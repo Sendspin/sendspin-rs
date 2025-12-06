@@ -1,9 +1,9 @@
-// ABOUTME: Main library entry point for resonate-rs
-// ABOUTME: Exports public API for Resonate Protocol client and server
+// ABOUTME: Main library entry point for sendspin-rs
+// ABOUTME: Exports public API for Sendspin Protocol client and server
 
-//! # resonate-rs
+//! # sendspin-rs
 //!
-//! Hyper-efficient Rust implementation of the Resonate Protocol for synchronized multi-room audio streaming.
+//! Hyper-efficient Rust implementation of the Sendspin Protocol for synchronized multi-room audio streaming.
 //!
 //! This library provides zero-copy audio pipelines, lock-free concurrency, and async I/O
 //! for building high-performance audio streaming clients and servers.
@@ -23,14 +23,14 @@ pub use protocol::client::ProtocolClient;
 pub use protocol::messages::{ClientHello, ServerHello};
 pub use scheduler::AudioScheduler;
 
-/// Result type for resonate operations
+/// Result type for sendspin operations
 pub type Result<T> = std::result::Result<T, error::Error>;
 
-/// Error types for resonate
+/// Error types for sendspin
 pub mod error {
     use thiserror::Error;
 
-    /// Error types for resonate operations
+    /// Error types for sendspin operations
     #[derive(Error, Debug)]
     pub enum Error {
         /// WebSocket-related error

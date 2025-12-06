@@ -1,6 +1,6 @@
-# resonate-rs
+# sendspin-rs
 
-Hyper-efficient Rust implementation of the [Resonate Protocol](https://github.com/resonate-protocol/spec) for synchronized multi-room audio streaming.
+Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.com/Sendspin/spec) for synchronized multi-room audio streaming.
 
 ## Features
 
@@ -36,14 +36,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-resonate = "0.1"
+sendspin = "0.1"
 ```
 
 ### Basic Client Example
 
 ```rust
-use resonate::protocol::messages::{ClientHello, DeviceInfo};
-use resonate::protocol::client::ProtocolClient;
+use sendspin::protocol::messages::{ClientHello, DeviceInfo};
+use sendspin::protocol::client::ProtocolClient;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ... configure device info and capabilities
     };
 
-    let client = ProtocolClient::connect("ws://localhost:8080/resonate", hello).await?;
+    let client = ProtocolClient::connect("ws://localhost:8080/sendspin", hello).await?;
 
     // Client is now connected and ready to receive audio
 

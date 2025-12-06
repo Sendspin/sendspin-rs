@@ -1,4 +1,4 @@
-use resonate::protocol::messages::{
+use sendspin::protocol::messages::{
     AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerSupport, ServerHello,
 };
 use serde_json;
@@ -11,8 +11,8 @@ fn test_client_hello_serialization() {
         version: 1,
         supported_roles: vec!["player".to_string()],
         device_info: DeviceInfo {
-            product_name: "Resonate-RS Player".to_string(),
-            manufacturer: "Resonate".to_string(),
+            product_name: "Sendspin-RS Player".to_string(),
+            manufacturer: "Sendspin".to_string(),
             software_version: "0.1.0".to_string(),
         },
         player_support: Some(PlayerSupport {

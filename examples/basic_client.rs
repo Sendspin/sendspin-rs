@@ -2,20 +2,20 @@
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
 
 use clap::Parser;
-use resonate::protocol::client::ProtocolClient;
-use resonate::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport};
+use sendspin::protocol::client::ProtocolClient;
+use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport};
 
-/// Resonate basic client
+/// Sendspin basic client
 #[derive(Parser, Debug)]
 #[command(name = "basic_client")]
-#[command(about = "Test connection to Resonate server", long_about = None)]
+#[command(about = "Test connection to Sendspin server", long_about = None)]
 struct Args {
-    /// WebSocket URL of the Resonate server
-    #[arg(short, long, default_value = "ws://localhost:8927/resonate")]
+    /// WebSocket URL of the Sendspin server
+    #[arg(short, long, default_value = "ws://localhost:8927/sendspin")]
     server: String,
 
     /// Client name
-    #[arg(short, long, default_value = "Resonate-RS Basic Client")]
+    #[arg(short, long, default_value = "Sendspin-RS Basic Client")]
     name: String,
 }
 
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         supported_roles: vec!["player".to_string()],
         device_info: DeviceInfo {
             product_name: args.name.clone(),
-            manufacturer: "Resonate".to_string(),
+            manufacturer: "Sendspin".to_string(),
             software_version: "0.1.0".to_string(),
         },
         player_support: Some(PlayerSupport {

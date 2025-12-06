@@ -1,5 +1,5 @@
-use resonate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
-use resonate::scheduler::AudioScheduler;
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+use sendspin::scheduler::AudioScheduler;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -1,4 +1,4 @@
-// ABOUTME: Clock synchronization for Resonate protocol
+// ABOUTME: Clock synchronization for Sendspin protocol
 // ABOUTME: NTP-style round-trip time calculation and server timestamp conversion
 
 /// Clock synchronization implementation

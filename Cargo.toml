@@ -1,11 +1,11 @@
 [package]
-name = "resonate"
+name = "sendspin"
 version = "0.1.0"
 edition = "2021"
-authors = ["Resonate Contributors"]
-description = "Hyper-efficient Rust implementation of the Resonate Protocol for synchronized multi-room audio streaming"
+authors = ["Sendspin Contributors"]
+description = "Hyper-efficient Rust implementation of the Sendspin Protocol for synchronized multi-room audio streaming"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/resonate-protocol/resonate-rs"
+repository = "https://github.com/Sendspin/sendspin-rs"
 
 [dependencies]
 # Async runtime

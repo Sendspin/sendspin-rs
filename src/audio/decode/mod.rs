@@ -4,7 +4,7 @@
 /// PCM decoder implementation
 pub mod pcm;
 
-pub use pcm::PcmDecoder;
+pub use pcm::{PcmDecoder, PcmEndian};
 
 use crate::audio::Sample;
 use crate::error::Error;

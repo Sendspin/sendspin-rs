@@ -4,7 +4,7 @@
 use crate::audio::AudioBuffer;
 use crossbeam::queue::SegQueue;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Lock-free audio scheduler
 pub struct AudioScheduler {
@@ -49,11 +49,14 @@ impl AudioScheduler {
 
         let now = Instant::now();
 
+        // Per spec: 1ms early window to tolerate micro jitter
+        let early_ok = Duration::from_micros(1000);
+
         // Check if first buffer is ready
         if let Some(buf) = sorted.first() {
-            // Check if play_at time has passed or is very close (within 1ms)
-            if buf.play_at <= now {
-                // Ready to play or late
+            // Check if play_at time has passed or is within early window
+            if buf.play_at <= now + early_ok {
+                // Ready to play, late, or within 1ms early (tolerate jitter)
                 return Some(sorted.remove(0));
             }
         }
