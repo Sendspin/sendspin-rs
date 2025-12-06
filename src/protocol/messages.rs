@@ -1,5 +1,5 @@
 // ABOUTME: Protocol message type definitions and serialization
-// ABOUTME: Supports client/hello, server/hello, stream/start, etc.
+// ABOUTME: Supports all Sendspin protocol messages per spec
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum Message {
+    // === Handshake messages ===
     /// Client hello handshake message
     #[serde(rename = "client/hello")]
     ClientHello(ClientHello),
@@ -15,6 +16,7 @@ pub enum Message {
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),
 
+    // === Time synchronization ===
     /// Client time synchronization request
     #[serde(rename = "client/time")]
     ClientTime(ClientTime),
@@ -23,18 +25,55 @@ pub enum Message {
     #[serde(rename = "server/time")]
     ServerTime(ServerTime),
 
+    // === State messages ===
+    /// Client state update
+    #[serde(rename = "client/state")]
+    ClientState(ClientState),
+
+    /// Server state update (metadata, controller info)
+    #[serde(rename = "server/state")]
+    ServerState(ServerState),
+
+    // === Command messages ===
+    /// Server command to client (player commands)
+    #[serde(rename = "server/command")]
+    ServerCommand(ServerCommand),
+
+    /// Client command to server (controller commands)
+    #[serde(rename = "client/command")]
+    ClientCommand(ClientCommand),
+
+    // === Stream control messages ===
     /// Stream start notification
     #[serde(rename = "stream/start")]
     StreamStart(StreamStart),
 
-    /// Server command to client
-    #[serde(rename = "server/command")]
-    ServerCommand(ServerCommand),
+    /// Stream end notification
+    #[serde(rename = "stream/end")]
+    StreamEnd(StreamEnd),
 
-    /// Client state update (replaces player/update)
-    #[serde(rename = "client/state")]
-    ClientState(ClientState),
+    /// Stream clear notification
+    #[serde(rename = "stream/clear")]
+    StreamClear(StreamClear),
+
+    /// Client request for specific stream format
+    #[serde(rename = "stream/request-format")]
+    StreamRequestFormat(StreamRequestFormat),
+
+    // === Group messages ===
+    /// Group update notification
+    #[serde(rename = "group/update")]
+    GroupUpdate(GroupUpdate),
+
+    // === Connection lifecycle ===
+    /// Client goodbye message
+    #[serde(rename = "client/goodbye")]
+    ClientGoodbye(ClientGoodbye),
 }
+
+// =============================================================================
+// Handshake Messages
+// =============================================================================
 
 /// Client hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +177,10 @@ pub enum ConnectionReason {
     Playback,
 }
 
+// =============================================================================
+// Time Synchronization
+// =============================================================================
+
 /// Client time sync message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientTime {
@@ -155,6 +198,173 @@ pub struct ServerTime {
     /// Server transmission timestamp (server loop microseconds)
     pub server_transmitted: i64,
 }
+
+// =============================================================================
+// State Messages
+// =============================================================================
+
+/// Client state update message (wraps role-specific state)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientState {
+    /// Player state (if player role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerState>,
+}
+
+/// Player state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerState {
+    /// Sync state: "synchronized" or "error"
+    pub state: PlayerSyncState,
+    /// Current volume level (0-100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Whether audio is muted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
+}
+
+/// Player synchronization state
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerSyncState {
+    /// Player is synchronized with server clock
+    Synchronized,
+    /// Player encountered an error
+    Error,
+    /// Player is in use by an external system (e.g., different audio source, HDMI input)
+    ExternalSource,
+}
+
+/// Server state update message (metadata and controller info)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerState {
+    /// Metadata state (track info, progress, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<MetadataState>,
+    /// Controller state (supported commands, volume, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller: Option<ControllerState>,
+}
+
+/// Metadata state from server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataState {
+    /// Server timestamp for progress calculation (microseconds)
+    pub timestamp: i64,
+    /// Track title
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Artist name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// Album name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album: Option<String>,
+    /// Artwork URL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork_url: Option<String>,
+    /// Release year
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<u32>,
+    /// Track number info (e.g., "3/12")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<String>,
+    /// Current track progress in microseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TrackProgress>,
+    /// Repeat mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatMode>,
+    /// Shuffle state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
+}
+
+/// Track progress information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackProgress {
+    /// Current position in microseconds
+    pub position: i64,
+    /// Total duration in microseconds
+    pub duration: i64,
+    /// Playback speed multiplier (1.0 = normal, 0.0 = paused)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_speed: Option<f64>,
+}
+
+/// Repeat mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    /// No repeat
+    Off,
+    /// Repeat current track
+    One,
+    /// Repeat all tracks
+    All,
+}
+
+/// Controller state from server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerState {
+    /// List of supported commands
+    pub supported_commands: Vec<String>,
+    /// Current volume level (0-100)
+    pub volume: u8,
+    /// Whether audio is muted
+    pub muted: bool,
+}
+
+// =============================================================================
+// Command Messages
+// =============================================================================
+
+/// Server command message (wraps role-specific commands)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCommand {
+    /// Player command (if targeting player role)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerCommand>,
+}
+
+/// Player-specific command from server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerCommand {
+    /// Command name (e.g., "play", "pause", "stop")
+    pub command: String,
+    /// Optional volume level (0-100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Optional mute state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mute: Option<bool>,
+}
+
+/// Client command message (controller commands to server)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCommand {
+    /// Controller command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller: Option<ControllerCommand>,
+}
+
+/// Controller command from client
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerCommand {
+    /// Command name (play, pause, stop, next, previous, volume, mute, etc.)
+    pub command: String,
+    /// Optional volume level (0-100) for volume command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Optional mute state for mute command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mute: Option<bool>,
+}
+
+// =============================================================================
+// Stream Control Messages
+// =============================================================================
 
 /// Stream start message
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,63 +409,130 @@ pub struct StreamVisualizerConfig {
     // FFT details TBD per spec
 }
 
-/// Server command message (wraps role-specific commands)
+/// Stream end message
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerCommand {
-    /// Player command (if targeting player role)
+pub struct StreamEnd {
+    /// Roles for which streaming has ended (optional, all if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub player: Option<PlayerCommand>,
+    pub roles: Option<Vec<String>>,
 }
 
-/// Player-specific command
+/// Stream clear message (clear buffers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerCommand {
-    /// Command name (e.g., "play", "pause", "stop")
-    pub command: String,
-    /// Optional volume level (0-100)
+pub struct StreamClear {
+    /// Roles for which buffers should be cleared (optional, all if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u8>,
-    /// Optional mute state
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mute: Option<bool>,
+    pub roles: Option<Vec<String>>,
 }
 
-/// Client state update message (wraps role-specific state)
+/// Stream format request from client
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientState {
-    /// Player state (if player role active)
+pub struct StreamRequestFormat {
+    /// Requested player format
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub player: Option<PlayerState>,
+    pub player: Option<PlayerFormatRequest>,
+    /// Requested artwork format
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkFormatRequest>,
 }
 
-/// Player state
+/// Player format request
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerState {
-    /// Sync state: "synchronized" or "error"
-    pub state: PlayerSyncState,
-    /// Current volume level (0-100)
+pub struct PlayerFormatRequest {
+    /// Preferred codec
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume: Option<u8>,
-    /// Whether audio is muted
+    pub codec: Option<String>,
+    /// Preferred channel count
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub muted: Option<bool>,
+    pub channels: Option<u8>,
+    /// Preferred sample rate
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// Preferred bit depth
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
 }
 
-/// Player synchronization state
+/// Artwork format request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtworkFormatRequest {
+    /// Artwork channel to request
+    pub channel: u8,
+    /// Preferred image source
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Preferred image format (jpeg, png, bmp)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Display width in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_width: Option<u32>,
+    /// Display height in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_height: Option<u32>,
+}
+
+// =============================================================================
+// Group Messages
+// =============================================================================
+
+/// Group update notification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupUpdate {
+    /// Current playback state of the group
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playback_state: Option<PlaybackState>,
+    /// Group identifier
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// Human-readable group name
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+}
+
+/// Group playback state
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackState {
+    /// Audio is playing
+    Playing,
+    /// Playback is stopped
+    Stopped,
+}
+
+// =============================================================================
+// Connection Lifecycle
+// =============================================================================
+
+/// Client goodbye message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientGoodbye {
+    /// Reason for disconnection
+    pub reason: GoodbyeReason,
+}
+
+/// Goodbye reason
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlayerSyncState {
-    /// Player is synchronized with server clock
-    Synchronized,
-    /// Player encountered an error
-    Error,
-    /// Player is in use by an external system (e.g., different audio source, HDMI input)
-    ExternalSource,
+pub enum GoodbyeReason {
+    /// Switching to another server
+    AnotherServer,
+    /// Client is shutting down
+    Shutdown,
+    /// Client is restarting
+    Restart,
+    /// User requested disconnect
+    UserRequest,
 }
 
-// Legacy type aliases for backwards compatibility during migration
+// =============================================================================
+// Legacy Aliases (deprecated)
+// =============================================================================
+
+/// Legacy type alias for backwards compatibility
 #[deprecated(note = "Use PlayerV1Support instead")]
 pub type PlayerSupport = PlayerV1Support;
 
+/// Legacy type alias for backwards compatibility
 #[deprecated(note = "Use ClientState instead")]
 pub type PlayerUpdate = ClientState;
