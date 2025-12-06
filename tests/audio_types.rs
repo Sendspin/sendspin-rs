@@ -1,4 +1,4 @@
-use resonate::audio::{AudioFormat, Codec, Sample};
+use sendspin::audio::{AudioFormat, Codec, Sample};
 
 #[test]
 fn test_sample_from_i16() {

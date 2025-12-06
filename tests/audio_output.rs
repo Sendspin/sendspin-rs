@@ -1,5 +1,5 @@
-use resonate::audio::output::{AudioOutput, CpalOutput};
-use resonate::audio::{AudioFormat, Codec, Sample};
+use sendspin::audio::output::{AudioOutput, CpalOutput};
+use sendspin::audio::{AudioFormat, Codec, Sample};
 use std::sync::Arc;
 
 #[test]

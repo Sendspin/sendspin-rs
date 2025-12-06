@@ -25,6 +25,9 @@ pub struct ClockSync {
 
     /// When we computed this (for staleness detection)
     last_update: Option<Instant>,
+
+    /// Whether we've successfully synced once
+    synced: bool,
 }
 
 impl ClockSync {
@@ -34,6 +37,7 @@ impl ClockSync {
             rtt_micros: None,
             server_loop_start_unix: None,
             last_update: None,
+            synced: false,
         }
     }
 
@@ -47,10 +51,31 @@ impl ClockSync {
         let rtt = (t4 - t1) - (t3 - t2);
         self.rtt_micros = Some(rtt);
 
-        // Server loop start in Unix time, accounting for network delay
-        // At server time t3, the Unix time was approximately t4 - (rtt/2)
-        // So server loop started at: (t4 - rtt/2) - t3
-        self.server_loop_start_unix = Some(t4 - t3 - (rtt / 2));
+        // Discard samples with high RTT (network congestion)
+        if rtt > 100_000 {
+            // 100ms
+            eprintln!("Discarding sync sample: high RTT {}µs", rtt);
+            return;
+        }
+
+        // On first successful sync, compute when the server loop started in Unix µs
+        // Per Go reference: ONLY calculate this once, never update it again!
+        // The server loop started at a specific moment in time - that never changes.
+        if !self.synced {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as i64;
+
+            self.server_loop_start_unix = Some(now_unix - t2);
+            self.synced = true;
+
+            eprintln!(
+                "Clock sync established: t1={}, t2={}, t3={}, t4={}, rtt={}µs, now_unix={}, serverLoopStart={}",
+                t1, t2, t3, t4, rtt, now_unix,
+                self.server_loop_start_unix.unwrap()
+            );
+        }
 
         self.last_update = Some(Instant::now());
     }

@@ -60,7 +60,7 @@ pub struct ClientHello {
 /// Device information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
-    /// Product name (e.g., "Resonate-RS Player")
+    /// Product name (e.g., "Sendspin-RS Player")
     pub product_name: String,
     /// Manufacturer name
     pub manufacturer: String,

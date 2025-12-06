@@ -38,6 +38,20 @@ impl Sample {
         Self(extended)
     }
 
+    /// Convert from 24-bit big-endian bytes
+    #[inline]
+    pub fn from_i24_be(bytes: [u8; 3]) -> Self {
+        // Build 24-bit signed integer in i32 (big-endian order)
+        let val = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
+        // Sign-extend from 24-bit to 32-bit
+        let extended = if val & 0x00800000 != 0 {
+            val | 0xFF000000u32 as i32 // Negative: fill upper 8 bits with 1
+        } else {
+            val // Positive: upper 8 bits already 0
+        };
+        Self(extended)
+    }
+
     /// Convert to 16-bit sample (shift right 8 bits)
     #[inline]
     pub fn to_i16(self) -> i16 {

@@ -1,4 +1,4 @@
-// ABOUTME: WebSocket client implementation for Resonate protocol
+// ABOUTME: WebSocket client implementation for Sendspin protocol
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
@@ -62,7 +62,7 @@ impl AudioChunk {
     }
 }
 
-/// WebSocket client for Resonate protocol
+/// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
     ws_tx:
         Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
@@ -72,7 +72,7 @@ pub struct ProtocolClient {
 }
 
 impl ProtocolClient {
-    /// Connect to Resonate server
+    /// Connect to Sendspin server
     pub async fn connect(url: &str, hello: ClientHello) -> Result<Self, Error> {
         // Connect WebSocket
         let (ws_stream, _) = connect_async(url)

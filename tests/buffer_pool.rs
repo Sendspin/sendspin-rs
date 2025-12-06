@@ -1,4 +1,4 @@
-use resonate::audio::{BufferPool, Sample};
+use sendspin::audio::{BufferPool, Sample};
 
 #[test]
 fn test_buffer_pool_creation() {

@@ -1,4 +1,4 @@
-use resonate::sync::ClockSync;
+use sendspin::sync::ClockSync;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -40,9 +40,9 @@ fn test_sync_quality() {
 
     // Good RTT (30µs)
     sync.update(1_000_000, 500_000, 500_010, 1_000_040);
-    assert_eq!(sync.quality(), resonate::sync::SyncQuality::Good);
+    assert_eq!(sync.quality(), sendspin::sync::SyncQuality::Good);
 
     // Degraded RTT (75ms = 75,000µs)
     sync.update(2_000_000, 600_000, 600_010, 2_075_010);
-    assert_eq!(sync.quality(), resonate::sync::SyncQuality::Degraded);
+    assert_eq!(sync.quality(), sendspin::sync::SyncQuality::Degraded);
 }

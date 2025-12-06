@@ -1,4 +1,4 @@
-// ABOUTME: Audio types and processing for resonate-rs
+// ABOUTME: Audio types and processing for sendspin-rs
 // ABOUTME: Contains Sample type, AudioFormat, Buffer, and codec definitions
 
 /// Audio decoder implementations (PCM, Opus, FLAC)

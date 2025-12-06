@@ -1,4 +1,4 @@
-// ABOUTME: Protocol implementation for Resonate WebSocket protocol
+// ABOUTME: Protocol implementation for Sendspin WebSocket protocol
 // ABOUTME: Message types, serialization, and WebSocket client
 
 /// WebSocket client implementation

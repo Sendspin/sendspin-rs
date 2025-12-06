@@ -25,6 +25,24 @@ impl CpalOutput {
             .default_output_device()
             .ok_or_else(|| Error::Output("No output device available".to_string()))?;
 
+        // Log device's default supported config to catch format mismatches
+        if let Ok(def) = device.default_output_config() {
+            eprintln!(
+                "Device default: {:?} {}Hz {}ch",
+                def.sample_format(),
+                def.sample_rate().0,
+                def.channels()
+            );
+            if def.sample_rate().0 != format.sample_rate
+                || def.channels() != format.channels as u16
+            {
+                eprintln!(
+                    "WARN: requested {}Hz/{}ch; device default is {}Hz/{}ch (OS may resample)",
+                    format.sample_rate, format.channels, def.sample_rate().0, def.channels()
+                );
+            }
+        }
+
         let config = StreamConfig {
             channels: format.channels as u16,
             sample_rate: cpal::SampleRate(format.sample_rate),
