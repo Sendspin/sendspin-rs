@@ -2,10 +2,9 @@ use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand,
     ClientGoodbye, ClientHello, ClientState, ConnectionReason, ControllerCommand, ControllerState,
     DeviceInfo, GoodbyeReason, GroupUpdate, ImageFormat, Message, MetadataState, PlaybackState,
-    PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode, ServerState, StreamClear,
-    StreamEnd, TrackProgress,
+    PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode, ServerCommand, ServerState,
+    StreamClear, StreamEnd, StreamStart, TrackProgress,
 };
-use serde_json;
 
 // =============================================================================
 // Handshake Tests
@@ -207,6 +206,31 @@ fn test_client_command_serialization() {
 }
 
 #[test]
+fn test_server_command_deserialization() {
+    let json = r#"{
+        "type": "server/command",
+        "payload": {
+            "player": {
+                "command": "play",
+                "volume": 80
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerCommand(cmd) => {
+            let player = cmd.player.expect("Expected player command");
+            assert_eq!(player.command, "play");
+            assert_eq!(player.volume, Some(80));
+            assert!(player.mute.is_none());
+        }
+        _ => panic!("Expected ServerCommand"),
+    }
+}
+
+#[test]
 fn test_client_command_volume() {
     let command = ClientCommand {
         controller: Some(ControllerCommand {
@@ -225,6 +249,36 @@ fn test_client_command_volume() {
 // =============================================================================
 // Stream Control Tests
 // =============================================================================
+
+#[test]
+fn test_stream_start_deserialization() {
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "player": {
+                "codec": "pcm",
+                "sample_rate": 48000,
+                "channels": 2,
+                "bit_depth": 24
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::StreamStart(start) => {
+            let player = start.player.expect("Expected player config");
+            assert_eq!(player.codec, "pcm");
+            assert_eq!(player.sample_rate, 48000);
+            assert_eq!(player.channels, 2);
+            assert_eq!(player.bit_depth, 24);
+            assert!(start.artwork.is_none());
+            assert!(start.visualizer.is_none());
+        }
+        _ => panic!("Expected StreamStart"),
+    }
+}
 
 #[test]
 fn test_stream_end_deserialization() {

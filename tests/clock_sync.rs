@@ -1,5 +1,4 @@
 use sendspin::sync::ClockSync;
-use std::time::{Duration, Instant};
 
 #[test]
 fn test_clock_sync_rtt_calculation() {
