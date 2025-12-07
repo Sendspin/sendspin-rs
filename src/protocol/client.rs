@@ -75,7 +75,10 @@ impl AudioChunk {
     /// Parse from WebSocket binary frame (type 4 = player audio)
     pub fn from_bytes(frame: &[u8]) -> Result<Self, Error> {
         if frame.len() < 9 {
-            return Err(Error::Protocol("Audio chunk too short".to_string()));
+            return Err(Error::Protocol(format!(
+                "Audio chunk too short: got {} bytes, need at least 9",
+                frame.len()
+            )));
         }
 
         // Per spec: player audio uses binary type 4
@@ -113,7 +116,10 @@ impl ArtworkChunk {
     /// Parse from WebSocket binary frame (types 8-11 = artwork channels 0-3)
     pub fn from_bytes(frame: &[u8]) -> Result<Self, Error> {
         if frame.len() < 9 {
-            return Err(Error::Protocol("Artwork chunk too short".to_string()));
+            return Err(Error::Protocol(format!(
+                "Artwork chunk too short: got {} bytes, need at least 9",
+                frame.len()
+            )));
         }
 
         let type_id = frame[0];
@@ -153,7 +159,10 @@ impl VisualizerChunk {
     /// Parse from WebSocket binary frame (type 16 = visualizer)
     pub fn from_bytes(frame: &[u8]) -> Result<Self, Error> {
         if frame.len() < 9 {
-            return Err(Error::Protocol("Visualizer chunk too short".to_string()));
+            return Err(Error::Protocol(format!(
+                "Visualizer chunk too short: got {} bytes, need at least 9",
+                frame.len()
+            )));
         }
 
         if frame[0] != binary_types::VISUALIZER {

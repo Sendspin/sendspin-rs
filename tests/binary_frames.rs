@@ -1,3 +1,6 @@
+// ABOUTME: Tests for binary frame parsing (audio, artwork, visualizer)
+// ABOUTME: Validates Sendspin protocol binary message types and edge cases
+
 use sendspin::protocol::client::{
     binary_types, ArtworkChunk, AudioChunk, BinaryFrame, VisualizerChunk,
 };
@@ -74,6 +77,37 @@ fn test_audio_chunk_too_short() {
     let frame: Vec<u8> = vec![0x04, 0x00, 0x00]; // Only 3 bytes
     let result = AudioChunk::from_bytes(&frame);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_audio_chunk_boundary_8_bytes() {
+    // Exactly 8 bytes - type + incomplete timestamp, should fail
+    let frame: Vec<u8> = vec![0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let result = AudioChunk::from_bytes(&frame);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_audio_chunk_minimum_valid() {
+    // Exactly 9 bytes - minimum valid frame (no data)
+    let frame: Vec<u8> = vec![
+        0x04, // Type
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // Timestamp: 1
+    ];
+    let chunk = AudioChunk::from_bytes(&frame).unwrap();
+    assert_eq!(chunk.timestamp, 1);
+    assert!(chunk.data.is_empty());
+}
+
+#[test]
+fn test_audio_chunk_negative_timestamp() {
+    let frame: Vec<u8> = vec![
+        0x04, // Type
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Timestamp: -1
+        0x00, // Data
+    ];
+    let chunk = AudioChunk::from_bytes(&frame).unwrap();
+    assert_eq!(chunk.timestamp, -1);
 }
 
 // =============================================================================
