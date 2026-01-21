@@ -1,8 +1,9 @@
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientGoodbye, ClientHello, ClientState, ConnectionReason,
-    ControllerCommand, ControllerState, DeviceInfo, GoodbyeReason, GroupUpdate, Message,
-    MetadataState, PlaybackState, PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode,
-    ServerState, StreamClear, StreamEnd, TrackProgress,
+    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand,
+    ClientGoodbye, ClientHello, ClientState, ConnectionReason, ControllerCommand, ControllerState,
+    DeviceInfo, GoodbyeReason, GroupUpdate, ImageFormat, Message, MetadataState, PlaybackState,
+    PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode, ServerState, StreamClear,
+    StreamEnd, TrackProgress,
 };
 use serde_json;
 
@@ -348,6 +349,66 @@ fn test_repeat_mode_variants() {
 
     for (json_val, expected) in modes {
         let parsed: RepeatMode = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+// =============================================================================
+// Artwork Tests
+// =============================================================================
+
+#[test]
+fn test_artwork_v1_support_serialization() {
+    let support = ArtworkV1Support {
+        channels: vec![
+            ArtworkChannel {
+                source: ArtworkSource::Album,
+                format: ImageFormat::Jpeg,
+                media_width: 800,
+                media_height: 800,
+            },
+            ArtworkChannel {
+                source: ArtworkSource::Artist,
+                format: ImageFormat::Png,
+                media_width: 400,
+                media_height: 400,
+            },
+        ],
+    };
+
+    let json = serde_json::to_string(&support).unwrap();
+
+    assert!(json.contains("\"source\":\"album\""));
+    assert!(json.contains("\"format\":\"jpeg\""));
+    assert!(json.contains("\"media_width\":800"));
+    assert!(json.contains("\"source\":\"artist\""));
+    assert!(json.contains("\"format\":\"png\""));
+}
+
+#[test]
+fn test_artwork_source_variants() {
+    let sources = [
+        (r#""album""#, ArtworkSource::Album),
+        (r#""artist""#, ArtworkSource::Artist),
+        (r#""none""#, ArtworkSource::None),
+    ];
+
+    for (json_val, expected) in sources {
+        let parsed: ArtworkSource = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+#[test]
+fn test_image_format_variants() {
+    let formats = [
+        (r#""jpeg""#, ImageFormat::Jpeg),
+        (r#""png""#, ImageFormat::Png),
+        (r#""bmp""#, ImageFormat::Bmp),
+    ];
+
+    for (json_val, expected) in formats {
+        let parsed: ImageFormat = serde_json::from_str(json_val).unwrap();
         assert_eq!(parsed, expected);
     }
 }

@@ -141,8 +141,45 @@ pub struct AudioFormatSpec {
 /// Artwork@v1 capabilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtworkV1Support {
-    /// Supported artwork channels (0-3)
-    pub channels: Vec<u8>,
+    /// Supported artwork channels (1-4 channels, array index is channel number)
+    pub channels: Vec<ArtworkChannel>,
+}
+
+/// Artwork channel configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtworkChannel {
+    /// Artwork source type
+    pub source: ArtworkSource,
+    /// Image format
+    pub format: ImageFormat,
+    /// Max width in pixels
+    pub media_width: u32,
+    /// Max height in pixels
+    pub media_height: u32,
+}
+
+/// Artwork source type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtworkSource {
+    /// Album artwork
+    Album,
+    /// Artist image
+    Artist,
+    /// No artwork (channel disabled)
+    None,
+}
+
+/// Image format
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageFormat {
+    /// JPEG format
+    Jpeg,
+    /// PNG format
+    Png,
+    /// BMP format
+    Bmp,
 }
 
 /// Visualizer@v1 capabilities
