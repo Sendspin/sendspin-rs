@@ -24,7 +24,7 @@ fn test_client_hello_serialization() {
                 bit_depth: 24,
             }],
             buffer_capacity: 100,
-            supported_commands: vec!["play".to_string(), "pause".to_string()],
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
         artwork_v1_support: None,
         visualizer_v1_support: None,

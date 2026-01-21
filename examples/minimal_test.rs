@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bit_depth: 24,
             }],
             buffer_capacity: 100,
-            supported_commands: vec!["play".to_string()],
+            supported_commands: vec!["volume".to_string()],
         }),
         artwork_v1_support: None,
         visualizer_v1_support: None,
