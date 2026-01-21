@@ -243,12 +243,14 @@ pub struct PlayerState {
 
 /// Player synchronization state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum PlayerSyncState {
     /// Player is synchronized with server clock
     Synchronized,
     /// Player encountered an error
     Error,
+    /// Player is in use by an external system (e.g., different audio source, HDMI input)
+    ExternalSource,
 }
 
 // Legacy type aliases for backwards compatibility during migration
