@@ -1,8 +1,15 @@
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientHello, ClientState, ConnectionReason, DeviceInfo, Message,
-    PlayerState, PlayerSyncState, PlayerV1Support, ServerHello,
+    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand,
+    ClientGoodbye, ClientHello, ClientState, ConnectionReason, ControllerCommand, ControllerState,
+    DeviceInfo, GoodbyeReason, GroupUpdate, ImageFormat, Message, MetadataState, PlaybackState,
+    PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode, ServerState, StreamClear,
+    StreamEnd, TrackProgress,
 };
 use serde_json;
+
+// =============================================================================
+// Handshake Tests
+// =============================================================================
 
 #[test]
 fn test_client_hello_serialization() {
@@ -66,6 +73,10 @@ fn test_server_hello_deserialization() {
     }
 }
 
+// =============================================================================
+// State Tests
+// =============================================================================
+
 #[test]
 fn test_client_state_serialization() {
     let state = ClientState {
@@ -98,4 +109,306 @@ fn test_player_sync_state_error() {
     let json = serde_json::to_string(&message).unwrap();
 
     assert!(json.contains("\"state\":\"error\""));
+}
+
+#[test]
+fn test_server_state_metadata_deserialization() {
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "metadata": {
+                "timestamp": 1234567890,
+                "title": "Test Song",
+                "artist": "Test Artist",
+                "album": "Test Album",
+                "year": 2024,
+                "track": 3,
+                "progress": {
+                    "track_progress": 60000,
+                    "track_duration": 180000,
+                    "playback_speed": 1000
+                },
+                "repeat": "off",
+                "shuffle": false
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let metadata = state.metadata.expect("Expected metadata");
+            assert_eq!(metadata.timestamp, 1234567890);
+            assert_eq!(metadata.title, Some("Test Song".to_string()));
+            assert_eq!(metadata.artist, Some("Test Artist".to_string()));
+            assert_eq!(metadata.album, Some("Test Album".to_string()));
+            assert_eq!(metadata.year, Some(2024));
+            assert_eq!(metadata.track, Some(3));
+
+            let progress = metadata.progress.expect("Expected progress");
+            assert_eq!(progress.track_progress, 60000);
+            assert_eq!(progress.track_duration, 180000);
+            assert_eq!(progress.playback_speed, 1000);
+
+            assert_eq!(metadata.repeat, Some(RepeatMode::Off));
+            assert_eq!(metadata.shuffle, Some(false));
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_server_state_controller_deserialization() {
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "controller": {
+                "supported_commands": ["play", "pause", "next", "previous", "volume", "mute"],
+                "volume": 75,
+                "muted": false
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let controller = state.controller.expect("Expected controller");
+            assert_eq!(controller.volume, 75);
+            assert!(!controller.muted);
+            assert!(controller.supported_commands.contains(&"play".to_string()));
+            assert!(controller.supported_commands.contains(&"volume".to_string()));
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+// =============================================================================
+// Command Tests
+// =============================================================================
+
+#[test]
+fn test_client_command_serialization() {
+    let command = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: "play".to_string(),
+            volume: None,
+            mute: None,
+        }),
+    };
+
+    let message = Message::ClientCommand(command);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"type\":\"client/command\""));
+    assert!(json.contains("\"command\":\"play\""));
+}
+
+#[test]
+fn test_client_command_volume() {
+    let command = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: "volume".to_string(),
+            volume: Some(50),
+            mute: None,
+        }),
+    };
+
+    let message = Message::ClientCommand(command);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"volume\":50"));
+}
+
+// =============================================================================
+// Stream Control Tests
+// =============================================================================
+
+#[test]
+fn test_stream_end_deserialization() {
+    let json = r#"{
+        "type": "stream/end",
+        "payload": {
+            "roles": ["player@v1"]
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::StreamEnd(end) => {
+            assert_eq!(end.roles, Some(vec!["player@v1".to_string()]));
+        }
+        _ => panic!("Expected StreamEnd"),
+    }
+}
+
+#[test]
+fn test_stream_clear_deserialization() {
+    let json = r#"{
+        "type": "stream/clear",
+        "payload": {}
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::StreamClear(clear) => {
+            assert!(clear.roles.is_none());
+        }
+        _ => panic!("Expected StreamClear"),
+    }
+}
+
+// =============================================================================
+// Group Tests
+// =============================================================================
+
+#[test]
+fn test_group_update_deserialization() {
+    let json = r#"{
+        "type": "group/update",
+        "payload": {
+            "playback_state": "playing",
+            "group_id": "living-room",
+            "group_name": "Living Room"
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::GroupUpdate(update) => {
+            assert_eq!(update.playback_state, Some(PlaybackState::Playing));
+            assert_eq!(update.group_id, Some("living-room".to_string()));
+            assert_eq!(update.group_name, Some("Living Room".to_string()));
+        }
+        _ => panic!("Expected GroupUpdate"),
+    }
+}
+
+#[test]
+fn test_playback_state_variants() {
+    // Test all playback state variants (per spec: only 'playing' and 'stopped')
+    let states = [
+        (r#""playing""#, PlaybackState::Playing),
+        (r#""stopped""#, PlaybackState::Stopped),
+    ];
+
+    for (json_val, expected) in states {
+        let parsed: PlaybackState = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+// =============================================================================
+// Goodbye Tests
+// =============================================================================
+
+#[test]
+fn test_client_goodbye_serialization() {
+    let goodbye = ClientGoodbye {
+        reason: GoodbyeReason::AnotherServer,
+    };
+
+    let message = Message::ClientGoodbye(goodbye);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"type\":\"client/goodbye\""));
+    assert!(json.contains("\"reason\":\"another_server\""));
+}
+
+#[test]
+fn test_goodbye_reason_variants() {
+    let reasons = [
+        (r#""another_server""#, GoodbyeReason::AnotherServer),
+        (r#""shutdown""#, GoodbyeReason::Shutdown),
+        (r#""restart""#, GoodbyeReason::Restart),
+        (r#""user_request""#, GoodbyeReason::UserRequest),
+    ];
+
+    for (json_val, expected) in reasons {
+        let parsed: GoodbyeReason = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+// =============================================================================
+// Repeat Mode Tests
+// =============================================================================
+
+#[test]
+fn test_repeat_mode_variants() {
+    let modes = [
+        (r#""off""#, RepeatMode::Off),
+        (r#""one""#, RepeatMode::One),
+        (r#""all""#, RepeatMode::All),
+    ];
+
+    for (json_val, expected) in modes {
+        let parsed: RepeatMode = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+// =============================================================================
+// Artwork Tests
+// =============================================================================
+
+#[test]
+fn test_artwork_v1_support_serialization() {
+    let support = ArtworkV1Support {
+        channels: vec![
+            ArtworkChannel {
+                source: ArtworkSource::Album,
+                format: ImageFormat::Jpeg,
+                media_width: 800,
+                media_height: 800,
+            },
+            ArtworkChannel {
+                source: ArtworkSource::Artist,
+                format: ImageFormat::Png,
+                media_width: 400,
+                media_height: 400,
+            },
+        ],
+    };
+
+    let json = serde_json::to_string(&support).unwrap();
+
+    assert!(json.contains("\"source\":\"album\""));
+    assert!(json.contains("\"format\":\"jpeg\""));
+    assert!(json.contains("\"media_width\":800"));
+    assert!(json.contains("\"source\":\"artist\""));
+    assert!(json.contains("\"format\":\"png\""));
+}
+
+#[test]
+fn test_artwork_source_variants() {
+    let sources = [
+        (r#""album""#, ArtworkSource::Album),
+        (r#""artist""#, ArtworkSource::Artist),
+        (r#""none""#, ArtworkSource::None),
+    ];
+
+    for (json_val, expected) in sources {
+        let parsed: ArtworkSource = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
+}
+
+#[test]
+fn test_image_format_variants() {
+    let formats = [
+        (r#""jpeg""#, ImageFormat::Jpeg),
+        (r#""png""#, ImageFormat::Png),
+        (r#""bmp""#, ImageFormat::Bmp),
+    ];
+
+    for (json_val, expected) in formats {
+        let parsed: ImageFormat = serde_json::from_str(json_val).unwrap();
+        assert_eq!(parsed, expected);
+    }
 }
