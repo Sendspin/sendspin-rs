@@ -258,6 +258,9 @@ pub struct MetadataState {
     /// Artist name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artist: Option<String>,
+    /// Album artist
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_artist: Option<String>,
     /// Album name
     #[serde(skip_serializing_if = "Option::is_none")]
     pub album: Option<String>,
@@ -267,10 +270,10 @@ pub struct MetadataState {
     /// Release year
     #[serde(skip_serializing_if = "Option::is_none")]
     pub year: Option<u32>,
-    /// Track number info (e.g., "3/12")
+    /// Track number (1-indexed)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub track: Option<String>,
-    /// Current track progress in microseconds
+    pub track: Option<u32>,
+    /// Current track progress
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<TrackProgress>,
     /// Repeat mode
@@ -284,13 +287,12 @@ pub struct MetadataState {
 /// Track progress information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackProgress {
-    /// Current position in microseconds
-    pub position: i64,
-    /// Total duration in microseconds
-    pub duration: i64,
-    /// Playback speed multiplier (1.0 = normal, 0.0 = paused)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub playback_speed: Option<f64>,
+    /// Current position in milliseconds
+    pub track_progress: i64,
+    /// Total duration in milliseconds (0 for unknown/live streams)
+    pub track_duration: i64,
+    /// Playback speed multiplier * 1000 (1000 = normal, 0 = paused)
+    pub playback_speed: i32,
 }
 
 /// Repeat mode
@@ -331,7 +333,7 @@ pub struct ServerCommand {
 /// Player-specific command from server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCommand {
-    /// Command name (e.g., "play", "pause", "stop")
+    /// Command name: "volume" or "mute"
     pub command: String,
     /// Optional volume level (0-100)
     #[serde(skip_serializing_if = "Option::is_none")]

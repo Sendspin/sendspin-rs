@@ -121,10 +121,11 @@ fn test_server_state_metadata_deserialization() {
                 "artist": "Test Artist",
                 "album": "Test Album",
                 "year": 2024,
+                "track": 3,
                 "progress": {
-                    "position": 60000000,
-                    "duration": 180000000,
-                    "playback_speed": 1.0
+                    "track_progress": 60000,
+                    "track_duration": 180000,
+                    "playback_speed": 1000
                 },
                 "repeat": "off",
                 "shuffle": false
@@ -142,11 +143,12 @@ fn test_server_state_metadata_deserialization() {
             assert_eq!(metadata.artist, Some("Test Artist".to_string()));
             assert_eq!(metadata.album, Some("Test Album".to_string()));
             assert_eq!(metadata.year, Some(2024));
+            assert_eq!(metadata.track, Some(3));
 
             let progress = metadata.progress.expect("Expected progress");
-            assert_eq!(progress.position, 60000000);
-            assert_eq!(progress.duration, 180000000);
-            assert_eq!(progress.playback_speed, Some(1.0));
+            assert_eq!(progress.track_progress, 60000);
+            assert_eq!(progress.track_duration, 180000);
+            assert_eq!(progress.playback_speed, 1000);
 
             assert_eq!(metadata.repeat, Some(RepeatMode::Off));
             assert_eq!(metadata.shuffle, Some(false));
