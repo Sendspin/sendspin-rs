@@ -41,15 +41,33 @@ pub struct AudioChunk {
     pub data: Arc<[u8]>,
 }
 
+/// Binary message type IDs per Sendspin spec
+pub mod binary_types {
+    /// Player audio chunk (types 4-7, we use 4)
+    pub const PLAYER_AUDIO: u8 = 0x04;
+    /// Artwork channels (types 8-11 for channels 0-3)
+    pub const ARTWORK_CHANNEL_0: u8 = 0x08;
+    pub const ARTWORK_CHANNEL_1: u8 = 0x09;
+    pub const ARTWORK_CHANNEL_2: u8 = 0x0A;
+    pub const ARTWORK_CHANNEL_3: u8 = 0x0B;
+    /// Visualizer data (type 16)
+    pub const VISUALIZER: u8 = 0x10;
+}
+
 impl AudioChunk {
-    /// Parse from WebSocket binary frame
+    /// Parse from WebSocket binary frame (type 4 = player audio)
     pub fn from_bytes(frame: &[u8]) -> Result<Self, Error> {
         if frame.len() < 9 {
             return Err(Error::Protocol("Audio chunk too short".to_string()));
         }
 
-        if frame[0] != 0x01 {
-            return Err(Error::Protocol("Invalid audio chunk type".to_string()));
+        // Per spec: player audio uses binary type 4
+        if frame[0] != binary_types::PLAYER_AUDIO {
+            return Err(Error::Protocol(format!(
+                "Invalid audio chunk type: expected {}, got {}",
+                binary_types::PLAYER_AUDIO,
+                frame[0]
+            )));
         }
 
         let timestamp = i64::from_be_bytes([

@@ -1,5 +1,6 @@
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerSupport, ServerHello,
+    AudioFormatSpec, ClientHello, ClientState, ConnectionReason, DeviceInfo, Message,
+    PlayerState, PlayerSyncState, PlayerV1Support, ServerHello,
 };
 use serde_json;
 
@@ -9,27 +10,24 @@ fn test_client_hello_serialization() {
         client_id: "test-client-123".to_string(),
         name: "Test Player".to_string(),
         version: 1,
-        supported_roles: vec!["player".to_string()],
-        device_info: DeviceInfo {
-            product_name: "Sendspin-RS Player".to_string(),
-            manufacturer: "Sendspin".to_string(),
-            software_version: "0.1.0".to_string(),
-        },
-        player_support: Some(PlayerSupport {
-            support_codecs: vec!["pcm".to_string()],
-            support_channels: vec![2],
-            support_sample_rates: vec![48000],
-            support_bit_depth: vec![16, 24],
-            support_formats: vec![AudioFormatSpec {
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: Some(DeviceInfo {
+            product_name: Some("Sendspin-RS Player".to_string()),
+            manufacturer: Some("Sendspin".to_string()),
+            software_version: Some("0.1.0".to_string()),
+        }),
+        player_v1_support: Some(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,
                 sample_rate: 48000,
                 bit_depth: 24,
             }],
-            buffer_capacity: 100,
-            supported_commands: vec!["play".to_string(), "pause".to_string()],
+            buffer_capacity: 50 * 1024 * 1024, // 50 MB
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
-        metadata_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
     };
 
     let message = Message::ClientHello(hello);
@@ -37,6 +35,8 @@ fn test_client_hello_serialization() {
 
     assert!(json.contains("\"type\":\"client/hello\""));
     assert!(json.contains("\"client_id\":\"test-client-123\""));
+    assert!(json.contains("\"player@v1_support\""));
+    assert!(json.contains("\"player@v1\""));
 }
 
 #[test]
@@ -46,7 +46,9 @@ fn test_server_hello_deserialization() {
         "payload": {
             "server_id": "server-456",
             "name": "Test Server",
-            "version": 1
+            "version": 1,
+            "active_roles": ["player@v1"],
+            "connection_reason": "playback"
         }
     }"#;
 
@@ -57,7 +59,43 @@ fn test_server_hello_deserialization() {
             assert_eq!(hello.server_id, "server-456");
             assert_eq!(hello.name, "Test Server");
             assert_eq!(hello.version, 1);
+            assert_eq!(hello.active_roles, vec!["player@v1"]);
+            assert_eq!(hello.connection_reason, ConnectionReason::Playback);
         }
         _ => panic!("Expected ServerHello"),
     }
+}
+
+#[test]
+fn test_client_state_serialization() {
+    let state = ClientState {
+        player: Some(PlayerState {
+            state: PlayerSyncState::Synchronized,
+            volume: Some(100),
+            muted: Some(false),
+        }),
+    };
+
+    let message = Message::ClientState(state);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"type\":\"client/state\""));
+    assert!(json.contains("\"state\":\"synchronized\""));
+    assert!(json.contains("\"volume\":100"));
+}
+
+#[test]
+fn test_player_sync_state_error() {
+    let state = ClientState {
+        player: Some(PlayerState {
+            state: PlayerSyncState::Error,
+            volume: None,
+            muted: None,
+        }),
+    };
+
+    let message = Message::ClientState(state);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"state\":\"error\""));
 }

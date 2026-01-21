@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sendspin::protocol::client::ProtocolClient;
-use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerSupport};
+use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerV1Support};
 
 /// Sendspin basic client
 #[derive(Parser, Debug)]
@@ -29,27 +29,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: uuid::Uuid::new_v4().to_string(),
         name: args.name.clone(),
         version: 1,
-        supported_roles: vec!["player".to_string()],
-        device_info: DeviceInfo {
-            product_name: args.name.clone(),
-            manufacturer: "Sendspin".to_string(),
-            software_version: "0.1.0".to_string(),
-        },
-        player_support: Some(PlayerSupport {
-            support_codecs: vec!["pcm".to_string()],
-            support_channels: vec![2], // Stereo
-            support_sample_rates: vec![48000, 96000, 192000],
-            support_bit_depth: vec![16, 24],
-            support_formats: vec![AudioFormatSpec {
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: Some(DeviceInfo {
+            product_name: Some(args.name.clone()),
+            manufacturer: Some("Sendspin".to_string()),
+            software_version: Some("0.1.0".to_string()),
+        }),
+        player_v1_support: Some(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,
                 sample_rate: 48000,
                 bit_depth: 24,
             }],
-            buffer_capacity: 100,
-            supported_commands: vec!["play".to_string(), "pause".to_string()],
+            buffer_capacity: 50 * 1024 * 1024, // 50 MB
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
-        metadata_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
     };
 
     println!("Connecting to {}...", args.server);

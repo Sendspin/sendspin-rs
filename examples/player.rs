@@ -3,10 +3,11 @@
 
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
-use sendspin::audio::{AudioBuffer, AudioFormat, AudioOutput, Codec, CpalOutput, Sample};
+use sendspin::audio::{AudioBuffer, AudioFormat, AudioOutput, Codec, CpalOutput};
 use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientHello, ClientTime, DeviceInfo, Message, PlayerSupport, PlayerUpdate,
+    AudioFormatSpec, ClientHello, ClientState, ClientTime, DeviceInfo, Message, PlayerState,
+    PlayerSyncState, PlayerV1Support,
 };
 use sendspin::scheduler::AudioScheduler;
 use std::sync::Arc;
@@ -52,27 +53,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: uuid::Uuid::new_v4().to_string(),
         name: args.name.clone(),
         version: 1,
-        supported_roles: vec!["player".to_string()],
-        device_info: DeviceInfo {
-            product_name: args.name.clone(),
-            manufacturer: "Sendspin".to_string(),
-            software_version: "0.1.0".to_string(),
-        },
-        player_support: Some(PlayerSupport {
-            support_codecs: vec!["pcm".to_string()],
-            support_channels: vec![2], // Stereo
-            support_sample_rates: vec![48000, 96000, 192000],
-            support_bit_depth: vec![16, 24],
-            support_formats: vec![AudioFormatSpec {
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: Some(DeviceInfo {
+            product_name: Some(args.name.clone()),
+            manufacturer: Some("Sendspin".to_string()),
+            software_version: Some("0.1.0".to_string()),
+        }),
+        player_v1_support: Some(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,
                 sample_rate: 48000,
                 bit_depth: 24,
             }],
-            buffer_capacity: 100,
-            supported_commands: vec!["play".to_string(), "pause".to_string()],
+            buffer_capacity: 50 * 1024 * 1024, // 50 MB
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
-        metadata_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
     };
 
     println!("Connecting to {}...", args.server);
@@ -82,14 +80,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Split client into separate receivers for concurrent processing
     let (mut message_rx, mut audio_rx, clock_sync, ws_tx) = client.split();
 
-    // Send initial player/update message (handshake step 3)
-    let player_update = Message::PlayerUpdate(PlayerUpdate {
-        state: "idle".to_string(),
-        volume: 100,
-        muted: false,
+    // Send initial client/state message (handshake step 3)
+    let client_state = Message::ClientState(ClientState {
+        player: Some(PlayerState {
+            state: PlayerSyncState::Synchronized,
+            volume: Some(100),
+            muted: Some(false),
+        }),
     });
-    ws_tx.send_message(player_update).await?;
-    println!("Sent initial player/update");
+    ws_tx.send_message(client_state).await?;
+    println!("Sent initial client/state");
 
     // Send immediate initial clock sync
     let client_transmitted = SystemTime::now()
@@ -160,12 +160,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Configuration from environment variables
-    let min_lead_ms = env_u64("RES_PLAY_MIN_LEAD_MS", 200);
-    let start_buffer_ms = env_u64("RES_PLAY_START_BUFFER_MS", 500);
-    let log_lead = env_bool("RES_LOG_LEAD");
+    let min_lead_ms = env_u64("SS_PLAY_MIN_LEAD_MS", 200);
+    let start_buffer_ms = env_u64("SS_PLAY_START_BUFFER_MS", 500);
+    let log_lead = env_bool("SS_LOG_LEAD");
 
-    println!("Player config: min_lead={}ms, start_buffer={}ms, log_lead={}",
-             min_lead_ms, start_buffer_ms, log_lead);
+    println!(
+        "Player config: min_lead={}ms, start_buffer={}ms, log_lead={}",
+        min_lead_ms, start_buffer_ms, log_lead
+    );
 
     // Message handling variables
     let mut decoder: Option<PcmDecoder> = None;
@@ -182,42 +184,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = message_rx.recv() => {
                 match msg {
                     Message::StreamStart(stream_start) => {
-                        println!(
-                            "Stream starting: codec='{}' {}Hz {}ch {}bit",
-                            stream_start.player.codec,
-                            stream_start.player.sample_rate,
-                            stream_start.player.channels,
-                            stream_start.player.bit_depth
-                        );
+                        if let Some(ref player_config) = stream_start.player {
+                            println!(
+                                "Stream starting: codec='{}' {}Hz {}ch {}bit",
+                                player_config.codec,
+                                player_config.sample_rate,
+                                player_config.channels,
+                                player_config.bit_depth
+                            );
 
-                        // Validate codec before proceeding
-                        if stream_start.player.codec != "pcm" {
-                            eprintln!("ERROR: Unsupported codec '{}' - only 'pcm' is supported!", stream_start.player.codec);
-                            eprintln!("Server is sending compressed audio that we can't decode!");
-                            continue;
+                            // Validate codec before proceeding
+                            if player_config.codec != "pcm" {
+                                eprintln!("ERROR: Unsupported codec '{}' - only 'pcm' is supported!", player_config.codec);
+                                eprintln!("Server is sending compressed audio that we can't decode!");
+                                continue;
+                            }
+
+                            if player_config.bit_depth != 16 && player_config.bit_depth != 24 {
+                                eprintln!("ERROR: Unsupported bit depth {} - only 16 or 24-bit PCM supported!", player_config.bit_depth);
+                                continue;
+                            }
+
+                            audio_format = Some(AudioFormat {
+                                codec: Codec::Pcm,
+                                sample_rate: player_config.sample_rate,
+                                channels: player_config.channels,
+                                bit_depth: player_config.bit_depth,
+                                codec_header: None,
+                            });
+
+                            // Decoder will be created on first chunk after auto-detecting endianness
+                            decoder = None;
+                            endian_locked = None;
+                            buffered_duration_us = 0; // Reset on new stream
+                            playback_started = false;
+                            next_play_time = None;
+                            first_chunk_logged = false; // Reset for new stream
+                            println!("Waiting for first audio chunk to auto-detect endianness...");
+                        } else {
+                            println!("Received stream/start without player config");
                         }
-
-                        if stream_start.player.bit_depth != 16 && stream_start.player.bit_depth != 24 {
-                            eprintln!("ERROR: Unsupported bit depth {} - only 16 or 24-bit PCM supported!", stream_start.player.bit_depth);
-                            continue;
-                        }
-
-                        audio_format = Some(AudioFormat {
-                            codec: Codec::Pcm,
-                            sample_rate: stream_start.player.sample_rate,
-                            channels: stream_start.player.channels,
-                            bit_depth: stream_start.player.bit_depth,
-                            codec_header: None,
-                        });
-
-                        // Decoder will be created on first chunk after auto-detecting endianness
-                        decoder = None;
-                        endian_locked = None;
-                        buffered_duration_us = 0; // Reset on new stream
-                        playback_started = false;
-                        next_play_time = None;
-                        first_chunk_logged = false; // Reset for new stream
-                        println!("Waiting for first audio chunk to auto-detect endianness...");
                     }
                     Message::ServerTime(server_time) => {
                         // Get t4 (client receive time) in Unix microseconds
@@ -323,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             drop(sync); // Release lock
 
                             // Add safety window: ensure we never schedule in the past
-                            // Per spec: minimum lead (env RES_PLAY_MIN_LEAD_MS) to prevent late-chunk drops
+                            // Per spec: minimum lead (env SS_PLAY_MIN_LEAD_MS) to prevent late-chunk drops
                             let min_lead = Duration::from_millis(min_lead_ms);
                             let now = Instant::now();
                             let play_at = if play_at <= now + min_lead {

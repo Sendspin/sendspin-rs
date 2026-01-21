@@ -31,9 +31,9 @@ pub enum Message {
     #[serde(rename = "server/command")]
     ServerCommand(ServerCommand),
 
-    /// Player state update from client
-    #[serde(rename = "player/update")]
-    PlayerUpdate(PlayerUpdate),
+    /// Client state update (replaces player/update)
+    #[serde(rename = "client/state")]
+    ClientState(ClientState),
 }
 
 /// Client hello message
@@ -45,42 +45,41 @@ pub struct ClientHello {
     pub name: String,
     /// Protocol version number
     pub version: u32,
-    /// List of supported roles (e.g., "player", "metadata")
+    /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
-    /// Device information
-    pub device_info: DeviceInfo,
-    /// Player capabilities (if client supports player role)
+    /// Device information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub player_support: Option<PlayerSupport>,
-    /// Metadata capabilities (if client supports metadata role)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata_support: Option<MetadataSupport>,
+    pub device_info: Option<DeviceInfo>,
+    /// Player capabilities (if client supports player@v1 role)
+    #[serde(rename = "player@v1_support", skip_serializing_if = "Option::is_none")]
+    pub player_v1_support: Option<PlayerV1Support>,
+    /// Artwork capabilities (if client supports artwork@v1 role)
+    #[serde(rename = "artwork@v1_support", skip_serializing_if = "Option::is_none")]
+    pub artwork_v1_support: Option<ArtworkV1Support>,
+    /// Visualizer capabilities (if client supports visualizer@v1 role)
+    #[serde(rename = "visualizer@v1_support", skip_serializing_if = "Option::is_none")]
+    pub visualizer_v1_support: Option<VisualizerV1Support>,
 }
 
-/// Device information
+/// Device information (all fields optional per spec)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {
     /// Product name (e.g., "Sendspin-RS Player")
-    pub product_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_name: Option<String>,
     /// Manufacturer name
-    pub manufacturer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manufacturer: Option<String>,
     /// Software version string
-    pub software_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
 }
 
-/// Player capabilities
+/// Player@v1 capabilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerSupport {
-    /// List of supported codecs (e.g., ["pcm", "opus"])
-    pub support_codecs: Vec<String>,
-    /// List of supported channel counts (e.g., [1, 2] for mono and stereo)
-    pub support_channels: Vec<u8>,
-    /// List of supported sample rates (e.g., [44100, 48000, 96000])
-    pub support_sample_rates: Vec<u32>,
-    /// List of supported bit depths (e.g., [16, 24, 32])
-    pub support_bit_depth: Vec<u8>,
+pub struct PlayerV1Support {
     /// List of supported audio formats
-    pub support_formats: Vec<AudioFormatSpec>,
+    pub supported_formats: Vec<AudioFormatSpec>,
     /// Buffer capacity in chunks
     pub buffer_capacity: u32,
     /// List of supported playback commands
@@ -90,7 +89,7 @@ pub struct PlayerSupport {
 /// Audio format specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFormatSpec {
-    /// Codec name (e.g., "pcm", "opus")
+    /// Codec name (e.g., "pcm", "opus", "flac")
     pub codec: String,
     /// Number of audio channels
     pub channels: u8,
@@ -100,15 +99,18 @@ pub struct AudioFormatSpec {
     pub bit_depth: u8,
 }
 
-/// Metadata display capabilities
+/// Artwork@v1 capabilities
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetadataSupport {
-    /// Supported picture formats (e.g., "jpeg", "png")
-    pub support_picture_formats: Vec<String>,
-    /// Display width in pixels
-    pub media_width: u32,
-    /// Display height in pixels
-    pub media_height: u32,
+pub struct ArtworkV1Support {
+    /// Supported artwork channels (0-3)
+    pub channels: Vec<u8>,
+}
+
+/// Visualizer@v1 capabilities
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizerV1Support {
+    /// Buffer capacity for visualization data
+    pub buffer_capacity: u32,
 }
 
 /// Server hello message
@@ -120,6 +122,20 @@ pub struct ServerHello {
     pub name: String,
     /// Protocol version number
     pub version: u32,
+    /// List of roles activated by server for this client
+    pub active_roles: Vec<String>,
+    /// Reason for connection: 'discovery' or 'playback'
+    pub connection_reason: ConnectionReason,
+}
+
+/// Connection reason enum
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionReason {
+    /// Server connected for discovery/announcement
+    Discovery,
+    /// Server connected for active playback
+    Playback,
 }
 
 /// Client time sync message
@@ -143,8 +159,15 @@ pub struct ServerTime {
 /// Stream start message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStart {
-    /// Player stream configuration
-    pub player: StreamPlayerConfig,
+    /// Player stream configuration (optional - only if player role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<StreamPlayerConfig>,
+    /// Artwork stream configuration (optional - only if artwork role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<StreamArtworkConfig>,
+    /// Visualizer stream configuration (optional - only if visualizer role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visualizer: Option<StreamVisualizerConfig>,
 }
 
 /// Stream player configuration
@@ -163,9 +186,30 @@ pub struct StreamPlayerConfig {
     pub codec_header: Option<String>,
 }
 
-/// Server command message
+/// Stream artwork configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamArtworkConfig {
+    /// Active artwork channels
+    pub channels: Vec<u8>,
+}
+
+/// Stream visualizer configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamVisualizerConfig {
+    // FFT details TBD per spec
+}
+
+/// Server command message (wraps role-specific commands)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCommand {
+    /// Player command (if targeting player role)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerCommand>,
+}
+
+/// Player-specific command
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerCommand {
     /// Command name (e.g., "play", "pause", "stop")
     pub command: String,
     /// Optional volume level (0-100)
@@ -176,13 +220,42 @@ pub struct ServerCommand {
     pub mute: Option<bool>,
 }
 
-/// Player state update message
+/// Client state update message (wraps role-specific state)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlayerUpdate {
-    /// Current playback state (e.g., "playing", "paused", "stopped")
-    pub state: String,
-    /// Current volume level (0-100)
-    pub volume: u8,
-    /// Whether audio is muted
-    pub muted: bool,
+pub struct ClientState {
+    /// Player state (if player role active)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerState>,
 }
+
+/// Player state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerState {
+    /// Sync state: "synchronized" or "error"
+    pub state: PlayerSyncState,
+    /// Current volume level (0-100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    /// Whether audio is muted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
+}
+
+/// Player synchronization state
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerSyncState {
+    /// Player is synchronized with server clock
+    Synchronized,
+    /// Player encountered an error
+    Error,
+    /// Player is in use by an external system (e.g., different audio source, HDMI input)
+    ExternalSource,
+}
+
+// Legacy type aliases for backwards compatibility during migration
+#[deprecated(note = "Use PlayerV1Support instead")]
+pub type PlayerSupport = PlayerV1Support;
+
+#[deprecated(note = "Use ClientState instead")]
+pub type PlayerUpdate = ClientState;

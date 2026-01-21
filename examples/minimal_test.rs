@@ -3,7 +3,10 @@
 
 use clap::Parser;
 use sendspin::protocol::client::ProtocolClient;
-use sendspin::protocol::messages::{ClientHello, DeviceInfo, PlayerSupport, AudioFormatSpec, Message, PlayerUpdate};
+use sendspin::protocol::messages::{
+    AudioFormatSpec, ClientHello, ClientState, DeviceInfo, Message, PlayerState, PlayerSyncState,
+    PlayerV1Support,
+};
 
 /// Minimal Sendspin test client
 #[derive(Parser, Debug)]
@@ -24,27 +27,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: uuid::Uuid::new_v4().to_string(),
         name: "Minimal Test Client".to_string(),
         version: 1,
-        supported_roles: vec!["player".to_string()],
-        device_info: DeviceInfo {
-            product_name: "Minimal Test".to_string(),
-            manufacturer: "Sendspin".to_string(),
-            software_version: "0.1.0".to_string(),
-        },
-        player_support: Some(PlayerSupport {
-            support_codecs: vec!["pcm".to_string()],
-            support_channels: vec![2],
-            support_sample_rates: vec![48000],
-            support_bit_depth: vec![24],
-            support_formats: vec![AudioFormatSpec {
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: Some(DeviceInfo {
+            product_name: Some("Minimal Test".to_string()),
+            manufacturer: Some("Sendspin".to_string()),
+            software_version: Some("0.1.0".to_string()),
+        }),
+        player_v1_support: Some(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
                 codec: "pcm".to_string(),
                 channels: 2,
                 sample_rate: 48000,
                 bit_depth: 24,
             }],
-            buffer_capacity: 100,
-            supported_commands: vec!["play".to_string()],
+            buffer_capacity: 50 * 1024 * 1024, // 50 MB
+            supported_commands: vec!["volume".to_string()],
         }),
-        metadata_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
     };
 
     println!("Connecting to {}...", args.server);
@@ -54,14 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Split client
     let (mut message_rx, mut audio_rx, _clock_sync, ws_tx) = client.split();
 
-    // Send player/update (handshake step 3)
-    let player_update = Message::PlayerUpdate(PlayerUpdate {
-        state: "idle".to_string(),
-        volume: 100,
-        muted: false,
+    // Send client/state (handshake step 3)
+    let client_state = Message::ClientState(ClientState {
+        player: Some(PlayerState {
+            state: PlayerSyncState::Synchronized,
+            volume: Some(100),
+            muted: Some(false),
+        }),
     });
-    ws_tx.send_message(player_update).await?;
-    println!("Sent player/update");
+    ws_tx.send_message(client_state).await?;
+    println!("Sent client/state");
 
     println!("\nListening for ALL messages from server...\n");
 
