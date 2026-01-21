@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sample_rate: 48000,
                 bit_depth: 24,
             }],
-            buffer_capacity: 100,
+            buffer_capacity: 50 * 1024 * 1024, // 50 MB
             supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
         artwork_v1_support: None,
