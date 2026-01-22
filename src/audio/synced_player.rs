@@ -356,12 +356,21 @@ impl SyncedPlayer {
                         if schedule.drop_every_n_frames > 0 {
                             drop_counter = drop_counter.saturating_sub(1);
                             if drop_counter == 0 {
-                                let _ = queue.next_frame(channels, sample_rate);
+                                // Discard one frame to catch up
                                 let _ = queue.next_frame(channels, sample_rate);
                                 drop_counter = schedule.drop_every_n_frames;
-                                for sample in &last_frame {
-                                    data[out_index] = sample.0 as f32 / 8_388_607.0;
-                                    out_index += 1;
+                                // Get and output the next frame (don't repeat last_frame)
+                                if let Some(frame) = queue.next_frame(channels, sample_rate) {
+                                    last_frame.copy_from_slice(frame);
+                                    for sample in frame {
+                                        data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                        out_index += 1;
+                                    }
+                                } else {
+                                    for sample in &last_frame {
+                                        data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                        out_index += 1;
+                                    }
                                 }
                                 continue;
                             }
