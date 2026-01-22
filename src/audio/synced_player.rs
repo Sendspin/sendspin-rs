@@ -175,6 +175,8 @@ pub struct SyncedPlayer {
     format: AudioFormat,
     _stream: Stream,
     queue: Arc<Mutex<PlaybackQueue>>,
+    /// Last error from the audio stream callback, if any.
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl SyncedPlayer {
@@ -201,14 +203,18 @@ impl SyncedPlayer {
         let queue = Arc::new(Mutex::new(PlaybackQueue::new()));
         let queue_clone = Arc::clone(&queue);
         let format_clone = format.clone();
+        let last_error = Arc::new(Mutex::new(None));
+        let error_clone = Arc::clone(&last_error);
 
-        let stream = Self::build_stream(&device, &config, queue_clone, clock_sync, format_clone)?;
+        let stream =
+            Self::build_stream(&device, &config, queue_clone, clock_sync, format_clone, error_clone)?;
         stream.play().map_err(|e| Error::Output(e.to_string()))?;
 
         Ok(Self {
             format,
             _stream: stream,
             queue,
+            last_error,
         })
     }
 
@@ -227,12 +233,25 @@ impl SyncedPlayer {
         &self.format
     }
 
+    /// Check if the audio stream has encountered an error.
+    ///
+    /// Returns the error message if one occurred, clearing it in the process.
+    pub fn take_error(&self) -> Option<String> {
+        self.last_error.lock().take()
+    }
+
+    /// Check if the audio stream has an error without clearing it.
+    pub fn has_error(&self) -> bool {
+        self.last_error.lock().is_some()
+    }
+
     fn build_stream(
         device: &Device,
         config: &StreamConfig,
         queue: Arc<Mutex<PlaybackQueue>>,
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
+        error_sink: Arc<Mutex<Option<String>>>,
     ) -> Result<Stream, Error> {
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
@@ -372,7 +391,10 @@ impl SyncedPlayer {
 
                     }
                 },
-                |err| eprintln!("Audio stream error: {}", err),
+                move |err| {
+                    eprintln!("Audio stream error: {}", err);
+                    *error_sink.lock() = Some(err.to_string());
+                },
                 None,
             )
             .map_err(|e| Error::Output(e.to_string()))?;
