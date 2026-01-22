@@ -69,7 +69,7 @@ impl PlaybackQueue {
                     let frames = front.samples.len() / channels.max(1);
                     let duration_us =
                         (frames as i64 * 1_000_000) / sample_rate as i64;
-                    if front.timestamp + duration_us <= self.cursor_us {
+                    if front.timestamp + duration_us < self.cursor_us {
                         let _ = self.queue.pop_front();
                         continue;
                     }
