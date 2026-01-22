@@ -179,15 +179,19 @@ pub struct SyncedPlayer {
 }
 
 impl SyncedPlayer {
-    /// Create a new synced player using the provided clock sync.
+    /// Create a new synced player using the provided clock sync and optional device.
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<TokioMutex<ClockSync>>,
+        device: Option<Device>,
     ) -> Result<Self, Error> {
         let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| Error::Output("No output device available".to_string()))?;
+        let device = match device {
+            Some(device) => device,
+            None => host
+                .default_output_device()
+                .ok_or_else(|| Error::Output("No output device available".to_string()))?,
+        };
 
         let config = StreamConfig {
             channels: format.channels as u16,
