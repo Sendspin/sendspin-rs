@@ -34,6 +34,14 @@ impl AudioScheduler {
         self.incoming.is_empty() && self.sorted.lock().is_empty()
     }
 
+    /// Clear all queued buffers
+    pub fn clear(&self) {
+        // Drain incoming queue
+        while self.incoming.pop().is_some() {}
+        // Clear sorted buffers
+        self.sorted.lock().clear();
+    }
+
     /// Get next buffer that's ready to play (within 50ms window)
     pub fn next_ready(&self) -> Option<AudioBuffer> {
         // Take the lock once and do all operations under it
