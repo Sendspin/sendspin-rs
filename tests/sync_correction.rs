@@ -4,14 +4,7 @@ use sendspin::audio::{CorrectionPlanner, CorrectionSchedule};
 fn test_correction_deadband() {
     let planner = CorrectionPlanner::new();
     let schedule = planner.plan(1_000, 48_000);
-    assert_eq!(
-        schedule,
-        CorrectionSchedule {
-            insert_every_n_frames: 0,
-            drop_every_n_frames: 0,
-            reanchor: false,
-        }
-    );
+    assert_eq!(schedule, CorrectionSchedule::default());
 }
 
 #[test]

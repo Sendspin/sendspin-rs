@@ -239,11 +239,7 @@ impl SyncedPlayer {
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
         let mut last_frame = vec![Sample::ZERO; channels];
-        let mut schedule = CorrectionSchedule {
-            insert_every_n_frames: 0,
-            drop_every_n_frames: 0,
-            reanchor: false,
-        };
+        let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
         let mut drop_counter = 0u32;
         let mut started = false;
@@ -260,11 +256,7 @@ impl SyncedPlayer {
                     if generation != last_generation {
                         last_generation = generation;
                         started = false;
-                        schedule = CorrectionSchedule {
-                            insert_every_n_frames: 0,
-                            drop_every_n_frames: 0,
-                            reanchor: false,
-                        };
+                        schedule = CorrectionSchedule::default();
                         insert_counter = 0;
                         drop_counter = 0;
                         for sample in last_frame.iter_mut() {
@@ -328,11 +320,7 @@ impl SyncedPlayer {
                                         queue.force_reanchor = false;
                                     }
                                 }
-                                schedule = CorrectionSchedule {
-                                    insert_every_n_frames: 0,
-                                    drop_every_n_frames: 0,
-                                    reanchor: false,
-                                };
+                                schedule = CorrectionSchedule::default();
                                 insert_counter = 0;
                                 drop_counter = 0;
                             }

@@ -87,3 +87,13 @@ impl Default for CorrectionPlanner {
         Self::new()
     }
 }
+
+impl Default for CorrectionSchedule {
+    fn default() -> Self {
+        Self {
+            insert_every_n_frames: 0,
+            drop_every_n_frames: 0,
+            reanchor: false,
+        }
+    }
+}
