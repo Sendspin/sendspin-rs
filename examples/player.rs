@@ -3,13 +3,12 @@
 
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
-use sendspin::audio::{AudioBuffer, AudioFormat, AudioOutput, Codec, CpalOutput};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
 use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{
     AudioFormatSpec, ClientHello, ClientState, ClientTime, DeviceInfo, Message, PlayerState,
     PlayerSyncState, PlayerV1Support,
 };
-use sendspin::scheduler::AudioScheduler;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
@@ -124,49 +123,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create shared scheduler
-    let scheduler = Arc::new(AudioScheduler::new());
-    let scheduler_clone = Arc::clone(&scheduler);
-
-    // Spawn playback thread (not tokio task, since CpalOutput is !Send)
-    let playback_handle = std::thread::spawn(move || {
-        let mut output: Option<CpalOutput> = None;
-
-        loop {
-            if let Some(buffer) = scheduler_clone.next_ready() {
-                // Lazily initialize output when first buffer arrives
-                if output.is_none() {
-                    match CpalOutput::new(buffer.format.clone()) {
-                        Ok(out) => {
-                            println!("Audio output initialized");
-                            output = Some(out);
-                        }
-                        Err(e) => {
-                            eprintln!("Failed to create audio output: {}", e);
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(ref mut out) = output {
-                    if let Err(e) = out.write(&buffer.samples) {
-                        eprintln!("Output error: {}", e);
-                    }
-                }
-            }
-            // Per spec: 1ms polling to reduce enqueue jitter
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-
     // Configuration from environment variables
-    let min_lead_ms = env_u64("SS_PLAY_MIN_LEAD_MS", 200);
     let start_buffer_ms = env_u64("SS_PLAY_START_BUFFER_MS", 500);
     let log_lead = env_bool("SS_LOG_LEAD");
-
     println!(
-        "Player config: min_lead={}ms, start_buffer={}ms, log_lead={}",
-        min_lead_ms, start_buffer_ms, log_lead
+        "Player config: start_buffer={}ms, log_lead={}",
+        start_buffer_ms, log_lead
     );
 
     // Message handling variables
@@ -175,8 +137,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut endian_locked: Option<PcmEndian> = None; // Auto-detect on first chunk
     let mut buffered_duration_us: u64 = 0; // Track buffered audio duration in microseconds
     let mut playback_started = false; // Track if we've started playback
-    let mut next_play_time: Option<Instant> = None; // Track when next chunk should play
     let mut first_chunk_logged = false; // Track if we've logged the first chunk
+    let mut synced_player: Option<SyncedPlayer> = None;
 
     loop {
         // Process messages and audio chunks concurrently
@@ -218,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             endian_locked = None;
                             buffered_duration_us = 0; // Reset on new stream
                             playback_started = false;
-                            next_play_time = None;
                             first_chunk_logged = false; // Reset for new stream
                             println!("Waiting for first audio chunk to auto-detect endianness...");
                         } else {
@@ -237,10 +198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let t2 = server_time.server_received;
                         let t3 = server_time.server_transmitted;
 
-                        clock_sync.lock().await.update(t1, t2, t3, t4);
+                        clock_sync.lock().update(t1, t2, t3, t4);
 
                         // Log sync quality
-                        let sync = clock_sync.lock().await;
+                        let sync = clock_sync.lock();
                         if let Some(rtt) = sync.rtt_micros() {
                             let quality = sync.quality();
                             println!(
@@ -252,18 +213,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Message::StreamEnd(stream_end) => {
                         println!("Stream ended: {:?}", stream_end.roles);
-                        scheduler.clear();
+                        if let Some(ref player) = synced_player {
+                            player.clear();
+                        }
                         buffered_duration_us = 0;
                         playback_started = false;
-                        next_play_time = None;
                         first_chunk_logged = false;
                     }
                     Message::StreamClear(stream_clear) => {
                         println!("Stream cleared: {:?}", stream_clear.roles);
-                        scheduler.clear();
+                        if let Some(ref player) = synced_player {
+                            player.clear();
+                        }
                         buffered_duration_us = 0;
                         playback_started = false;
-                        next_play_time = None;
                         first_chunk_logged = false;
                     }
                     _ => {
@@ -325,35 +288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // samples.len() includes all channels
                             let frames = samples.len() / fmt.channels as usize;
                             let duration_micros = (frames as u64 * 1_000_000) / fmt.sample_rate as u64;
-                            let duration = Duration::from_micros(duration_micros);
-
-                            // Try to use clock sync to determine play_at time
-                            let sync = clock_sync.lock().await;
-                            let play_at = if let Some(instant) = sync.server_to_local_instant(chunk.timestamp) {
-                                // Clock sync is ready, use synchronized timestamp
-                                instant
-                            } else {
-                                // No clock sync yet, fall back to continuous scheduling
-                                if next_play_time.is_none() {
-                                    // Start from now + initial buffer
-                                    next_play_time = Some(Instant::now() + Duration::from_millis(start_buffer_ms));
-                                }
-                                let play_time = next_play_time.unwrap();
-                                next_play_time = Some(play_time + duration);
-                                play_time
-                            };
-                            drop(sync); // Release lock
-
-                            // Add safety window: ensure we never schedule in the past
-                            // Per spec: minimum lead (env SS_PLAY_MIN_LEAD_MS) to prevent late-chunk drops
-                            let min_lead = Duration::from_millis(min_lead_ms);
-                            let now = Instant::now();
-                            let play_at = if play_at <= now + min_lead {
-                                now + min_lead
-                            } else {
-                                play_at
-                            };
-
                             // Track buffered duration
                             buffered_duration_us += duration_micros;
 
@@ -367,27 +301,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             // Track and log lead time
-                            let lead = play_at.saturating_duration_since(Instant::now());
-                            let lead_us = lead.as_micros() as u64;
                             if log_lead {
                                 println!(
-                                    "Enqueued chunk ts={} lead={}µs ({:.1}ms) buffered={:.1}ms len={} bytes",
+                                    "Enqueued chunk ts={} buffered={:.1}ms len={} bytes",
                                     chunk.timestamp,
-                                    lead_us,
-                                    lead_us as f64 / 1000.0,
                                     buffered_duration_us as f64 / 1000.0,
                                     chunk.data.len()
                                 );
                             }
 
-                            let buffer = AudioBuffer {
-                                timestamp: chunk.timestamp,
-                                play_at,
-                                samples,
-                                format: fmt.clone(),
-                            };
+                            if synced_player.is_none() {
+                                match SyncedPlayer::new(
+                                    fmt.clone(),
+                                    Arc::clone(&clock_sync),
+                                    None,
+                                ) {
+                                    Ok(player) => {
+                                        println!("Synced audio output initialized");
+                                        synced_player = Some(player);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Failed to create synced output: {}", e);
+                                    }
+                                }
+                            }
 
-                            scheduler.schedule(buffer);
+                            if let Some(ref player) = synced_player {
+                                let buffer = AudioBuffer {
+                                    timestamp: chunk.timestamp,
+                                    play_at: Instant::now(),
+                                    samples,
+                                    format: fmt.clone(),
+                                };
+                                player.enqueue(buffer);
+                            }
                         }
                         Err(e) => {
                             eprintln!("Decode error: {}", e);
@@ -402,8 +349,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Note: playback_handle will be cleaned up when program exits
-    // We don't join() here since the thread runs an infinite loop
-    drop(playback_handle);
     Ok(())
 }

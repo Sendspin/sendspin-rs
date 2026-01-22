@@ -72,3 +72,30 @@ fn test_scheduler_clear() {
     assert!(scheduler.is_empty());
     assert!(scheduler.next_ready().is_none());
 }
+
+#[test]
+fn test_scheduler_latency_compensation() {
+    let scheduler = AudioScheduler::new();
+
+    let format = AudioFormat {
+        codec: Codec::Pcm,
+        sample_rate: 48000,
+        channels: 2,
+        bit_depth: 24,
+        codec_header: None,
+    };
+
+    let samples = vec![Sample::ZERO; 960];
+    let buffer = AudioBuffer {
+        timestamp: 0,
+        play_at: Instant::now() + Duration::from_millis(50),
+        samples: Arc::from(samples.into_boxed_slice()),
+        format,
+    };
+
+    scheduler.schedule(buffer);
+
+    assert!(scheduler.next_ready().is_none());
+    let ready = scheduler.next_ready_with_latency(Duration::from_millis(60));
+    assert!(ready.is_some());
+}

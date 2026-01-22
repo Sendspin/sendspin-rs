@@ -8,6 +8,7 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -237,7 +238,7 @@ pub struct ProtocolClient {
     artwork_rx: UnboundedReceiver<ArtworkChunk>,
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
     message_rx: UnboundedReceiver<Message>,
-    clock_sync: Arc<tokio::sync::Mutex<ClockSync>>,
+    clock_sync: Arc<Mutex<ClockSync>>,
 }
 
 impl ProtocolClient {
@@ -321,7 +322,7 @@ impl ProtocolClient {
         let (visualizer_tx, visualizer_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
 
-        let clock_sync = Arc::new(tokio::sync::Mutex::new(ClockSync::new()));
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
 
         // Spawn message router task
         let clock_sync_clone = Arc::clone(&clock_sync);
@@ -353,7 +354,7 @@ impl ProtocolClient {
         artwork_tx: UnboundedSender<ArtworkChunk>,
         visualizer_tx: UnboundedSender<VisualizerChunk>,
         message_tx: UnboundedSender<Message>,
-        _clock_sync: Arc<tokio::sync::Mutex<ClockSync>>,
+        _clock_sync: Arc<Mutex<ClockSync>>,
     ) {
         while let Some(msg) = read.next().await {
             match msg {
@@ -453,7 +454,7 @@ impl ProtocolClient {
     }
 
     /// Get reference to clock sync
-    pub fn clock_sync(&self) -> Arc<tokio::sync::Mutex<ClockSync>> {
+    pub fn clock_sync(&self) -> Arc<Mutex<ClockSync>> {
         Arc::clone(&self.clock_sync)
     }
 
@@ -466,7 +467,7 @@ impl ProtocolClient {
     ) -> (
         UnboundedReceiver<Message>,
         UnboundedReceiver<AudioChunk>,
-        Arc<tokio::sync::Mutex<ClockSync>>,
+        Arc<Mutex<ClockSync>>,
         WsSender,
     ) {
         (
@@ -487,7 +488,7 @@ impl ProtocolClient {
         UnboundedReceiver<AudioChunk>,
         UnboundedReceiver<ArtworkChunk>,
         UnboundedReceiver<VisualizerChunk>,
-        Arc<tokio::sync::Mutex<ClockSync>>,
+        Arc<Mutex<ClockSync>>,
         WsSender,
     ) {
         (

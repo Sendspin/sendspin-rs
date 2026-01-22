@@ -1,5 +1,19 @@
 use sendspin::sync::ClockSync;
 
+/// Assert that two values are within tolerance (microseconds precision)
+fn assert_within(actual: Option<i64>, expected: i64, tolerance: i64) {
+    let actual = actual.expect("expected Some value");
+    let diff = (actual - expected).abs();
+    assert!(
+        diff <= tolerance,
+        "expected {} ± {}, got {} (diff: {})",
+        expected,
+        tolerance,
+        actual,
+        diff
+    );
+}
+
 #[test]
 fn test_clock_sync_rtt_calculation() {
     let mut sync = ClockSync::new();
@@ -17,20 +31,20 @@ fn test_clock_sync_rtt_calculation() {
 }
 
 #[test]
-fn test_server_to_local_conversion() {
+fn test_server_to_client_conversion() {
     let mut sync = ClockSync::new();
 
     let t1 = 1_000_000;
-    let t2 = 500_000;
-    let t3 = 500_010;
-    let t4 = 1_000_050;
+    let t2 = 1_005_100;
+    let t3 = 1_005_100;
+    let t4 = 1_000_200;
 
     sync.update(t1, t2, t3, t4);
+    sync.update(2_000_000, 2_005_100, 2_005_100, 2_000_200);
 
-    // Server loop start = t4 - t3 = 1_000_050 - 500_010 = 500_040 Unix µs
-    // Converting server time 520_000 should give us ~520_040 Unix µs
-    let local = sync.server_to_local_instant(520_000);
-    assert!(local.is_some());
+    let client_micros = sync.server_to_client_micros(2_005_000);
+    // Kalman filter may introduce small rounding errors
+    assert_within(client_micros, 2_000_000, 10);
 }
 
 #[test]
@@ -44,4 +58,16 @@ fn test_sync_quality() {
     // Degraded RTT (75ms = 75,000µs)
     sync.update(2_000_000, 600_000, 600_010, 2_075_010);
     assert_eq!(sync.quality(), sendspin::sync::SyncQuality::Degraded);
+}
+
+#[test]
+fn test_clock_drift_correction() {
+    let mut sync = ClockSync::new();
+
+    sync.update(1_000_000, 1_005_100, 1_005_100, 1_000_200);
+    sync.update(2_000_000, 2_005_200, 2_005_200, 2_000_200);
+
+    let server_time = sync.client_to_server_micros(3_000_200);
+    // Kalman filter may introduce small rounding errors
+    assert_within(server_time, 3_005_400, 10);
 }
