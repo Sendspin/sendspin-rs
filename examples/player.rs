@@ -198,10 +198,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let t2 = server_time.server_received;
                         let t3 = server_time.server_transmitted;
 
-                        clock_sync.lock().await.update(t1, t2, t3, t4);
+                        clock_sync.lock().update(t1, t2, t3, t4);
 
                         // Log sync quality
-                        let sync = clock_sync.lock().await;
+                        let sync = clock_sync.lock();
                         if let Some(rtt) = sync.rtt_micros() {
                             let quality = sync.quality();
                             println!(

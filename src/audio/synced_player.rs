@@ -11,7 +11,6 @@ use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex as TokioMutex;
 
 struct PlaybackQueue {
     queue: VecDeque<AudioBuffer>,
@@ -182,7 +181,7 @@ impl SyncedPlayer {
     /// Create a new synced player using the provided clock sync and optional device.
     pub fn new(
         format: AudioFormat,
-        clock_sync: Arc<TokioMutex<ClockSync>>,
+        clock_sync: Arc<Mutex<ClockSync>>,
         device: Option<Device>,
     ) -> Result<Self, Error> {
         let host = cpal::default_host();
@@ -232,7 +231,7 @@ impl SyncedPlayer {
         device: &Device,
         config: &StreamConfig,
         queue: Arc<Mutex<PlaybackQueue>>,
-        clock_sync: Arc<TokioMutex<ClockSync>>,
+        clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
     ) -> Result<Stream, Error> {
         let channels = format.channels as usize;
@@ -280,7 +279,7 @@ impl SyncedPlayer {
                         }
                     };
 
-                    if let (Some(cursor_us), Ok(sync)) = (cursor_us, clock_sync.try_lock()) {
+                    if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
                         if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
                             let early_window = Duration::from_millis(1);
                             if !started && playback_instant + early_window < expected_instant {
