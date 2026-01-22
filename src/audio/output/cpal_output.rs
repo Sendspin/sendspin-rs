@@ -6,6 +6,7 @@ use crate::audio::{AudioFormat, Sample};
 use crate::error::Error;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, StreamConfig};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,7 @@ pub struct CpalOutput {
     format: AudioFormat,
     _stream: Stream,
     sample_tx: SyncSender<Arc<[Sample]>>,
-    latency_micros: Arc<Mutex<u64>>,
+    latency_micros: Arc<AtomicU64>,
 }
 
 impl CpalOutput {
@@ -51,7 +52,7 @@ impl CpalOutput {
 
         // Use bounded channel for backpressure (10 buffers max = ~200ms at 20ms chunks)
         let (sample_tx, sample_rx) = sync_channel::<Arc<[Sample]>>(10);
-        let latency_micros = Arc::new(Mutex::new(0u64));
+        let latency_micros = Arc::new(AtomicU64::new(0));
         let latency_clone = Arc::clone(&latency_micros);
 
         let stream = Self::build_stream(&device, &config, sample_rx, latency_clone)?;
@@ -69,7 +70,7 @@ impl CpalOutput {
         device: &Device,
         config: &StreamConfig,
         sample_rx: Receiver<Arc<[Sample]>>,
-        _latency_micros: Arc<Mutex<u64>>,
+        latency_micros: Arc<AtomicU64>,
     ) -> Result<Stream, Error> {
         let sample_rx = Arc::new(Mutex::new(sample_rx));
         let mut current_buffer: Option<Arc<[Sample]>> = None;
@@ -78,7 +79,11 @@ impl CpalOutput {
         let stream = device
             .build_output_stream(
                 config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    let ts = info.timestamp();
+                    if let Some(latency) = ts.playback.duration_since(&ts.callback) {
+                        latency_micros.store(latency.as_micros() as u64, Ordering::Relaxed);
+                    }
                     for sample_out in data.iter_mut() {
                         // Get next sample from current buffer or receive new buffer
                         if current_buffer.is_none()
@@ -125,7 +130,7 @@ impl AudioOutput for CpalOutput {
     }
 
     fn latency_micros(&self) -> u64 {
-        *self.latency_micros.lock().unwrap()
+        self.latency_micros.load(Ordering::Relaxed)
     }
 
     fn format(&self) -> &AudioFormat {

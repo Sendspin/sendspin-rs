@@ -44,6 +44,11 @@ impl AudioScheduler {
 
     /// Get next buffer that's ready to play (within 50ms window)
     pub fn next_ready(&self) -> Option<AudioBuffer> {
+        self.next_ready_with_latency(Duration::ZERO)
+    }
+
+    /// Get next buffer that's ready to play, compensating for output latency
+    pub fn next_ready_with_latency(&self, output_latency: Duration) -> Option<AudioBuffer> {
         // Take the lock once and do all operations under it
         let mut sorted = self.sorted.lock();
 
@@ -63,7 +68,7 @@ impl AudioScheduler {
         // Check if first buffer is ready
         if let Some(buf) = sorted.first() {
             // Check if play_at time has passed or is within early window
-            if buf.play_at <= now + early_ok {
+            if buf.play_at <= now + early_ok + output_latency {
                 // Ready to play, late, or within 1ms early (tolerate jitter)
                 return Some(sorted.remove(0));
             }
