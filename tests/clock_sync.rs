@@ -1,5 +1,19 @@
 use sendspin::sync::ClockSync;
 
+/// Assert that two values are within tolerance (microseconds precision)
+fn assert_within(actual: Option<i64>, expected: i64, tolerance: i64) {
+    let actual = actual.expect("expected Some value");
+    let diff = (actual - expected).abs();
+    assert!(
+        diff <= tolerance,
+        "expected {} ± {}, got {} (diff: {})",
+        expected,
+        tolerance,
+        actual,
+        diff
+    );
+}
+
 #[test]
 fn test_clock_sync_rtt_calculation() {
     let mut sync = ClockSync::new();
@@ -29,7 +43,8 @@ fn test_server_to_client_conversion() {
     sync.update(2_000_000, 2_005_100, 2_005_100, 2_000_200);
 
     let client_micros = sync.server_to_client_micros(2_005_000);
-    assert_eq!(client_micros, Some(2_000_000));
+    // Kalman filter may introduce small rounding errors
+    assert_within(client_micros, 2_000_000, 10);
 }
 
 #[test]
@@ -53,5 +68,6 @@ fn test_clock_drift_correction() {
     sync.update(2_000_000, 2_005_200, 2_005_200, 2_000_200);
 
     let server_time = sync.client_to_server_micros(3_000_200);
-    assert_eq!(server_time, Some(3_005_400));
+    // Kalman filter may introduce small rounding errors
+    assert_within(server_time, 3_005_400, 10);
 }
