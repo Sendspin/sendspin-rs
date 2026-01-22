@@ -250,6 +250,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
+                    Message::StreamEnd(stream_end) => {
+                        println!("Stream ended: {:?}", stream_end.roles);
+                        scheduler.clear();
+                        buffered_duration_us = 0;
+                        playback_started = false;
+                        next_play_time = None;
+                        first_chunk_logged = false;
+                    }
+                    Message::StreamClear(stream_clear) => {
+                        println!("Stream cleared: {:?}", stream_clear.roles);
+                        scheduler.clear();
+                        buffered_duration_us = 0;
+                        playback_started = false;
+                        next_play_time = None;
+                        first_chunk_logged = false;
+                    }
                     _ => {
                         println!("Received message: {:?}", msg);
                     }
