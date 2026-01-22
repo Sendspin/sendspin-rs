@@ -40,3 +40,35 @@ fn test_scheduler_schedule_and_ready() {
     let ready = scheduler.next_ready();
     assert!(ready.is_some());
 }
+
+#[test]
+fn test_scheduler_clear() {
+    let scheduler = AudioScheduler::new();
+
+    let format = AudioFormat {
+        codec: Codec::Pcm,
+        sample_rate: 48000,
+        channels: 2,
+        bit_depth: 24,
+        codec_header: None,
+    };
+
+    // Schedule multiple buffers
+    for i in 0..3 {
+        let samples = vec![Sample::ZERO; 960];
+        let buffer = AudioBuffer {
+            timestamp: i * 1000,
+            play_at: Instant::now() + Duration::from_millis(10),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format: format.clone(),
+        };
+        scheduler.schedule(buffer);
+    }
+
+    assert!(!scheduler.is_empty());
+
+    // Clear and verify empty
+    scheduler.clear();
+    assert!(scheduler.is_empty());
+    assert!(scheduler.next_ready().is_none());
+}

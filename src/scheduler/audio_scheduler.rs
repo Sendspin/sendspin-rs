@@ -36,10 +36,10 @@ impl AudioScheduler {
 
     /// Clear all queued buffers
     pub fn clear(&self) {
-        // Drain incoming queue
+        // Hold lock while draining to prevent race with schedule()/next_ready()
+        let mut sorted = self.sorted.lock();
         while self.incoming.pop().is_some() {}
-        // Clear sorted buffers
-        self.sorted.lock().clear();
+        sorted.clear();
     }
 
     /// Get next buffer that's ready to play (within 50ms window)
