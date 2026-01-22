@@ -93,14 +93,24 @@ pub struct AudioFormat {
     pub codec_header: Option<Vec<u8>>,
 }
 
-/// Audio buffer with timestamp (zero-copy via Arc)
+/// Audio buffer with timestamp (zero-copy via Arc).
+///
+/// Note: [`SyncedPlayer`](crate::audio::SyncedPlayer) uses only `timestamp` for
+/// scheduling and ignores `play_at`. The `play_at` field is used by
+/// [`AudioScheduler`](crate::scheduler::AudioScheduler) for pre-computed local
+/// playback times.
 pub struct AudioBuffer {
-    /// Server loop timestamp in microseconds
+    /// Server loop timestamp in microseconds.
+    ///
+    /// Used by [`SyncedPlayer`](crate::audio::SyncedPlayer) for drift-corrected scheduling.
     pub timestamp: i64,
-    /// Computed local playback time
+    /// Computed local playback time.
+    ///
+    /// Used by [`AudioScheduler`](crate::scheduler::AudioScheduler). Ignored by
+    /// [`SyncedPlayer`](crate::audio::SyncedPlayer) which computes timing from `timestamp`.
     pub play_at: Instant,
-    /// Immutable, shareable sample data
+    /// Immutable, shareable sample data.
     pub samples: Arc<[Sample]>,
-    /// Audio format specification
+    /// Audio format specification.
     pub format: AudioFormat,
 }

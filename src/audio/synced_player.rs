@@ -219,6 +219,9 @@ impl SyncedPlayer {
     }
 
     /// Enqueue a decoded buffer for playback.
+    ///
+    /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
+    /// drift-corrected playback. The `play_at` field is ignored.
     pub fn enqueue(&self, buffer: AudioBuffer) {
         self.queue.lock().push(buffer);
     }
