@@ -2,6 +2,7 @@
 // ABOUTME: Just connects and prints everything the server sends
 
 use clap::Parser;
+use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{ClientState, Message, PlayerState, PlayerSyncState};
 use sendspin::ProtocolClientBuilder;
 
@@ -22,12 +23,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
-        .server_url(args.server)
         .client_id(uuid::Uuid::new_v4().to_string())
         .name("Minimal Test Client".to_string())
         .build();
 
-    let client = test.connect().await?;
+    let client = test.connect(&args.server).await?;
     println!("Connected! Server said hello.");
 
     // Split client

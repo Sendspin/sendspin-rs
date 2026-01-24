@@ -27,12 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connecting to {}...", &args.server);
 
     let test = ProtocolClientBuilder::builder()
-        .server_url(args.server)
         .client_id(uuid::Uuid::new_v4().to_string())
         .name(args.name.clone())
         .build();
 
-    let _client = test.connect().await?;
+    let _client = test.connect(&args.server).await?;
 
     println!("Connected! Waiting for server hello...");
 

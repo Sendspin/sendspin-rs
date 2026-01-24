@@ -234,7 +234,6 @@ impl BinaryFrame {
 #[derive(TypedBuilder, Clone)]
 /// Builder Class for ProtocolClient
 pub struct ProtocolClientBuilder {
-    server_url: String,
     client_id: String,
     name: String,
     #[builder(default=None)]
@@ -245,7 +244,7 @@ pub struct ProtocolClientBuilder {
 
 impl ProtocolClientBuilder {
     /// Connect to Sendspin server
-    pub async fn connect(self) -> Result<ProtocolClient, Error> {
+    pub async fn connect(self, url: &str) -> Result<ProtocolClient, Error> {
         let hello = ClientHello {
             client_id: self.client_id.clone(),
             name: self.name.clone(),
@@ -269,24 +268,6 @@ impl ProtocolClientBuilder {
             artwork_v1_support: None,
             visualizer_v1_support: None,
         };
-        ProtocolClient::connect(&self.server_url, hello).await
-    }
-}
-
-/// WebSocket client for Sendspin protocol
-pub struct ProtocolClient {
-    ws_tx:
-        Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
-    audio_rx: UnboundedReceiver<AudioChunk>,
-    artwork_rx: UnboundedReceiver<ArtworkChunk>,
-    visualizer_rx: UnboundedReceiver<VisualizerChunk>,
-    message_rx: UnboundedReceiver<Message>,
-    clock_sync: Arc<Mutex<ClockSync>>,
-}
-
-impl ProtocolClient {
-    /// Connect to Sendspin server
-    pub async fn connect(url: &str, hello: ClientHello) -> Result<Self, Error> {
         // Connect WebSocket
         let (ws_stream, _) = connect_async(url)
             .await
@@ -373,7 +354,7 @@ impl ProtocolClient {
         // Spawn message router task
         let clock_sync_clone = Arc::clone(&clock_sync);
         tokio::spawn(async move {
-            Self::message_router(
+            ProtocolClient::message_router(
                 read_temp,
                 audio_tx,
                 artwork_tx,
@@ -384,7 +365,7 @@ impl ProtocolClient {
             .await;
         });
 
-        Ok(Self {
+        Ok(ProtocolClient {
             ws_tx: Arc::new(tokio::sync::Mutex::new(write)),
             audio_rx,
             artwork_rx,
@@ -393,7 +374,20 @@ impl ProtocolClient {
             clock_sync,
         })
     }
+}
 
+/// WebSocket client for Sendspin protocol
+pub struct ProtocolClient {
+    ws_tx:
+        Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    audio_rx: UnboundedReceiver<AudioChunk>,
+    artwork_rx: UnboundedReceiver<ArtworkChunk>,
+    visualizer_rx: UnboundedReceiver<VisualizerChunk>,
+    message_rx: UnboundedReceiver<Message>,
+    clock_sync: Arc<Mutex<ClockSync>>,
+}
+
+impl ProtocolClient {
     async fn message_router(
         mut read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
         audio_tx: UnboundedSender<AudioChunk>,
