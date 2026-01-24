@@ -2,7 +2,9 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
-use crate::protocol::messages::{ClientHello, Message};
+use crate::protocol::messages::{
+    AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerV1Support,
+};
 use crate::sync::ClockSync;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -14,7 +16,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-
+use typed_builder::TypedBuilder;
 /// WebSocket sender wrapper for sending messages
 pub struct WsSender {
     tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
@@ -124,9 +126,8 @@ impl ArtworkChunk {
         }
 
         let type_id = frame[0];
-        let channel = binary_types::artwork_channel(type_id).ok_or_else(|| {
-            Error::Protocol(format!("Invalid artwork chunk type: {}", type_id))
-        })?;
+        let channel = binary_types::artwork_channel(type_id)
+            .ok_or_else(|| Error::Protocol(format!("Invalid artwork chunk type: {}", type_id)))?;
 
         let timestamp = i64::from_be_bytes([
             frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8],
@@ -230,6 +231,48 @@ impl BinaryFrame {
     }
 }
 
+#[derive(TypedBuilder, Clone)]
+/// Builder Class for ProtocolClient
+pub struct ProtocolClientBuilder {
+    server_url: String,
+    client_id: String,
+    name: String,
+    #[builder(default=None)]
+    product_name: Option<String>,
+    #[builder(default=None)]
+    manufacturer: Option<String>,
+}
+
+impl ProtocolClientBuilder {
+    /// Connect to Sendspin server
+    pub async fn connect(self) -> Result<ProtocolClient, Error> {
+        let hello = ClientHello {
+            client_id: self.client_id.clone(),
+            name: self.name.clone(),
+            version: 1,
+            supported_roles: vec!["player@v1".to_string()],
+            device_info: Some(DeviceInfo {
+                product_name: self.product_name.clone(),
+                manufacturer: Some(self.manufacturer.unwrap_or("Sendspin".to_string())),
+                software_version: Some("0.1.0".to_string()),
+            }),
+            player_v1_support: Some(PlayerV1Support {
+                supported_formats: vec![AudioFormatSpec {
+                    codec: "pcm".to_string(),
+                    channels: 2,
+                    sample_rate: 48000,
+                    bit_depth: 24,
+                }],
+                buffer_capacity: 50 * 1024 * 1024, // 50 MB
+                supported_commands: vec!["volume".to_string(), "mute".to_string()],
+            }),
+            artwork_v1_support: None,
+            visualizer_v1_support: None,
+        };
+        ProtocolClient::connect(&self.server_url, hello).await
+    }
+}
+
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
     ws_tx:
@@ -302,7 +345,10 @@ impl ProtocolClient {
                         return Err(Error::Connection("Server closed connection".to_string()));
                     }
                     Ok(other) => {
-                        log::warn!("Unexpected message type while waiting for hello: {:?}", other);
+                        log::warn!(
+                            "Unexpected message type while waiting for hello: {:?}",
+                            other
+                        );
                         continue;
                     }
                     Err(e) => {
