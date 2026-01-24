@@ -10,7 +10,7 @@ repository = "https://github.com/Sendspin/sendspin-rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
 # Serialization
@@ -32,6 +32,7 @@ crossbeam = "0.8"
 
 # Fast mutexes
 parking_lot = "0.12"
+tungstenite = "0.24.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
