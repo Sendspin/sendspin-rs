@@ -87,13 +87,18 @@ impl PlaybackQueue {
             }
         }
 
+        // Only advance index and cursor when we actually have a frame
+        // to return. During underruns (current is None), advancing the
+        // cursor would cause post-stall buffers to be dropped as stale.
+        let len = self.current.as_ref()?.samples.len();
         let start = self.index;
         let end = self.index + channels;
+        debug_assert!(end <= len, "index overran buffer: {} > {}", end, len);
         self.index = end;
         self.advance_cursor(sample_rate);
-
-        let current = self.current.as_ref()?;
-        Some(&current.samples[start..end])
+        // Safety: self.current cannot become None between the ?-check
+        // above and here — nothing in between mutates it.
+        Some(&self.current.as_ref().unwrap().samples[start..end])
     }
 
     fn advance_cursor(&mut self, sample_rate: u32) {
@@ -167,6 +172,53 @@ mod tests {
         let frame = queue.next_frame(2, 48_000);
         assert!(frame.is_some());
         assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
+    }
+
+    #[test]
+    fn test_cursor_does_not_advance_during_underrun() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        // Push one buffer, drain it fully to initialize the cursor.
+        let samples = vec![Sample::ZERO; 2]; // 1 frame
+        queue.push(AudioBuffer {
+            timestamp: 1_000_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format: format.clone(),
+        });
+        let _ = queue.next_frame(2, 48_000); // consumes the one frame
+        let cursor_after_drain = queue.cursor_us;
+
+        // Queue is now empty. Simulate 480 underrun frames (10ms).
+        for _ in 0..480 {
+            assert!(queue.next_frame(2, 48_000).is_none());
+        }
+
+        // Cursor must not have moved during underrun.
+        assert_eq!(
+            queue.cursor_us, cursor_after_drain,
+            "cursor advanced during underrun — post-stall buffers would be dropped as stale"
+        );
+
+        // Push a new buffer at the cursor position. It must not be
+        // dropped as stale — this is the actual recovery path.
+        let samples = vec![Sample(42); 2]; // 1 frame, non-zero so we can verify
+        queue.push(AudioBuffer {
+            timestamp: cursor_after_drain,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+        let frame = queue.next_frame(2, 48_000);
+        assert!(frame.is_some(), "post-underrun buffer was dropped as stale");
+        assert_eq!(frame.unwrap()[0], Sample(42), "recovered wrong buffer");
     }
 }
 
