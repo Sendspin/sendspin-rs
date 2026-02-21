@@ -363,12 +363,12 @@ impl SyncedPlayer {
                                 if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                     last_frame.copy_from_slice(frame);
                                     for sample in frame {
-                                        data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                        data[out_index] = sample.to_f32();
                                         out_index += 1;
                                     }
                                 } else {
                                     for sample in &last_frame {
-                                        data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                        data[out_index] = sample.to_f32();
                                         out_index += 1;
                                     }
                                 }
@@ -381,7 +381,7 @@ impl SyncedPlayer {
                             if insert_counter == 0 {
                                 insert_counter = schedule.insert_every_n_frames;
                                 for sample in &last_frame {
-                                    data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                    data[out_index] = sample.to_f32();
                                     out_index += 1;
                                 }
                                 continue;
@@ -391,7 +391,7 @@ impl SyncedPlayer {
                         if let Some(frame) = queue.next_frame(channels, sample_rate) {
                             last_frame.copy_from_slice(frame);
                             for sample in frame {
-                                data[out_index] = sample.0 as f32 / 8_388_607.0;
+                                data[out_index] = sample.to_f32();
                                 out_index += 1;
                             }
                         } else {
