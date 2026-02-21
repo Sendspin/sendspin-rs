@@ -186,6 +186,9 @@ impl SyncedPlayer {
         clock_sync: Arc<Mutex<ClockSync>>,
         device: Option<Device>,
     ) -> Result<Self, Error> {
+        if format.channels == 0 {
+            return Err(Error::Output("channels must be > 0".to_string()));
+        }
         let host = cpal::default_host();
         let device = match device {
             Some(device) => device,

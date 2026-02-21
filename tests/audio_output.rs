@@ -37,3 +37,17 @@ fn test_audio_output_write() {
     let result = output.write(&samples_arc);
     assert!(result.is_ok());
 }
+
+#[test]
+fn test_audio_output_rejects_zero_channels() {
+    let format = AudioFormat {
+        codec: Codec::Pcm,
+        sample_rate: 48000,
+        channels: 0,
+        bit_depth: 24,
+        codec_header: None,
+    };
+
+    let result = CpalOutput::new(format);
+    assert!(result.is_err());
+}
