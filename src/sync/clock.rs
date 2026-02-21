@@ -191,18 +191,22 @@ impl ClockSync {
     pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
         // RTT = (t4 - t1) - (t3 - t2)
         let rtt = (t4 - t1) - (t3 - t2);
-        self.rtt_micros = Some(rtt);
 
-        // Discard samples with high RTT (network congestion)
-        if rtt > 100_000 {
-            // 100ms
-            eprintln!("Discarding sync sample: high RTT {}µs", rtt);
+        // Discard negative RTT (misordered timestamps) and high RTT
+        // (network congestion). Store only valid RTT so that quality()
+        // doesn't report Good on a negative value.
+        if rtt < 0 || rtt > 100_000 {
             return;
         }
+        self.rtt_micros = Some(rtt);
 
         // NTP offset = ((t2 - t1) + (t3 - t4)) / 2
         let measurement = ((t2 - t1) + (t3 - t4)) / 2;
-        let max_error = (rtt / 2).max(0);
+        // Floor max_error at 1µs so the Kalman filter always sees
+        // nonzero measurement variance. RTT = 0 is legitimate on
+        // localhost; without this floor, repeated zero-variance
+        // samples would drive covariance to zero and eventually NaN.
+        let max_error = (rtt / 2).max(1);
 
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
