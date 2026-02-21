@@ -71,3 +71,23 @@ fn test_clock_drift_correction() {
     // Kalman filter may introduce small rounding errors
     assert_within(server_time, 3_005_400, 10);
 }
+
+#[test]
+fn test_diverged_drift_returns_none() {
+    let mut sync = ClockSync::new();
+
+    // Two samples 10µs apart where the NTP offset drops from 100 to 88,
+    // giving drift = -1.2 — far beyond any real hardware clock skew.
+    // Both conversions should return None rather than produce garbage.
+    sync.update(1000, 1100, 1100, 1000);
+    sync.update(1010, 1098, 1098, 1010);
+
+    assert!(
+        sync.server_to_client_micros(2000).is_none(),
+        "server_to_client should return None when drift has diverged"
+    );
+    assert!(
+        sync.client_to_server_micros(2000).is_none(),
+        "client_to_server should return None when drift has diverged"
+    );
+}
