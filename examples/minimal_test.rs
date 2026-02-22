@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected! Server said hello.");
 
     // Split client
-    let (mut message_rx, mut audio_rx, _clock_sync, ws_tx) = client.split();
+    let (mut message_rx, mut audio_rx, _clock_sync, ws_tx, _guard) = client.split();
 
     // Send client/state (handshake step 3)
     let client_state = Message::ClientState(ClientState {
