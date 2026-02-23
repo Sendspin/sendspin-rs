@@ -88,6 +88,18 @@ cargo run --example basic_client
 cargo build --release
 ```
 
+### Verification (cargo-make)
+
+```bash
+# Install cargo-make (one time)
+cargo install cargo-make
+
+# Run the full verification suite
+cargo make verify
+```
+
+`cargo make verify` runs: tests, Clippy, doc build, doctests, and formatting checks.
+
 ## Testing
 
 ```bash

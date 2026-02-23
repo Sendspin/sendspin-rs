@@ -66,8 +66,7 @@ impl PlaybackQueue {
             if self.initialized {
                 while let Some(front) = self.queue.front() {
                     let frames = front.samples.len() / channels.max(1);
-                    let duration_us =
-                        (frames as i64 * 1_000_000) / sample_rate as i64;
+                    let duration_us = (frames as i64 * 1_000_000) / sample_rate as i64;
                     if front.timestamp + duration_us < self.cursor_us {
                         let _ = self.queue.pop_front();
                         continue;
@@ -101,72 +100,6 @@ impl PlaybackQueue {
         let advance = self.cursor_remainder / sample_rate as i64;
         self.cursor_remainder %= sample_rate as i64;
         self.cursor_us += advance;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PlaybackQueue;
-    use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
-    use std::sync::Arc;
-    use std::time::Instant;
-
-    #[test]
-    fn test_queue_clear_bumps_generation() {
-        let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
-        let samples = vec![Sample::ZERO; 96];
-        queue.push(AudioBuffer {
-            timestamp: 1234,
-            play_at: Instant::now(),
-            samples: Arc::from(samples.into_boxed_slice()),
-            format,
-        });
-
-        let before = queue.generation;
-        queue.clear();
-        assert_ne!(queue.generation, before);
-        assert!(queue.queue.is_empty());
-        assert!(!queue.initialized);
-    }
-
-    #[test]
-    fn test_queue_drops_stale_buffers() {
-        let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
-
-        let samples = vec![Sample::ZERO; 4800 * 2];
-        queue.push(AudioBuffer {
-            timestamp: 0,
-            play_at: Instant::now(),
-            samples: Arc::from(samples.clone().into_boxed_slice()),
-            format: format.clone(),
-        });
-        queue.push(AudioBuffer {
-            timestamp: 200_000,
-            play_at: Instant::now(),
-            samples: Arc::from(samples.into_boxed_slice()),
-            format,
-        });
-
-        queue.cursor_us = 150_000;
-        queue.initialized = true;
-
-        let frame = queue.next_frame(2, 48_000);
-        assert!(frame.is_some());
-        assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
     }
 }
 
@@ -206,8 +139,14 @@ impl SyncedPlayer {
         let last_error = Arc::new(Mutex::new(None));
         let error_clone = Arc::clone(&last_error);
 
-        let stream =
-            Self::build_stream(&device, &config, queue_clone, clock_sync, format_clone, error_clone)?;
+        let stream = Self::build_stream(
+            &device,
+            &config,
+            queue_clone,
+            clock_sync,
+            format_clone,
+            error_clone,
+        )?;
         stream.play().map_err(|e| Error::Output(e.to_string()))?;
 
         Ok(Self {
@@ -400,7 +339,6 @@ impl SyncedPlayer {
                                 out_index += 1;
                             }
                         }
-
                     }
                 },
                 move |err| {
@@ -412,5 +350,71 @@ impl SyncedPlayer {
             .map_err(|e| Error::Output(e.to_string()))?;
 
         Ok(stream)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaybackQueue;
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    #[test]
+    fn test_queue_clear_bumps_generation() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+        let samples = vec![Sample::ZERO; 96];
+        queue.push(AudioBuffer {
+            timestamp: 1234,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        let before = queue.generation;
+        queue.clear();
+        assert_ne!(queue.generation, before);
+        assert!(queue.queue.is_empty());
+        assert!(!queue.initialized);
+    }
+
+    #[test]
+    fn test_queue_drops_stale_buffers() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        let samples = vec![Sample::ZERO; 4800 * 2];
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.clone().into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.push(AudioBuffer {
+            timestamp: 200_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        queue.cursor_us = 150_000;
+        queue.initialized = true;
+
+        let frame = queue.next_frame(2, 48_000);
+        assert!(frame.is_some());
+        assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
     }
 }
