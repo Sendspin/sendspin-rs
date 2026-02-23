@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 /// WebSocket sender wrapper for sending messages
 pub struct WsSender {
     tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
