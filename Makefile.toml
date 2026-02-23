@@ -15,8 +15,6 @@ args = [
     "run",
     "--workspace",
     "--all-features",
-    "-E",
-    "not (test(test_audio_output_creation) | test(test_audio_output_write))",
 ]
 
 [tasks.lint]

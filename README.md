@@ -98,12 +98,7 @@ cargo install cargo-make
 cargo make verify
 ```
 
-`cargo make verify` runs:
-- `cargo test --workspace --all-features -- --skip test_audio_output_creation --skip test_audio_output_write`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo doc --workspace --no-deps --all-features --document-private-items` with `RUSTDOCFLAGS=--deny warnings`
-- `cargo test --workspace --doc --all-features`
-- `cargo fmt --check --all`
+`cargo make verify` runs: tests, Clippy, doc build, doctests, and formatting checks.
 
 ## Testing
 
