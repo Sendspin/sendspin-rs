@@ -88,6 +88,23 @@ cargo run --example basic_client
 cargo build --release
 ```
 
+### Verification (cargo-make)
+
+```bash
+# Install cargo-make (one time)
+cargo install cargo-make
+
+# Run the full verification suite
+cargo make verify
+```
+
+`cargo make verify` runs:
+- `cargo test --workspace --all-features -- --skip test_audio_output_creation --skip test_audio_output_write`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `cargo doc --workspace --no-deps --all-features --document-private-items` with `RUSTDOCFLAGS=--deny warnings`
+- `cargo test --workspace --doc --all-features`
+- `cargo fmt --check --all`
+
 ## Testing
 
 ```bash
