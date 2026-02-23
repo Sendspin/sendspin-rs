@@ -35,22 +35,8 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
-      - name: Run tests
-        run: cargo test --workspace --all-features -- --skip test_audio_output_creation --skip test_audio_output_write
-
-  test-audio-linux:
-    name: test-audio-linux
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
-      - name: Install ALSA dev headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
       - name: Configure virtual ALSA output
+        if: runner.os == 'Linux'
         run: |
           cat > "$RUNNER_TEMP/asound.conf" <<'EOF'
           pcm.!default {
@@ -58,5 +44,8 @@ jobs:
           }
           EOF
           echo "ALSA_CONFIG_PATH=$RUNNER_TEMP/asound.conf" >> "$GITHUB_ENV"
+      - name: Run tests
+        run: cargo test --workspace --all-features -- --skip test_audio_output_creation --skip test_audio_output_write
       - name: Run audio output tests
+        if: runner.os == 'Linux'
         run: cargo test --test audio_output --all-features
