@@ -1,5 +1,6 @@
 // ABOUTME: Basic example demonstrating secure WebSocket connection and handshake
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
+// ABOUTME: Run with: cargo run --example secure_socket --features native-tls
 
 use clap::Parser;
 use sendspin::protocol::client::ProtocolClient;
