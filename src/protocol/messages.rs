@@ -96,7 +96,10 @@ pub struct ClientHello {
     #[serde(rename = "artwork@v1_support", skip_serializing_if = "Option::is_none")]
     pub artwork_v1_support: Option<ArtworkV1Support>,
     /// Visualizer capabilities (if client supports visualizer@v1 role)
-    #[serde(rename = "visualizer@v1_support", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "visualizer@v1_support",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
 }
 

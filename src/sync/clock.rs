@@ -140,8 +140,7 @@ impl TimeFilter {
     }
 
     fn compute_client_time(&self, server_time: i64) -> i64 {
-        let numerator = server_time as f64
-            - self.current.offset
+        let numerator = server_time as f64 - self.current.offset
             + self.current.drift * self.current.last_update as f64;
         (numerator / (1.0 + self.current.drift)).round() as i64
     }
