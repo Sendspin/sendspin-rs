@@ -4,15 +4,15 @@
 use clap::Parser;
 use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerV1Support};
-use tungstenite::client::IntoClientRequest;
-use tungstenite::http::{Method, Request};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{Method, Request};
 /// Sendspin basic client
 #[derive(Parser, Debug)]
 #[command(name = "basic_client")]
 #[command(about = "Test connection to Sendspin server", long_about = None)]
 struct Args {
     /// WebSocket URL of the Sendspin server
-    #[arg(short, long, default_value = "ws://localhost:8927/sendspin")]
+    #[arg(short, long, default_value = "wss://localhost:8927/sendspin")]
     server: String,
 
     /// Client name
