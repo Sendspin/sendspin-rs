@@ -2,7 +2,7 @@
 // ABOUTME: Computes correction schedule from sync error and sample rate
 
 /// Correction schedule for drop/insert cadence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CorrectionSchedule {
     /// Insert one frame every N frames (0 disables).
     pub insert_every_n_frames: u32,
@@ -85,15 +85,5 @@ impl CorrectionPlanner {
 impl Default for CorrectionPlanner {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Default for CorrectionSchedule {
-    fn default() -> Self {
-        Self {
-            insert_every_n_frames: 0,
-            drop_every_n_frames: 0,
-            reanchor: false,
-        }
     }
 }

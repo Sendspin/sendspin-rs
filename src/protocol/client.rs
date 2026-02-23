@@ -12,12 +12,23 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+type FullSplit = (
+    UnboundedReceiver<Message>,
+    UnboundedReceiver<AudioChunk>,
+    UnboundedReceiver<ArtworkChunk>,
+    UnboundedReceiver<VisualizerChunk>,
+    Arc<Mutex<ClockSync>>,
+    WsSender,
+);
+
 /// WebSocket sender wrapper for sending messages
 pub struct WsSender {
-    tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    tx: Arc<tokio::sync::Mutex<WsSink>>,
 }
 
 impl WsSender {
@@ -231,8 +242,7 @@ impl BinaryFrame {
 
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
-    ws_tx:
-        Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    ws_tx: Arc<tokio::sync::Mutex<WsSink>>,
     audio_rx: UnboundedReceiver<AudioChunk>,
     artwork_rx: UnboundedReceiver<ArtworkChunk>,
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
@@ -486,16 +496,7 @@ impl ProtocolClient {
     /// Split into all receivers including artwork and visualizer
     ///
     /// Use this when you need to handle all binary frame types
-    pub fn split_full(
-        self,
-    ) -> (
-        UnboundedReceiver<Message>,
-        UnboundedReceiver<AudioChunk>,
-        UnboundedReceiver<ArtworkChunk>,
-        UnboundedReceiver<VisualizerChunk>,
-        Arc<Mutex<ClockSync>>,
-        WsSender,
-    ) {
+    pub fn split_full(self) -> FullSplit {
         (
             self.message_rx,
             self.audio_rx,

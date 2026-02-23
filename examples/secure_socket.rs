@@ -1,11 +1,11 @@
-// ABOUTME: Basic example demonstrating WebSocket connection and handshake
+// ABOUTME: Basic example demonstrating secure WebSocket connection and handshake
 // ABOUTME: Connects to server, sends client/hello, receives server/hello
 
 use clap::Parser;
 use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{AudioFormatSpec, ClientHello, DeviceInfo, PlayerV1Support};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{Method, Request};
+
 /// Sendspin basic client
 #[derive(Parser, Debug)]
 #[command(name = "basic_client")]
