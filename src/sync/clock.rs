@@ -76,7 +76,8 @@ impl TimeFilter {
             self.count = 2;
             self.drift = (measurement as f64 - self.offset) / dt;
             self.offset = measurement as f64;
-            self.drift_covariance = (self.offset_covariance + measurement_variance) / dt;
+            // Divide by dt^2, not dt: variance of (x/c) is var(x)/c^2.
+            self.drift_covariance = (self.offset_covariance + measurement_variance) / (dt * dt);
             self.offset_covariance = measurement_variance;
             self.current = TimeElement {
                 last_update: self.last_update,
@@ -108,7 +109,7 @@ impl TimeFilter {
 
         if self.count < 100 {
             self.count += 1;
-        } else if residual > max_residual_cutoff {
+        } else if residual.abs() > max_residual_cutoff {
             new_drift_covariance *= self.forget_variance_factor;
             new_offset_drift_covariance *= self.forget_variance_factor;
             new_offset_covariance *= self.forget_variance_factor;
@@ -190,18 +191,23 @@ impl ClockSync {
     pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
         // RTT = (t4 - t1) - (t3 - t2)
         let rtt = (t4 - t1) - (t3 - t2);
-        self.rtt_micros = Some(rtt);
 
-        // Discard samples with high RTT (network congestion)
-        if rtt > 100_000 {
-            // 100ms
-            eprintln!("Discarding sync sample: high RTT {}µs", rtt);
+        // Discard negative RTT (misordered timestamps) and high RTT
+        // (network congestion). Store only valid RTT so that quality()
+        // doesn't report Good on a negative value.
+        if !(0..=100_000).contains(&rtt) {
             return;
         }
+        self.rtt_micros = Some(rtt);
 
         // NTP offset = ((t2 - t1) + (t3 - t4)) / 2
-        let measurement = ((t2 - t1) + (t3 - t4)) / 2;
-        let max_error = (rtt / 2).max(0);
+        // Use f64 division to avoid systematic ±0.5µs bias from integer truncation.
+        let measurement = (((t2 - t1) as f64 + (t3 - t4) as f64) / 2.0).round() as i64;
+        // Floor max_error at 1µs so the Kalman filter always sees
+        // nonzero measurement variance. RTT = 0 is legitimate on
+        // localhost; without this floor, repeated zero-variance
+        // samples would drive covariance to zero and eventually NaN.
+        let max_error = (rtt / 2).max(1);
 
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
