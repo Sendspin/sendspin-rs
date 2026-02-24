@@ -12,12 +12,23 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+type FullSplit = (
+    UnboundedReceiver<Message>,
+    UnboundedReceiver<AudioChunk>,
+    UnboundedReceiver<ArtworkChunk>,
+    UnboundedReceiver<VisualizerChunk>,
+    Arc<Mutex<ClockSync>>,
+    WsSender,
+);
+
 /// WebSocket sender wrapper for sending messages
 pub struct WsSender {
-    tx: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    tx: Arc<tokio::sync::Mutex<WsSink>>,
 }
 
 impl WsSender {
@@ -124,9 +135,8 @@ impl ArtworkChunk {
         }
 
         let type_id = frame[0];
-        let channel = binary_types::artwork_channel(type_id).ok_or_else(|| {
-            Error::Protocol(format!("Invalid artwork chunk type: {}", type_id))
-        })?;
+        let channel = binary_types::artwork_channel(type_id)
+            .ok_or_else(|| Error::Protocol(format!("Invalid artwork chunk type: {}", type_id)))?;
 
         let timestamp = i64::from_be_bytes([
             frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8],
@@ -232,8 +242,7 @@ impl BinaryFrame {
 
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
-    ws_tx:
-        Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>>>,
+    ws_tx: Arc<tokio::sync::Mutex<WsSink>>,
     audio_rx: UnboundedReceiver<AudioChunk>,
     artwork_rx: UnboundedReceiver<ArtworkChunk>,
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
@@ -243,9 +252,12 @@ pub struct ProtocolClient {
 
 impl ProtocolClient {
     /// Connect to Sendspin server
-    pub async fn connect(url: &str, hello: ClientHello) -> Result<Self, Error> {
+    pub async fn connect<R>(request: R, hello: ClientHello) -> Result<Self, Error>
+    where
+        R: IntoClientRequest + Unpin,
+    {
         // Connect WebSocket
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = connect_async(request)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
@@ -302,7 +314,10 @@ impl ProtocolClient {
                         return Err(Error::Connection("Server closed connection".to_string()));
                     }
                     Ok(other) => {
-                        log::warn!("Unexpected message type while waiting for hello: {:?}", other);
+                        log::warn!(
+                            "Unexpected message type while waiting for hello: {:?}",
+                            other
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -481,16 +496,7 @@ impl ProtocolClient {
     /// Split into all receivers including artwork and visualizer
     ///
     /// Use this when you need to handle all binary frame types
-    pub fn split_full(
-        self,
-    ) -> (
-        UnboundedReceiver<Message>,
-        UnboundedReceiver<AudioChunk>,
-        UnboundedReceiver<ArtworkChunk>,
-        UnboundedReceiver<VisualizerChunk>,
-        Arc<Mutex<ClockSync>>,
-        WsSender,
-    ) {
+    pub fn split_full(self) -> FullSplit {
         (
             self.message_rx,
             self.audio_rx,

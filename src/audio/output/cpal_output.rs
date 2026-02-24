@@ -34,12 +34,14 @@ impl CpalOutput {
                 def.sample_rate().0,
                 def.channels()
             );
-            if def.sample_rate().0 != format.sample_rate
-                || def.channels() != format.channels as u16
+            if def.sample_rate().0 != format.sample_rate || def.channels() != format.channels as u16
             {
                 eprintln!(
                     "WARN: requested {}Hz/{}ch; device default is {}Hz/{}ch (OS may resample)",
-                    format.sample_rate, format.channels, def.sample_rate().0, def.channels()
+                    format.sample_rate,
+                    format.channels,
+                    def.sample_rate().0,
+                    def.channels()
                 );
             }
         }
@@ -102,8 +104,7 @@ impl CpalOutput {
                         if let Some(ref buf) = current_buffer {
                             if buffer_pos < buf.len() {
                                 let sample = buf[buffer_pos];
-                                // Convert 24-bit sample to f32 (-1.0 to 1.0)
-                                *sample_out = sample.0 as f32 / 8388607.0;
+                                *sample_out = sample.to_f32();
                                 buffer_pos += 1;
                             } else {
                                 *sample_out = 0.0; // Silence

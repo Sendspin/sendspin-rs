@@ -1,9 +1,7 @@
 use sendspin::protocol::messages::{
-    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand,
-    ClientGoodbye, ClientHello, ClientState, ConnectionReason, ControllerCommand, ControllerState,
-    DeviceInfo, GoodbyeReason, GroupUpdate, ImageFormat, Message, MetadataState, PlaybackState,
-    PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode, ServerCommand, ServerState,
-    StreamClear, StreamEnd, StreamStart, TrackProgress,
+    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand, ClientGoodbye,
+    ClientHello, ClientState, ConnectionReason, ControllerCommand, DeviceInfo, GoodbyeReason,
+    ImageFormat, Message, PlaybackState, PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode,
 };
 
 // =============================================================================
@@ -178,7 +176,9 @@ fn test_server_state_controller_deserialization() {
             assert_eq!(controller.volume, 75);
             assert!(!controller.muted);
             assert!(controller.supported_commands.contains(&"play".to_string()));
-            assert!(controller.supported_commands.contains(&"volume".to_string()));
+            assert!(controller
+                .supported_commands
+                .contains(&"volume".to_string()));
         }
         _ => panic!("Expected ServerState"),
     }
