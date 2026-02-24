@@ -2,7 +2,6 @@
 // ABOUTME: Just connects and prints everything the server sends
 
 use clap::Parser;
-use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{ClientState, Message, PlayerState, PlayerSyncState};
 use sendspin::ProtocolClientBuilder;
 
