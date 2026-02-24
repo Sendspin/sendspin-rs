@@ -34,12 +34,14 @@ impl CpalOutput {
                 def.sample_rate().0,
                 def.channels()
             );
-            if def.sample_rate().0 != format.sample_rate
-                || def.channels() != format.channels as u16
+            if def.sample_rate().0 != format.sample_rate || def.channels() != format.channels as u16
             {
                 eprintln!(
                     "WARN: requested {}Hz/{}ch; device default is {}Hz/{}ch (OS may resample)",
-                    format.sample_rate, format.channels, def.sample_rate().0, def.channels()
+                    format.sample_rate,
+                    format.channels,
+                    def.sample_rate().0,
+                    def.channels()
                 );
             }
         }
