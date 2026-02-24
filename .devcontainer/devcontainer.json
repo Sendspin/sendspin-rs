@@ -22,7 +22,7 @@
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
 	// "forwardPorts": [],
 	// Use 'postCreateCommand' to run commands after the container is created.
-	"postCreateCommand": "sudo apt update && sudo apt install -y libasound2-dev pkg-config && echo -e 'pcm.!default {\\n  type null\\n}' > /home/vscode/.asoundrc && rustup component add rustfmt clippy && cargo install cargo-make && cargo install --locked cargo-nextest && cargo build",
+	"postCreateCommand": "sudo apt update && sudo apt install -y libasound2-dev pkg-config && printf 'pcm.!default {\\n  type null\\n}\\nctl.!default {\\n  type null\\n}\\n' > /home/vscode/.asoundrc && rustup component add rustfmt clippy && cargo install cargo-make && cargo install --locked cargo-nextest && cargo build",
 	// Configure tool-specific properties.
 	// "customizations": {},
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
