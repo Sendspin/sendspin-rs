@@ -80,7 +80,10 @@ fn test_negative_rtt_discarded() {
     // producing negative RTT. Should be silently discarded.
     sync.update(1000, 500, 500, 900);
     assert_eq!(sync.rtt_micros(), None, "negative RTT should not be stored");
-    assert!(!sync.is_synchronized(), "filter should not advance on invalid RTT");
+    assert!(
+        !sync.is_synchronized(),
+        "filter should not advance on invalid RTT"
+    );
 }
 
 #[test]
