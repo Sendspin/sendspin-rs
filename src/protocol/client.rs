@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -251,9 +252,12 @@ pub struct ProtocolClient {
 
 impl ProtocolClient {
     /// Connect to Sendspin server
-    pub async fn connect(url: &str, hello: ClientHello) -> Result<Self, Error> {
+    pub async fn connect<R>(request: R, hello: ClientHello) -> Result<Self, Error>
+    where
+        R: IntoClientRequest + Unpin,
+    {
         // Connect WebSocket
-        let (ws_stream, _) = connect_async(url)
+        let (ws_stream, _) = connect_async(request)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
