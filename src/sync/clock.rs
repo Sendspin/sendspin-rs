@@ -195,7 +195,7 @@ impl ClockSync {
         // Discard negative RTT (misordered timestamps) and high RTT
         // (network congestion). Store only valid RTT so that quality()
         // doesn't report Good on a negative value.
-        if rtt < 0 || rtt > 100_000 {
+        if !(0..=100_000).contains(&rtt) {
             return;
         }
         self.rtt_micros = Some(rtt);
