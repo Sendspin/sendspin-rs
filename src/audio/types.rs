@@ -58,6 +58,14 @@ impl Sample {
         (self.0 >> 8) as i16
     }
 
+    /// Convert to f32 in the range \[-1.0, 1.0\].
+    #[inline]
+    pub fn to_f32(self) -> f32 {
+        // Divide by 2^23 (not 2^23-1) so that MIN maps to exactly -1.0.
+        // MAX maps to 0.99999988, which is inaudible vs 1.0.
+        self.0 as f32 / 8_388_608.0
+    }
+
     /// Clamp to valid 24-bit range
     #[inline]
     pub fn clamp(self) -> Self {
