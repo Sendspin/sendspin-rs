@@ -141,9 +141,11 @@ impl TimeFilter {
     const MAX_DRIFT: f64 = 0.2;
 
     fn compute_server_time(&self, client_time: i64) -> Option<i64> {
-        // Use !(x <= threshold) instead of x > threshold so that NaN
-        // is also rejected (IEEE 754: all NaN comparisons return false).
-        if !(self.current.drift.abs() <= Self::MAX_DRIFT) {
+        // Accept only drift <= threshold; reject NaN/incomparable values.
+        if !matches!(
+            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
             return None;
         }
         let dt = (client_time - self.current.last_update) as f64;
@@ -152,9 +154,11 @@ impl TimeFilter {
     }
 
     fn compute_client_time(&self, server_time: i64) -> Option<i64> {
-        // Use !(x <= threshold) instead of x > threshold so that NaN
-        // is also rejected (IEEE 754: all NaN comparisons return false).
-        if !(self.current.drift.abs() <= Self::MAX_DRIFT) {
+        // Accept only drift <= threshold; reject NaN/incomparable values.
+        if !matches!(
+            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
             return None;
         }
         let numerator = server_time as f64 - self.current.offset
