@@ -251,6 +251,7 @@ pub struct ProtocolClientBuilderRaw {
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
+    software_version: Option<String>,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
@@ -290,6 +291,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             name: raw.name,
             product_name: raw.product_name,
             manufacturer: raw.manufacturer,
+            software_version: raw.software_version,
             supported_roles,
             player_v1_support,
             artwork_v1_support: raw.artwork_v1_support,
@@ -308,6 +310,8 @@ pub struct ProtocolClientBuilderFields {
     product_name: Option<String>,
     #[builder(default = None)]
     manufacturer: Option<String>,
+    #[builder(default = None)]
+    software_version: Option<String>,
     #[builder(default = None, setter(transform = |x: PlayerV1Support| Some(x)))]
     player_v1_support: Option<PlayerV1Support>,
     #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
@@ -323,6 +327,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             name: fields.name,
             product_name: fields.product_name,
             manufacturer: fields.manufacturer,
+            software_version: fields.software_version,
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
@@ -337,8 +342,8 @@ pub struct ProtocolClientBuilder {
     client_id: String,
     name: String,
     product_name: Option<String>,
-    software_version: Option<String>,
     manufacturer: Option<String>,
+    software_version: Option<String>,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
