@@ -1,6 +1,3 @@
-// Note: These are integration tests that require a running server
-// For now, we'll create the structure and skip them
-
 use sendspin::protocol::client::ProtocolClientBuilder;
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerV1Support,
