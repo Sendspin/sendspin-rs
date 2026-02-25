@@ -2,10 +2,7 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
-use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientHello, DeviceInfo, Message, PlayerV1Support,
-    VisualizerV1Support,
-};
+use crate::protocol::messages::{ClientHello, Message};
 use crate::sync::ClockSync;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -18,7 +15,6 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use typed_builder::TypedBuilder;
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type FullSplit = (
