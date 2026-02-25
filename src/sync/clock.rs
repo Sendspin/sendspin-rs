@@ -134,16 +134,36 @@ impl TimeFilter {
         };
     }
 
-    fn compute_server_time(&self, client_time: i64) -> i64 {
+    /// Maximum plausible drift magnitude. Real clock drift between
+    /// hardware oscillators is measured in ppm; 20% is far beyond
+    /// physical reality. This is a last-resort safety net for a
+    /// diverged filter, not a quality gate.
+    const MAX_DRIFT: f64 = 0.2;
+
+    fn compute_server_time(&self, client_time: i64) -> Option<i64> {
+        // Accept only drift <= threshold; reject NaN/incomparable values.
+        if !matches!(
+            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
+            return None;
+        }
         let dt = (client_time - self.current.last_update) as f64;
         let offset = self.current.offset + self.current.drift * dt;
-        client_time + offset.round() as i64
+        Some(client_time + offset.round() as i64)
     }
 
-    fn compute_client_time(&self, server_time: i64) -> i64 {
+    fn compute_client_time(&self, server_time: i64) -> Option<i64> {
+        // Accept only drift <= threshold; reject NaN/incomparable values.
+        if !matches!(
+            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
+            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        ) {
+            return None;
+        }
         let numerator = server_time as f64 - self.current.offset
             + self.current.drift * self.current.last_update as f64;
-        (numerator / (1.0 + self.current.drift)).round() as i64
+        Some((numerator / (1.0 + self.current.drift)).round() as i64)
     }
 
     fn is_synchronized(&self) -> bool {
@@ -223,7 +243,7 @@ impl ClockSync {
         if !self.filter.is_synchronized() {
             return None;
         }
-        Some(self.filter.compute_client_time(server_micros))
+        self.filter.compute_client_time(server_micros)
     }
 
     /// Convert client Unix microseconds to server loop microseconds
@@ -231,7 +251,7 @@ impl ClockSync {
         if !self.filter.is_synchronized() {
             return None;
         }
-        Some(self.filter.compute_server_time(client_micros))
+        self.filter.compute_server_time(client_micros)
     }
 
     /// Convert server loop microseconds to local Instant
