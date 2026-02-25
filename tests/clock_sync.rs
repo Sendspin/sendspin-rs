@@ -91,3 +91,29 @@ fn test_diverged_drift_returns_none() {
         "client_to_server should return None when drift has diverged"
     );
 }
+
+#[test]
+fn test_negative_rtt_discarded() {
+    let mut sync = ClockSync::new();
+
+    // Craft timestamps where t4 < t1 (response "before" request),
+    // producing negative RTT. Should be silently discarded.
+    sync.update(1000, 500, 500, 900);
+    assert_eq!(sync.rtt_micros(), None, "negative RTT should not be stored");
+    assert!(
+        !sync.is_synchronized(),
+        "filter should not advance on invalid RTT"
+    );
+}
+
+#[test]
+fn test_zero_rtt_accepted() {
+    let mut sync = ClockSync::new();
+
+    // RTT = 0 is legitimate on localhost. The filter clamps max_error
+    // to 1µs so zero-variance samples don't corrupt covariance.
+    sync.update(1000, 1100, 1100, 1000);
+    sync.update(2000, 2100, 2100, 2000);
+    assert_eq!(sync.rtt_micros(), Some(0));
+    assert!(sync.is_synchronized(), "zero RTT should still allow sync");
+}
