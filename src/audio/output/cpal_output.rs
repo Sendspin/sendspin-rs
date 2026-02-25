@@ -21,6 +21,9 @@ pub struct CpalOutput {
 impl CpalOutput {
     /// Create a new cpal audio output
     pub fn new(format: AudioFormat) -> Result<Self, Error> {
+        if format.channels == 0 {
+            return Err(Error::Output("channels must be > 0".to_string()));
+        }
         let host = cpal::default_host();
         let device = host
             .default_output_device()
