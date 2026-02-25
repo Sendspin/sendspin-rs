@@ -337,6 +337,7 @@ pub struct ProtocolClientBuilder {
     client_id: String,
     name: String,
     product_name: Option<String>,
+    software_version: Option<String>,
     manufacturer: Option<String>,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
@@ -370,7 +371,7 @@ impl ProtocolClientBuilder {
             device_info: Some(DeviceInfo {
                 product_name: self.product_name.clone(),
                 manufacturer: Some(self.manufacturer.unwrap_or("Sendspin".to_string())),
-                software_version: Some("0.1.0".to_string()),
+                software_version: self.software_version.clone(),
             }),
             player_v1_support: self.player_v1_support.clone(),
             artwork_v1_support: self.artwork_v1_support.clone(),
