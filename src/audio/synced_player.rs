@@ -365,6 +365,14 @@ impl SyncedPlayer {
             .build_output_stream(
                 config,
                 move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                    // Read all queue state in a single lock to avoid
+                    // a TOCTOU window between generation and cursor reads.
+                    // After clear(), force_reanchor is true but cursor_us
+                    // is None (initialized=false), so the reanchor block
+                    // is normally skipped and the flag persists. If clear()
+                    // races with an in-flight reanchor, the flag can be
+                    // cleared early; next_frame() re-anchors from the
+                    // first buffer's timestamp in that case.
                     let (generation, cursor_us, force_reanchor) = {
                         let queue = queue.lock();
                         let cursor = if queue.initialized {
@@ -393,6 +401,9 @@ impl SyncedPlayer {
                         .unwrap_or(Duration::ZERO);
                     let playback_instant = callback_instant + playback_delta;
 
+                    // try_lock: skip sync if contended rather than blocking
+                    // the audio thread. force_reanchor is sticky in the
+                    // queue, so it will be retried on the next callback.
                     if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
                         if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
                             let early_window = Duration::from_millis(1);
