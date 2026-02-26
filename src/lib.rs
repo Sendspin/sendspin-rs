@@ -20,6 +20,7 @@ pub mod scheduler;
 pub mod sync;
 
 pub use protocol::client::ProtocolClient;
+pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::messages::{ClientHello, ServerHello};
 pub use scheduler::AudioScheduler;
 
