@@ -3,6 +3,8 @@
 
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
+/// Lock-free volume/mute control
+pub mod gain;
 /// Audio output trait and implementations
 pub mod output;
 /// Buffer pool for reusing audio sample buffers
@@ -14,8 +16,9 @@ pub mod synced_player;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
 
+pub use gain::GainControl;
 pub use output::{AudioOutput, CpalOutput};
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
-pub use synced_player::SyncedPlayer;
+pub use synced_player::{ProcessCallback, SyncedPlayer};
 pub use types::{AudioBuffer, AudioFormat, Codec, Sample};
