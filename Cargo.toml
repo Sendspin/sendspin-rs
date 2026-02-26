@@ -7,6 +7,10 @@ description = "Hyper-efficient Rust implementation of the Sendspin Protocol for 
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sendspin/sendspin-rs"
 
+[features]
+default = []
+native-tls = ["tokio-tungstenite/native-tls"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
@@ -32,6 +36,7 @@ crossbeam = "0.8"
 
 # Fast mutexes
 parking_lot = "0.12"
+typed-builder = "0.23.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -42,3 +47,7 @@ clap = { version = "4.5", features = ["derive"] }
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[[example]]
+name = "secure_socket"
+required-features = ["native-tls"]
