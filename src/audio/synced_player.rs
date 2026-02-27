@@ -93,16 +93,19 @@ impl PlaybackQueue {
 
         // When the server rebases its timeline backward (e.g. after event loop
         // starvation), new chunks arrive with timestamps that overlap chunks
-        // already in the queue. Replace the old buffer to prevent duplicate
-        // audio that causes audible stuttering (~500ms of audio played twice).
-        let dominated = self
-            .queue
-            .iter()
-            .position(|b| (b.timestamp - buffer.timestamp).abs() < 12_500);
-        if let Some(idx) = dominated {
-            self.queue[idx] = buffer;
-            return;
-        }
+        // already in the queue. Remove all overlapping buffers to prevent
+        // duplicate audio that causes audible stuttering (~500ms of audio
+        // played twice). The server will send fresh buffers for any gaps.
+        //
+        // Two buffers overlap when their time ranges intersect:
+        //   start_a < end_b && start_b < end_a
+        // This works for any chunk size (the sendspin spec allows arbitrarily
+        // small chunks), unlike the previous fixed-threshold approach.
+        let new_end = buffer.timestamp + buffer.duration_us();
+        self.queue.retain(|b| {
+            let existing_end = b.timestamp + b.duration_us();
+            !(buffer.timestamp < existing_end && b.timestamp < new_end)
+        });
 
         let pos = self
             .queue
@@ -120,9 +123,7 @@ impl PlaybackQueue {
             // Drop stale buffers that are entirely before the cursor.
             if self.initialized {
                 while let Some(front) = self.queue.front() {
-                    let frames = front.samples.len() / channels.max(1);
-                    let duration_us = (frames as i64 * 1_000_000) / sample_rate as i64;
-                    if front.timestamp + duration_us < self.cursor_us {
+                    if front.timestamp + front.duration_us() < self.cursor_us {
                         let _ = self.queue.pop_front();
                         continue;
                     }
@@ -889,10 +890,12 @@ mod tests {
     #[test]
     fn test_next_frame_skips_into_overlapping_buffer() {
         // Simulates a backward timestamp jump from a server timeline rebase.
-        // Buffer A is 50ms (2400 frames stereo at 48kHz). Buffer B starts at
-        // 25ms — well outside the 12.5ms dedup window but inside A's range.
-        // After consuming A, the cursor is at 50ms. When B (starting at 25ms)
-        // is popped, the skip logic should jump 25ms (1200 frames) into B.
+        // Buffer A is 50ms (2400 frames stereo at 48kHz). After consuming A
+        // the cursor is at 50ms. Buffer B arrives at 25ms — the skip logic
+        // should jump 25ms (1200 frames) into B.
+        //
+        // B is pushed AFTER A is consumed so dedup doesn't apply (A is no
+        // longer in the queue).
         let mut queue = PlaybackQueue::new();
         let format = AudioFormat {
             codec: Codec::Pcm,
@@ -920,18 +923,24 @@ mod tests {
             samples: Arc::from(buf_a.into_boxed_slice()),
             format: format.clone(),
         });
-        queue.push(AudioBuffer {
-            timestamp: 25_000, // 25ms — overlaps with A but outside dedup window
-            play_at: Instant::now(),
-            samples: Arc::from(buf_b.into_boxed_slice()),
-            format,
-        });
 
         // Consume all of buffer A (2400 frames). Cursor advances to 50000µs.
         for _ in 0..2400 {
             assert!(queue.next_frame(2, 48_000).is_some());
         }
         assert_eq!(queue.cursor_us, 50_000);
+
+        // Push B after A is consumed — no dedup, tests skip logic only.
+        // push() lowers cursor_us to 25000 (min-tracking), so restore it
+        // to 50000 to simulate the real scenario where cursor has advanced.
+        queue.push(AudioBuffer {
+            timestamp: 25_000,
+            play_at: Instant::now(),
+            samples: Arc::from(buf_b.into_boxed_slice()),
+            format,
+        });
+        queue.cursor_us = 50_000;
+        queue.cursor_remainder = 0;
 
         // Buffer B starts at 25ms but cursor is at 50ms, so 25ms (1200 frames)
         // should be skipped. First returned frame should be Sample(333).
@@ -959,7 +968,7 @@ mod tests {
             codec_header: None,
         };
 
-        // 2400 frames = 50ms per buffer, well outside 12.5ms dedup window.
+        // 2400 frames = 50ms per buffer. Adjacent, non-overlapping.
         let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
         let samples_b: Vec<Sample> = (0..2400 * 2).map(|_| Sample(222)).collect();
 
@@ -991,5 +1000,122 @@ mod tests {
             Sample(222),
             "buffer B should play from the start (no skip needed)"
         );
+    }
+
+    #[test]
+    fn test_push_dedup_replaces_overlapping_buffer() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        // Buffer A: 10ms at ts=0 (480 stereo frames)
+        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        assert_eq!(queue.queue.len(), 1);
+
+        // Buffer B: 10ms at ts=5000 (5ms) — overlaps A's range [0, 10000)
+        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        queue.push(AudioBuffer {
+            timestamp: 5_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format,
+        });
+
+        // Should replace A, not add a second entry
+        assert_eq!(queue.queue.len(), 1);
+        assert_eq!(queue.queue[0].samples[0], Sample(222));
+    }
+
+    #[test]
+    fn test_push_dedup_no_false_positive_small_chunks() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        // Two adjacent 5ms chunks (240 stereo frames each).
+        // Chunk A: [0, 5000), Chunk B: [5000, 10000) — no overlap.
+        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
+        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.push(AudioBuffer {
+            timestamp: 5_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format,
+        });
+
+        // Both should be kept — they're adjacent, not overlapping
+        assert_eq!(queue.queue.len(), 2);
+        assert_eq!(queue.queue[0].timestamp, 0);
+        assert_eq!(queue.queue[1].timestamp, 5_000);
+    }
+
+    #[test]
+    fn test_push_dedup_removes_all_overlapping() {
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        // Buffer A: 10ms at ts=0 — range [0, 10000)
+        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        // Buffer B: 10ms at ts=12000 — range [12000, 22000). No overlap with A.
+        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.push(AudioBuffer {
+            timestamp: 12_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format: format.clone(),
+        });
+        assert_eq!(queue.queue.len(), 2);
+
+        // Buffer C: 20ms at ts=9000 — range [9000, 29000).
+        // Overlaps both A (9000 < 10000 && 0 < 29000) and B (9000 < 22000 && 12000 < 29000).
+        // Both stale buffers should be removed — the server will send fresh
+        // data for any gaps. Keeping either would cause duplicate audio.
+        let samples_c: Vec<Sample> = (0..960 * 2).map(|_| Sample(333)).collect();
+        queue.push(AudioBuffer {
+            timestamp: 9_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_c.into_boxed_slice()),
+            format,
+        });
+
+        assert_eq!(queue.queue.len(), 1);
+        assert_eq!(queue.queue[0].timestamp, 9_000);
+        assert_eq!(queue.queue[0].samples[0], Sample(333));
     }
 }

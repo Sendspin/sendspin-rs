@@ -381,39 +381,48 @@ impl ProtocolClient {
         let sync_handle = tokio::spawn(async move {
             log::debug!("Clock sync task started");
             let mut sample_count: u32 = 0;
-            loop {
+            'sync: loop {
+                // Send first, then sleep — the first sample fires at t=0
+                // instead of waiting for the initial delay.
+                let sent = 'send: {
+                    // Acquire the write lock in a block so it's always
+                    // released before sleeping, even on error paths.
+                    let mut tx = ws_tx_sync.lock().await;
+                    let t1 = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(d) => d.as_micros() as i64,
+                        Err(e) => {
+                            log::warn!("Clock before Unix epoch, skipping sync send: {}", e);
+                            break 'send false;
+                        }
+                    };
+                    let msg = Message::ClientTime(ClientTime {
+                        client_transmitted: t1,
+                    });
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            log::warn!("Failed to serialize client/time: {}", e);
+                            break 'send false;
+                        }
+                    };
+                    if tx.send(WsMessage::Text(json)).await.is_err() {
+                        log::info!("Clock sync task exiting: connection closed");
+                        break 'sync;
+                    }
+                    true
+                }; // tx dropped here — released before sleeping
+                if sent {
+                    sample_count = sample_count.saturating_add(1);
+                }
+                // First two successful sends use a 10ms interval so the
+                // Kalman filter converges quickly (~20ms), then switch
+                // to a 1-second cadence for ongoing drift correction.
                 let delay = if sample_count < 2 {
                     tokio::time::Duration::from_millis(10)
                 } else {
                     tokio::time::Duration::from_secs(1)
                 };
                 tokio::time::sleep(delay).await;
-                sample_count = sample_count.saturating_add(1);
-                // Acquire the write lock first, then capture t1 as
-                // close to the actual socket send as possible. This
-                // avoids inflating RTT when the lock is contended.
-                let mut tx = ws_tx_sync.lock().await;
-                let t1 = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                    Ok(d) => d.as_micros() as i64,
-                    Err(e) => {
-                        log::warn!("Clock before Unix epoch, skipping sync send: {}", e);
-                        continue;
-                    }
-                };
-                let msg = Message::ClientTime(ClientTime {
-                    client_transmitted: t1,
-                });
-                let json = match serde_json::to_string(&msg) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        log::warn!("Failed to serialize client/time: {}", e);
-                        continue;
-                    }
-                };
-                if tx.send(WsMessage::Text(json)).await.is_err() {
-                    log::info!("Clock sync task exiting: connection closed");
-                    break;
-                }
             }
         });
 
@@ -485,6 +494,9 @@ impl ProtocolClient {
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
                             log::debug!("Parsed message: {:?}", msg);
+                            // ServerTime is consumed here for clock sync
+                            // and intentionally NOT forwarded to message_rx
+                            // consumers — it's an internal protocol detail.
                             if let Message::ServerTime(ref st) = msg {
                                 match receive_time.duration_since(UNIX_EPOCH) {
                                     Ok(d) => {
