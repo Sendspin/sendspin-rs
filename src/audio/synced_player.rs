@@ -86,9 +86,6 @@ impl PlaybackQueue {
             self.cursor_us = buffer.timestamp;
             self.cursor_remainder = 0;
             self.initialized = true;
-        } else if buffer.timestamp < self.cursor_us {
-            self.cursor_us = buffer.timestamp;
-            self.cursor_remainder = 0;
         }
 
         // When the server rebases its timeline backward (e.g. after event loop
@@ -119,7 +116,11 @@ impl PlaybackQueue {
     }
 
     fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[Sample]> {
-        if self.current.is_none() || self.index + channels > self.current.as_ref()?.samples.len() {
+        let needs_buffer = match self.current {
+            None => true,
+            Some(ref c) => self.index + channels > c.samples.len(),
+        };
+        if needs_buffer {
             // Drop stale buffers that are entirely before the cursor.
             if self.initialized {
                 while let Some(front) = self.queue.front() {
@@ -130,23 +131,45 @@ impl PlaybackQueue {
                     break;
                 }
             }
-            self.current = self.queue.pop_front();
-            self.index = 0;
 
-            // Skip past samples that are behind the cursor. This handles buffers
-            // that partially overlap with the current playback position, e.g. from
-            // backward timestamp jumps during server timeline rebases. Without this,
-            // playing from the start of such a buffer repeats audio the cursor has
-            // already passed, causing an audible stutter.
-            if self.initialized {
-                if let Some(ref current) = self.current {
-                    if current.timestamp < self.cursor_us {
-                        let skip_us = self.cursor_us - current.timestamp;
-                        let skip_frames = (skip_us * sample_rate as i64 / 1_000_000) as usize;
-                        if skip_frames > 0 {
-                            self.index = (skip_frames * channels).min(current.samples.len());
+            // Pop buffers until we find one with remaining samples past the
+            // cursor, or the queue is empty.
+            loop {
+                self.current = self.queue.pop_front();
+                self.index = 0;
+
+                // Skip past samples that are behind the cursor. This handles
+                // buffers that partially overlap with the current playback
+                // position, e.g. from backward timestamp jumps during server
+                // timeline rebases. Without this, playing from the start of
+                // such a buffer repeats audio the cursor has already passed,
+                // causing an audible stutter.
+                if self.initialized {
+                    if let Some(ref current) = self.current {
+                        if current.timestamp < self.cursor_us {
+                            let skip_us = self.cursor_us - current.timestamp;
+                            let skip_frames =
+                                (skip_us.saturating_mul(sample_rate as i64) / 1_000_000) as usize;
+                            if skip_frames > 0 {
+                                self.index = skip_frames
+                                    .saturating_mul(channels)
+                                    .min(current.samples.len());
+                            }
                         }
                     }
+                }
+
+                // If the skip consumed the entire buffer (or left fewer
+                // samples than one frame), discard it and try the next one.
+                match self.current {
+                    Some(ref c) if self.index + channels > c.samples.len() => {
+                        self.current = None;
+                        if self.queue.is_empty() {
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => break,
                 }
             }
         }
@@ -612,16 +635,29 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    #[test]
-    fn test_queue_clear_bumps_generation() {
-        let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
+    /// Standard test format: 48kHz stereo 24-bit PCM.
+    fn test_format() -> AudioFormat {
+        AudioFormat {
             codec: Codec::Pcm,
             sample_rate: 48_000,
             channels: 2,
             bit_depth: 24,
             codec_header: None,
-        };
+        }
+    }
+
+    /// Mono variant of [`test_format`].
+    fn test_format_mono() -> AudioFormat {
+        AudioFormat {
+            channels: 1,
+            ..test_format()
+        }
+    }
+
+    #[test]
+    fn test_queue_clear_bumps_generation() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
         let samples = vec![Sample::ZERO; 96];
         queue.push(AudioBuffer {
             timestamp: 1234,
@@ -640,13 +676,7 @@ mod tests {
     #[test]
     fn test_queue_drops_stale_buffers() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // Use distinct sample values so we can verify which buffer was returned.
         // 4800 stereo frames at 48kHz = 100ms per buffer.
@@ -684,13 +714,7 @@ mod tests {
     #[test]
     fn test_queue_push_sorts_by_timestamp() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 1,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format_mono();
 
         // Push out of order: 300, 100, 200
         for ts in [300_000i64, 100_000, 200_000] {
@@ -702,6 +726,11 @@ mod tests {
                 format: format.clone(),
             });
         }
+
+        // Reset cursor so stale-buffer-dropping doesn't interfere with
+        // the sort-order verification (in real usage, sync reanchor sets
+        // cursor before playback begins).
+        queue.cursor_us = 0;
 
         // Drain and verify sorted order
         let _ = queue.next_frame(1, 48_000);
@@ -727,13 +756,7 @@ mod tests {
     #[test]
     fn test_queue_cursor_advances_correctly() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // 480 stereo frames = 10ms at 48kHz
         let num_frames = 480;
@@ -764,13 +787,7 @@ mod tests {
     #[test]
     fn test_cursor_does_not_advance_during_underrun() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // Push one buffer to initialize the cursor
         let samples = vec![Sample::ZERO; 480 * 2]; // 10ms stereo
@@ -823,13 +840,7 @@ mod tests {
     #[test]
     fn test_push_initializes_cursor_from_first_buffer() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         assert!(!queue.initialized);
         assert_eq!(queue.cursor_us, 0);
@@ -848,18 +859,12 @@ mod tests {
     }
 
     #[test]
-    fn test_push_lowers_cursor_for_earlier_buffer() {
+    fn test_push_does_not_regress_cursor_after_init() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
         let samples = vec![Sample::ZERO; 96];
 
-        // First buffer at 500ms
+        // First buffer at 500ms — initializes cursor
         queue.push(AudioBuffer {
             timestamp: 500_000,
             play_at: Instant::now(),
@@ -868,23 +873,22 @@ mod tests {
         });
         assert_eq!(queue.cursor_us, 500_000);
 
-        // Second buffer at 200ms -- cursor should move back
+        // Consume a frame so cursor advances past init
+        let _ = queue.next_frame(2, 48_000);
+        let cursor_after_consume = queue.cursor_us;
+        assert!(cursor_after_consume > 500_000);
+
+        // Push an earlier buffer — cursor must NOT regress
         queue.push(AudioBuffer {
             timestamp: 200_000,
-            play_at: Instant::now(),
-            samples: Arc::from(samples.clone().into_boxed_slice()),
-            format: format.clone(),
-        });
-        assert_eq!(queue.cursor_us, 200_000);
-
-        // Third buffer at 300ms -- cursor should NOT move (300 > 200)
-        queue.push(AudioBuffer {
-            timestamp: 300_000,
             play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
-        assert_eq!(queue.cursor_us, 200_000);
+        assert_eq!(
+            queue.cursor_us, cursor_after_consume,
+            "cursor must not regress after playback has started"
+        );
     }
 
     #[test]
@@ -897,13 +901,7 @@ mod tests {
         // B is pushed AFTER A is consumed so dedup doesn't apply (A is no
         // longer in the queue).
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         let buf_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
         let buf_b: Vec<Sample> = (0..2400 * 2)
@@ -931,16 +929,14 @@ mod tests {
         assert_eq!(queue.cursor_us, 50_000);
 
         // Push B after A is consumed — no dedup, tests skip logic only.
-        // push() lowers cursor_us to 25000 (min-tracking), so restore it
-        // to 50000 to simulate the real scenario where cursor has advanced.
+        // push() no longer regresses cursor_us after init, so cursor stays
+        // at 50000 and the skip logic activates naturally.
         queue.push(AudioBuffer {
             timestamp: 25_000,
             play_at: Instant::now(),
             samples: Arc::from(buf_b.into_boxed_slice()),
             format,
         });
-        queue.cursor_us = 50_000;
-        queue.cursor_remainder = 0;
 
         // Buffer B starts at 25ms but cursor is at 50ms, so 25ms (1200 frames)
         // should be skipped. First returned frame should be Sample(333).
@@ -960,13 +956,7 @@ mod tests {
         // Verify that the skip logic doesn't activate for normal (non-overlapping)
         // buffers — only for buffers that start before the cursor.
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // 2400 frames = 50ms per buffer. Adjacent, non-overlapping.
         let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
@@ -1005,13 +995,7 @@ mod tests {
     #[test]
     fn test_push_dedup_replaces_overlapping_buffer() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // Buffer A: 10ms at ts=0 (480 stereo frames)
         let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
@@ -1040,13 +1024,7 @@ mod tests {
     #[test]
     fn test_push_dedup_no_false_positive_small_chunks() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // Two adjacent 5ms chunks (240 stereo frames each).
         // Chunk A: [0, 5000), Chunk B: [5000, 10000) — no overlap.
@@ -1075,13 +1053,7 @@ mod tests {
     #[test]
     fn test_push_dedup_removes_all_overlapping() {
         let mut queue = PlaybackQueue::new();
-        let format = AudioFormat {
-            codec: Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 24,
-            codec_header: None,
-        };
+        let format = test_format();
 
         // Buffer A: 10ms at ts=0 — range [0, 10000)
         let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
@@ -1117,5 +1089,49 @@ mod tests {
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
         assert_eq!(queue.queue[0].samples[0], Sample(333));
+    }
+
+    #[test]
+    fn test_skip_past_entire_buffer_does_not_panic() {
+        // When the cursor is far ahead of a buffer, the skip logic can set
+        // self.index past the buffer's sample count. next_frame must not
+        // panic; it should discard the buffer and return the next one.
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        // 1ms buffer (48 stereo frames) at ts=49000. Duration = 1000µs,
+        // so it ends at 50000 which is NOT < cursor (50000), surviving
+        // the stale-drop. But the skip logic sees ts=49000 < cursor=50000
+        // and tries to skip 1ms (48 frames) — exactly the buffer length.
+        let short_samples: Vec<Sample> = (0..48 * 2).map(|_| Sample(111)).collect();
+        // Buffer that starts at cursor: 10ms at ts=50000
+        let ahead_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+
+        queue.initialized = true;
+        queue.cursor_us = 50_000;
+        queue.queue.push_back(AudioBuffer {
+            timestamp: 49_000,
+            play_at: Instant::now(),
+            samples: Arc::from(short_samples.into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.queue.push_back(AudioBuffer {
+            timestamp: 50_000,
+            play_at: Instant::now(),
+            samples: Arc::from(ahead_samples.into_boxed_slice()),
+            format,
+        });
+
+        // The skip tries to skip 1ms (48 frames) into a 48-frame buffer —
+        // index lands at the end. Must not panic; should discard the short
+        // buffer and return from the next one (ts=50000).
+        let frame = queue
+            .next_frame(2, 48_000)
+            .expect("should return a frame from the next buffer, not panic");
+        assert_eq!(
+            frame[0],
+            Sample(222),
+            "expected frame from the ahead buffer"
+        );
     }
 }
