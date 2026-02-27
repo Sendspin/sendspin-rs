@@ -90,6 +90,20 @@ impl PlaybackQueue {
             self.cursor_us = buffer.timestamp;
             self.cursor_remainder = 0;
         }
+
+        // When the server rebases its timeline backward (e.g. after event loop
+        // starvation), new chunks arrive with timestamps that overlap chunks
+        // already in the queue. Replace the old buffer to prevent duplicate
+        // audio that causes audible stuttering (~500ms of audio played twice).
+        let dominated = self
+            .queue
+            .iter()
+            .position(|b| (b.timestamp - buffer.timestamp).abs() < 12_500);
+        if let Some(idx) = dominated {
+            self.queue[idx] = buffer;
+            return;
+        }
+
         let pos = self
             .queue
             .iter()
@@ -117,6 +131,23 @@ impl PlaybackQueue {
             }
             self.current = self.queue.pop_front();
             self.index = 0;
+
+            // Skip past samples that are behind the cursor. This handles buffers
+            // that partially overlap with the current playback position, e.g. from
+            // backward timestamp jumps during server timeline rebases. Without this,
+            // playing from the start of such a buffer repeats audio the cursor has
+            // already passed, causing an audible stutter.
+            if self.initialized {
+                if let Some(ref current) = self.current {
+                    if current.timestamp < self.cursor_us {
+                        let skip_us = self.cursor_us - current.timestamp;
+                        let skip_frames = (skip_us * sample_rate as i64 / 1_000_000) as usize;
+                        if skip_frames > 0 {
+                            self.index = (skip_frames * channels).min(current.samples.len());
+                        }
+                    }
+                }
+            }
         }
 
         if !self.initialized {
@@ -430,8 +461,26 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
-                            let new_schedule = planner.plan(error_us, sample_rate);
+                            let new_schedule =
+                                planner.plan(error_us, sample_rate, schedule.is_correcting());
                             if new_schedule != schedule {
+                                if new_schedule.is_correcting() != schedule.is_correcting() {
+                                    if new_schedule.is_correcting() {
+                                        log::debug!(
+                                            "Sync correction engaged: \
+                                             error={:.1}ms, insert_every={}, drop_every={}",
+                                            error_us as f64 / 1000.0,
+                                            new_schedule.insert_every_n_frames,
+                                            new_schedule.drop_every_n_frames,
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "Sync correction disengaged: \
+                                             error={:.1}ms",
+                                            error_us as f64 / 1000.0,
+                                        );
+                                    }
+                                }
                                 schedule = new_schedule;
                                 insert_counter = schedule.insert_every_n_frames;
                                 drop_counter = schedule.drop_every_n_frames;
@@ -835,5 +884,112 @@ mod tests {
             format,
         });
         assert_eq!(queue.cursor_us, 200_000);
+    }
+
+    #[test]
+    fn test_next_frame_skips_into_overlapping_buffer() {
+        // Simulates a backward timestamp jump from a server timeline rebase.
+        // Buffer A is 50ms (2400 frames stereo at 48kHz). Buffer B starts at
+        // 25ms — well outside the 12.5ms dedup window but inside A's range.
+        // After consuming A, the cursor is at 50ms. When B (starting at 25ms)
+        // is popped, the skip logic should jump 25ms (1200 frames) into B.
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        let buf_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
+        let buf_b: Vec<Sample> = (0..2400 * 2)
+            .map(|i| {
+                // First half (1200 frames) = 222, second half = 333
+                if i < 2400 {
+                    Sample(222)
+                } else {
+                    Sample(333)
+                }
+            })
+            .collect();
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(buf_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.push(AudioBuffer {
+            timestamp: 25_000, // 25ms — overlaps with A but outside dedup window
+            play_at: Instant::now(),
+            samples: Arc::from(buf_b.into_boxed_slice()),
+            format,
+        });
+
+        // Consume all of buffer A (2400 frames). Cursor advances to 50000µs.
+        for _ in 0..2400 {
+            assert!(queue.next_frame(2, 48_000).is_some());
+        }
+        assert_eq!(queue.cursor_us, 50_000);
+
+        // Buffer B starts at 25ms but cursor is at 50ms, so 25ms (1200 frames)
+        // should be skipped. First returned frame should be Sample(333).
+        let frame = queue
+            .next_frame(2, 48_000)
+            .expect("should get a frame from buffer B");
+        assert_eq!(
+            frame[0],
+            Sample(333),
+            "expected skip into second half of buffer B (past the overlap), \
+             got first half — backward-timestamped audio was replayed"
+        );
+    }
+
+    #[test]
+    fn test_next_frame_no_skip_when_buffer_starts_at_or_after_cursor() {
+        // Verify that the skip logic doesn't activate for normal (non-overlapping)
+        // buffers — only for buffers that start before the cursor.
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        };
+
+        // 2400 frames = 50ms per buffer, well outside 12.5ms dedup window.
+        let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
+        let samples_b: Vec<Sample> = (0..2400 * 2).map(|_| Sample(222)).collect();
+
+        // Two consecutive, non-overlapping buffers.
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        queue.push(AudioBuffer {
+            timestamp: 50_000, // starts exactly where A ends
+            play_at: Instant::now(),
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format,
+        });
+
+        // Consume all of buffer A.
+        for _ in 0..2400 {
+            assert!(queue.next_frame(2, 48_000).is_some());
+        }
+
+        // Buffer B starts at cursor (50000µs) — no skip should occur.
+        let frame = queue
+            .next_frame(2, 48_000)
+            .expect("should get first frame of buffer B");
+        assert_eq!(
+            frame[0],
+            Sample(222),
+            "buffer B should play from the start (no skip needed)"
+        );
     }
 }
