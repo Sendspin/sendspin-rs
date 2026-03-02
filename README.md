@@ -34,6 +34,21 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 - Lock-free scheduler
 - End-to-end player
 
+
+## Installing build dependencies
+
+### Debian/Ubuntu/Mint
+
+```
+sudo apt install libasound2-dev
+```
+
+### Fedora/Centos
+
+```
+dnf install alsa-lib-devel
+```
+
 ## Quick Start
 
 Add to your `Cargo.toml`:
