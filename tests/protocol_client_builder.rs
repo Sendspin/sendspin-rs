@@ -106,11 +106,15 @@ fn test_default_player_v1_support_applied_at_build_time() {
     let support = builder
         .player_v1_support()
         .expect("should have default player support");
-    assert_eq!(support.supported_formats.len(), 1);
+    assert_eq!(support.supported_formats.len(), 2);
     assert_eq!(support.supported_formats[0].codec, "pcm");
     assert_eq!(support.supported_formats[0].channels, 2);
     assert_eq!(support.supported_formats[0].sample_rate, 48000);
     assert_eq!(support.supported_formats[0].bit_depth, 24);
+    assert_eq!(support.supported_formats[1].codec, "pcm");
+    assert_eq!(support.supported_formats[1].channels, 2);
+    assert_eq!(support.supported_formats[1].sample_rate, 48000);
+    assert_eq!(support.supported_formats[1].bit_depth, 16);
     assert_eq!(support.buffer_capacity, 50 * 1024 * 1024); // 50 MB
     assert_eq!(
         support.supported_commands,
