@@ -29,12 +29,20 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         // Default player support if not explicitly set
         let player_v1_support = raw.player_v1_support.or_else(|| {
             Some(PlayerV1Support {
-                supported_formats: vec![AudioFormatSpec {
-                    codec: "pcm".to_string(),
-                    channels: 2,
-                    sample_rate: 48000,
-                    bit_depth: 24,
-                }],
+                supported_formats: vec![
+                    AudioFormatSpec {
+                        codec: "pcm".to_string(),
+                        channels: 2,
+                        sample_rate: 48000,
+                        bit_depth: 24,
+                    },
+                    AudioFormatSpec {
+                        codec: "pcm".to_string(),
+                        channels: 2,
+                        sample_rate: 48000,
+                        bit_depth: 16,
+                    },
+                ],
                 buffer_capacity: 50 * 1024 * 1024,
                 supported_commands: vec!["volume".to_string(), "mute".to_string()],
             })
