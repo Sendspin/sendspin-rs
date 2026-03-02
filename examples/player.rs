@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected!");
 
     // Split client into separate receivers for concurrent processing
-    let (mut message_rx, mut audio_rx, clock_sync, ws_tx) = client.split();
+    let (mut message_rx, mut audio_rx, clock_sync, ws_tx, _guard) = client.split();
 
     // Send initial client/state message (handshake step 3)
     let client_state = Message::ClientState(ClientState {

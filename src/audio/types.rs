@@ -101,6 +101,18 @@ pub struct AudioFormat {
     pub codec_header: Option<Vec<u8>>,
 }
 
+impl AudioFormat {
+    /// Duration of `num_samples` total samples (interleaved) in microseconds.
+    ///
+    /// `num_samples` is the **total** sample count (frames × channels).
+    pub fn duration_us(&self, num_samples: usize) -> i64 {
+        debug_assert!(self.channels > 0, "AudioFormat with 0 channels");
+        debug_assert!(self.sample_rate > 0, "AudioFormat with 0 sample_rate");
+        let frames = num_samples / self.channels.max(1) as usize;
+        (frames as i64 * 1_000_000) / self.sample_rate.max(1) as i64
+    }
+}
+
 /// Audio buffer with timestamp (zero-copy via Arc).
 ///
 /// Note: [`SyncedPlayer`](crate::audio::SyncedPlayer) uses only `timestamp` for
@@ -121,4 +133,11 @@ pub struct AudioBuffer {
     pub samples: Arc<[Sample]>,
     /// Audio format specification.
     pub format: AudioFormat,
+}
+
+impl AudioBuffer {
+    /// Duration of this buffer in microseconds, derived from sample count and format.
+    pub fn duration_us(&self) -> i64 {
+        self.format.duration_us(self.samples.len())
+    }
 }

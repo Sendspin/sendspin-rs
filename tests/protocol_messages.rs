@@ -1,7 +1,8 @@
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand, ClientGoodbye,
-    ClientHello, ClientState, ConnectionReason, ControllerCommand, DeviceInfo, GoodbyeReason,
-    ImageFormat, Message, PlaybackState, PlayerState, PlayerSyncState, PlayerV1Support, RepeatMode,
+    ClientHello, ClientState, ClientTime, ConnectionReason, ControllerCommand, DeviceInfo,
+    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerState, PlayerSyncState,
+    PlayerV1Support, RepeatMode, ServerTime,
 };
 
 // =============================================================================
@@ -465,4 +466,96 @@ fn test_image_format_variants() {
         let parsed: ImageFormat = serde_json::from_str(json_val).unwrap();
         assert_eq!(parsed, expected);
     }
+}
+
+// =============================================================================
+// Time Sync Tests
+// =============================================================================
+
+#[test]
+fn test_client_time_serialization() {
+    let msg = Message::ClientTime(ClientTime {
+        client_transmitted: 1_700_000_000_000_000,
+    });
+    let json = serde_json::to_string(&msg).unwrap();
+
+    assert!(json.contains("\"type\":\"client/time\""));
+    assert!(json.contains("\"client_transmitted\":1700000000000000"));
+
+    // Round-trip
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    match parsed {
+        Message::ClientTime(ct) => {
+            assert_eq!(ct.client_transmitted, 1_700_000_000_000_000);
+        }
+        _ => panic!("Expected ClientTime"),
+    }
+}
+
+#[test]
+fn test_server_time_deserialization() {
+    let json = r#"{
+        "type": "server/time",
+        "payload": {
+            "client_transmitted": 1000000,
+            "server_received": 1005100,
+            "server_transmitted": 1005110
+        }
+    }"#;
+
+    let msg: Message = serde_json::from_str(json).unwrap();
+    match msg {
+        Message::ServerTime(st) => {
+            assert_eq!(st.client_transmitted, 1_000_000);
+            assert_eq!(st.server_received, 1_005_100);
+            assert_eq!(st.server_transmitted, 1_005_110);
+        }
+        _ => panic!("Expected ServerTime"),
+    }
+}
+
+#[test]
+fn test_server_time_fields_feed_clock_sync() {
+    use sendspin::sync::ClockSync;
+
+    // Simulate two sync rounds using the same field mapping
+    // that message_router uses: st.client_transmitted = t1,
+    // st.server_received = t2, st.server_transmitted = t3.
+    let mut sync = ClockSync::new();
+    assert!(!sync.is_synchronized());
+
+    let st1 = ServerTime {
+        client_transmitted: 1_000_000,
+        server_received: 1_005_100,
+        server_transmitted: 1_005_100,
+    };
+    let t4_1: i64 = 1_000_200;
+    sync.update(
+        st1.client_transmitted,
+        st1.server_received,
+        st1.server_transmitted,
+        t4_1,
+    );
+
+    let st2 = ServerTime {
+        client_transmitted: 2_000_000,
+        server_received: 2_005_100,
+        server_transmitted: 2_005_100,
+    };
+    let t4_2: i64 = 2_000_200;
+    sync.update(
+        st2.client_transmitted,
+        st2.server_received,
+        st2.server_transmitted,
+        t4_2,
+    );
+
+    // After two rounds, the filter should be synchronized
+    assert!(sync.is_synchronized());
+
+    // Verify the offset is reasonable: server time ≈ client time + 5000µs
+    let client = sync.server_to_client_micros(3_005_100);
+    assert!(client.is_some());
+    let diff = (client.unwrap() - 3_000_100).abs();
+    assert!(diff < 50, "offset drift too large: {}", diff);
 }

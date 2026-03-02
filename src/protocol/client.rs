@@ -2,7 +2,7 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
-use crate::protocol::messages::{ClientHello, Message};
+use crate::protocol::messages::{ClientHello, ClientTime, Message};
 use crate::sync::ClockSync;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -10,6 +10,7 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -24,6 +25,7 @@ type FullSplit = (
     UnboundedReceiver<VisualizerChunk>,
     Arc<Mutex<ClockSync>>,
     WsSender,
+    ConnectionGuard,
 );
 
 /// WebSocket sender wrapper for sending messages
@@ -248,6 +250,23 @@ pub struct ProtocolClient {
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
+    /// Background task guard, aborts tasks on drop
+    guard: ConnectionGuard,
+}
+
+/// Guard that aborts background tasks (message router, clock sync)
+/// when dropped. Hold onto this as long as the connection should
+/// remain active.
+pub struct ConnectionGuard {
+    router_handle: tokio::task::JoinHandle<()>,
+    sync_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.router_handle.abort();
+        self.sync_handle.abort();
+    }
 }
 
 impl ProtocolClient {
@@ -338,10 +357,11 @@ impl ProtocolClient {
         let (message_tx, message_rx) = unbounded_channel();
 
         let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+        let ws_tx = Arc::new(tokio::sync::Mutex::new(write));
 
         // Spawn message router task
         let clock_sync_clone = Arc::clone(&clock_sync);
-        tokio::spawn(async move {
+        let router_handle = tokio::spawn(async move {
             Self::message_router(
                 read_temp,
                 audio_tx,
@@ -353,13 +373,70 @@ impl ProtocolClient {
             .await;
         });
 
+        // Spawn periodic time sync task. Sends two rapid samples
+        // at startup (10ms apart) so the Kalman filter reaches
+        // is_synchronized() within ~20ms instead of ~2s, then
+        // settles into a 1-second cadence for ongoing correction.
+        let ws_tx_sync = Arc::clone(&ws_tx);
+        let sync_handle = tokio::spawn(async move {
+            log::debug!("Clock sync task started");
+            let mut sample_count: u32 = 0;
+            'sync: loop {
+                // Send first, then sleep — the first sample fires at t=0
+                // instead of waiting for the initial delay.
+                let sent = 'send: {
+                    // Acquire the write lock in a block so it's always
+                    // released before sleeping, even on error paths.
+                    let mut tx = ws_tx_sync.lock().await;
+                    let t1 = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(d) => d.as_micros() as i64,
+                        Err(e) => {
+                            log::warn!("Clock before Unix epoch, skipping sync send: {}", e);
+                            break 'send false;
+                        }
+                    };
+                    let msg = Message::ClientTime(ClientTime {
+                        client_transmitted: t1,
+                    });
+                    let json = match serde_json::to_string(&msg) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            log::warn!("Failed to serialize client/time: {}", e);
+                            break 'send false;
+                        }
+                    };
+                    if tx.send(WsMessage::Text(json)).await.is_err() {
+                        log::info!("Clock sync task exiting: connection closed");
+                        break 'sync;
+                    }
+                    true
+                }; // tx dropped here — released before sleeping
+                if sent {
+                    sample_count = sample_count.saturating_add(1);
+                }
+                // First two successful sends use a 10ms interval so the
+                // Kalman filter converges quickly (~20ms), then switch
+                // to a 1-second cadence for ongoing drift correction.
+                let delay = if sample_count < 2 {
+                    tokio::time::Duration::from_millis(10)
+                } else {
+                    tokio::time::Duration::from_secs(1)
+                };
+                tokio::time::sleep(delay).await;
+            }
+        });
+
         Ok(Self {
-            ws_tx: Arc::new(tokio::sync::Mutex::new(write)),
+            ws_tx,
             audio_rx,
             artwork_rx,
             visualizer_rx,
             message_rx,
             clock_sync,
+            guard: ConnectionGuard {
+                router_handle,
+                sync_handle,
+            },
         })
     }
 
@@ -369,7 +446,7 @@ impl ProtocolClient {
         artwork_tx: UnboundedSender<ArtworkChunk>,
         visualizer_tx: UnboundedSender<VisualizerChunk>,
         message_tx: UnboundedSender<Message>,
-        _clock_sync: Arc<Mutex<ClockSync>>,
+        clock_sync: Arc<Mutex<ClockSync>>,
     ) {
         while let Some(msg) = read.next().await {
             match msg {
@@ -410,11 +487,37 @@ impl ProtocolClient {
                     }
                 }
                 Ok(WsMessage::Text(text)) => {
+                    // Capture receive time before deserialization so
+                    // t4 is as close to the true arrival time as possible.
+                    let receive_time = SystemTime::now();
                     log::debug!("Received text message: {}", text);
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
                             log::debug!("Parsed message: {:?}", msg);
-                            let _ = message_tx.send(msg);
+                            // ServerTime is consumed here for clock sync
+                            // and intentionally NOT forwarded to message_rx
+                            // consumers — it's an internal protocol detail.
+                            if let Message::ServerTime(ref st) = msg {
+                                match receive_time.duration_since(UNIX_EPOCH) {
+                                    Ok(d) => {
+                                        let t4 = d.as_micros() as i64;
+                                        clock_sync.lock().update(
+                                            st.client_transmitted,
+                                            st.server_received,
+                                            st.server_transmitted,
+                                            t4,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "Clock before Unix epoch, skipping sync sample: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            } else {
+                                let _ = message_tx.send(msg);
+                            }
                         }
                         Err(e) => {
                             log::warn!("Failed to parse message: {}", e);
@@ -476,7 +579,8 @@ impl ProtocolClient {
     /// Split into separate receivers for concurrent processing
     ///
     /// This allows using tokio::select! to process messages and binary data concurrently
-    /// without borrow checker issues
+    /// without borrow checker issues. The returned `ConnectionGuard` must be held
+    /// alive; dropping it aborts the background tasks.
     pub fn split(
         self,
     ) -> (
@@ -484,18 +588,22 @@ impl ProtocolClient {
         UnboundedReceiver<AudioChunk>,
         Arc<Mutex<ClockSync>>,
         WsSender,
+        ConnectionGuard,
     ) {
         (
             self.message_rx,
             self.audio_rx,
             self.clock_sync,
             WsSender { tx: self.ws_tx },
+            self.guard,
         )
     }
 
     /// Split into all receivers including artwork and visualizer
     ///
-    /// Use this when you need to handle all binary frame types
+    /// Use this when you need to handle all binary frame types.
+    /// The returned `ConnectionGuard` must be held alive; dropping it
+    /// aborts the background tasks.
     pub fn split_full(self) -> FullSplit {
         (
             self.message_rx,
@@ -504,6 +612,7 @@ impl ProtocolClient {
             self.visualizer_rx,
             self.clock_sync,
             WsSender { tx: self.ws_tx },
+            self.guard,
         )
     }
 }

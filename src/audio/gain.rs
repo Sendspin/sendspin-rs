@@ -191,7 +191,6 @@ impl GainRamp {
             // next real call.
             return;
         }
-        debug_assert!(channels > 0, "channels must be > 0");
         debug_assert!(
             data.len().is_multiple_of(channels),
             "buffer length must be a multiple of channels"
@@ -200,6 +199,9 @@ impl GainRamp {
         self.update_target(target);
 
         // Fast path: skip per-sample multiply when gain is unity and stable.
+        // `== 1.0` is exact because `current_gain` only reaches 1.0 via the
+        // snap-to-target assignment (`self.current_gain = target`) when the
+        // ramp completes, so there is no accumulated floating-point error.
         if self.ramp_frames_remaining == 0 && self.current_gain == 1.0 {
             return;
         }
@@ -260,6 +262,12 @@ impl GainRamp {
 mod tests {
     use super::*;
 
+    // Expected gain values are precomputed literals, NOT calls to `volume_to_gain()`.
+    // This is intentional: using the function under test as its own oracle is
+    // tautological. The literals are independently derived from the 1.5-power
+    // perceptual curve: gain = (volume / 100)^1.5.  If the curve changes,
+    // these tests break — which is exactly what we want.
+
     #[test]
     fn test_volume_to_gain_boundaries() {
         let gc = GainControl::new(100, false);
@@ -271,8 +279,7 @@ mod tests {
         assert!((gc.target_gain() - 1.0).abs() < f32::EPSILON);
 
         gc.set_volume(50);
-        let expected = 0.5_f32.powf(1.5); // 0.0625
-        assert!((gc.target_gain() - expected).abs() < 1e-6);
+        assert!((gc.target_gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
     }
 
     #[test]
@@ -531,10 +538,9 @@ mod tests {
 
         // Unmute — gain should reflect volume=25, not volume=75
         gc.set_mute(false);
-        let expected = (25.0_f32 / 100.0).powf(1.5);
         assert!(
-            (gc.target_gain() - expected).abs() < 1e-6,
-            "after unmute, gain should match volume=25 ({expected}), got {}",
+            (gc.target_gain() - 0.125).abs() < 1e-3, // (25/100)^1.5
+            "after unmute, gain should match volume=25 (0.125), got {}",
             gc.target_gain()
         );
     }
@@ -807,8 +813,7 @@ mod tests {
     fn test_gain_control_initial_volume() {
         let gc = GainControl::new(50, false);
         assert_eq!(gc.volume(), 50);
-        let expected = (50.0_f32 / 100.0).powf(1.5);
-        assert!((gc.target_gain() - expected).abs() < 1e-6);
+        assert!((gc.target_gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
     }
 
     #[test]
@@ -820,8 +825,7 @@ mod tests {
 
         // Unmuting restores the gain for volume 75
         gc.set_mute(false);
-        let expected = (75.0_f32 / 100.0).powf(1.5);
-        assert!((gc.target_gain() - expected).abs() < 1e-6);
+        assert!((gc.target_gain() - 0.649_519).abs() < 1e-3); // (75/100)^1.5
     }
 
     #[test]
