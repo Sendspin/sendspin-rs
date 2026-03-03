@@ -1,6 +1,6 @@
 [package]
 name = "sendspin"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Sendspin Contributors"]
 description = "Hyper-efficient Rust implementation of the Sendspin Protocol for synchronized multi-room audio streaming"
