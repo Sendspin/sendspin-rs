@@ -12,6 +12,68 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 
+use cpal::traits::{DeviceTrait, HostTrait};
+
+fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let available_hosts = cpal::available_hosts();
+
+    for host_id in available_hosts {
+        println!("{}", host_id.name());
+        let host = cpal::host_from_id(host_id)?;
+
+        let devices = host.devices()?;
+        println!("  Devices: ");
+        for (device_index, device) in devices.enumerate() {
+            let id = device
+                .id()
+                .map_or("Unknown ID".to_string(), |id| id.to_string());
+
+            // Output configs
+            let output_configs = match device.supported_output_configs() {
+                Ok(f) => f.collect(),
+                Err(_) => Vec::new(),
+            };
+            if !output_configs.is_empty() {
+                if let Ok(desc) = device.description() {
+                    println!("  {}. {id}   # ({})", device_index + 1, desc);
+                } else {
+                    println!("  {}. {id}", device_index + 1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// Takes a string for device name
+fn find_device(device_name: &str) -> Result<Option<cpal::Device>, Box<dyn std::error::Error>> {
+    let available_hosts = cpal::available_hosts();
+
+    for host_id in available_hosts {
+        let host = cpal::host_from_id(host_id)?;
+
+        let devices = host.devices()?;
+        for device in devices {
+            let id = device
+                .id()
+                .map_or("Unknown ID".to_string(), |id| id.to_string());
+
+            // Output configs
+            let output_configs = match device.supported_output_configs() {
+                Ok(f) => f.collect(),
+                Err(_) => Vec::new(),
+            };
+            if !output_configs.is_empty() && id == device_name {
+                println!("Found matching device: {id}");
+                return Ok(Some(device));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Environment variable helpers
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -43,6 +105,14 @@ struct Args {
     /// Player UUID (optional, generates random UUID if not provided)
     #[arg(short = 'u', long)]
     uuid: Option<String>,
+
+    /// List all available audio output devices and exit
+    #[arg(long)]
+    list_devices: bool,
+
+    /// Audio output device ID (optional, uses default if not specified)
+    #[arg(long)]
+    device: Option<String>,
 }
 
 #[tokio::main]
@@ -50,6 +120,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args = Args::parse();
+
+    // Handle --list_devices flag
+    if args.list_devices {
+        print_devices()?;
+        return Ok(());
+    }
+
+    // Resolve device if specified
+    let device = if let Some(device_name) = &args.device {
+        match find_device(device_name) {
+            Ok(Some(dev)) => Some(dev),
+            Ok(None) => {
+                return Err(format!("Device '{}' not found", device_name).into());
+            }
+            Err(e) => {
+                eprintln!("Failed to find device: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
 
     // Use provided UUID or generate a new one
     let client_id = args
@@ -303,7 +395,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match SyncedPlayer::new(
                                     fmt.clone(),
                                     Arc::clone(&clock_sync),
-                                    None,
+                                    device.as_ref().cloned(),
                                     100,
                                     false,
                                 ) {
