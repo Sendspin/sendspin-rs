@@ -39,6 +39,10 @@ struct Args {
     /// Client name
     #[arg(short, long, default_value = "Sendspin-RS Player")]
     name: String,
+
+    /// Player UUID (optional, generates random UUID if not provided)
+    #[arg(short = 'u', long)]
+    uuid: Option<String>,
 }
 
 #[tokio::main]
@@ -47,9 +51,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
+    // Use provided UUID or generate a new one
+    let client_id = args
+        .uuid
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
+        .client_id(client_id)
         .name(args.name.clone())
         .build();
 
