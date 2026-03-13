@@ -17,60 +17,68 @@ use cpal::traits::{DeviceTrait, HostTrait};
 fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
     let available_hosts = cpal::available_hosts();
 
-    for host_id in available_hosts {
-        println!("{}", host_id.name());
-        let host = cpal::host_from_id(host_id)?;
-
-        let devices = host.devices()?;
-        println!("  Devices: ");
-        for (device_index, device) in devices.enumerate() {
-            let id = device
-                .id()
-                .map_or("Unknown ID".to_string(), |id| id.to_string());
-
-            // Output configs
-            let output_configs = match device.supported_output_configs() {
-                Ok(f) => f.collect(),
-                Err(_) => Vec::new(),
-            };
-            if !output_configs.is_empty() {
-                if let Ok(desc) = device.description() {
-                    println!("  {}. {id}   # ({})", device_index + 1, desc);
-                } else {
-                    println!("  {}. {id}", device_index + 1);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-// Takes a string for device name
-fn find_device(device_name: &str) -> Result<Option<cpal::Device>, Box<dyn std::error::Error>> {
-    let available_hosts = cpal::available_hosts();
-
+    println!("Available audio output devices:\n");
+    let mut usable_index = 0;
     for host_id in available_hosts {
         let host = cpal::host_from_id(host_id)?;
-
         let devices = host.devices()?;
         for device in devices {
             let id = device
                 .id()
                 .map_or("Unknown ID".to_string(), |id| id.to_string());
-
-            // Output configs
             let output_configs = match device.supported_output_configs() {
                 Ok(f) => f.collect(),
                 Err(_) => Vec::new(),
             };
-            if !output_configs.is_empty() && id == device_name {
-                println!("Found matching device: {id}");
-                return Ok(Some(device));
+            if !output_configs.is_empty() {
+                // Construct [number] and right-justify it in a fixed-width field
+                let index_str = format!("[{}]", usable_index);
+                if let Ok(desc) = device.description() {
+                    println!("{:>6} {}\n       Description: {}", index_str, id, desc);
+                } else {
+                    println!("{:>6} {}", index_str, id);
+                }
+                usable_index += 1;
             }
         }
     }
 
+    println!("\nTo select an audio device by index:");
+    println!("  player --audio-device 0");
+    println!("Or by device id string:");
+    println!("  player --audio-device \"<device_id_string>\"");
+    Ok(())
+}
+
+/// Accepts either an index (as printed by print_devices) or a device id string.
+fn find_device(device_query: &str) -> Result<Option<cpal::Device>, Box<dyn std::error::Error>> {
+    let available_hosts = cpal::available_hosts();
+    let idx_query = device_query.parse::<usize>().ok();
+    let mut usable_index = 0;
+
+    for host_id in available_hosts {
+        let host = cpal::host_from_id(host_id)?;
+        let devices = host.devices()?;
+        for device in devices {
+            let id = device
+                .id()
+                .map_or("Unknown ID".to_string(), |id| id.to_string());
+            let output_configs = match device.supported_output_configs() {
+                Ok(f) => f.collect(),
+                Err(_) => Vec::new(),
+            };
+            if !output_configs.is_empty() {
+                if let Some(idx) = idx_query {
+                    if usable_index == idx {
+                        return Ok(Some(device));
+                    }
+                } else if id == device_query {
+                    return Ok(Some(device));
+                }
+                usable_index += 1;
+            }
+        }
+    }
     Ok(None)
 }
 
@@ -102,17 +110,17 @@ struct Args {
     #[arg(short, long, default_value = "Sendspin-RS Player")]
     name: String,
 
-    /// Player UUID (optional, generates random UUID if not provided)
-    #[arg(short = 'u', long)]
-    uuid: Option<String>,
+    /// Player ID (optional, generates random UUID if not provided)
+    #[arg(short = 'i', long = "id")]
+    id: Option<String>,
 
     /// List all available audio output devices and exit
-    #[arg(long)]
-    list_devices: bool,
+    #[arg(long = "list-audio-devices")]
+    list_audio_devices: bool,
 
     /// Audio output device ID (optional, uses default if not specified)
-    #[arg(long)]
-    device: Option<String>,
+    #[arg(long = "audio-device")]
+    audio_device: Option<String>,
 }
 
 #[tokio::main]
@@ -121,14 +129,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Handle --list_devices flag
-    if args.list_devices {
+    // Handle --list-audio-devices flag
+    if args.list_audio_devices {
         print_devices()?;
         return Ok(());
     }
 
     // Resolve device if specified
-    let device = if let Some(device_name) = &args.device {
+    let device = if let Some(device_name) = &args.audio_device {
         match find_device(device_name) {
             Ok(Some(dev)) => Some(dev),
             Ok(None) => {
@@ -143,10 +151,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Use provided UUID or generate a new one
-    let client_id = args
-        .uuid
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Use provided ID or generate a random UUID
+    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
