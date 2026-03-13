@@ -12,6 +12,86 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::interval;
 
+use cpal::traits::{DeviceTrait, HostTrait};
+
+fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
+    let available_hosts = cpal::available_hosts();
+
+    println!("Available audio output devices:\n");
+    let mut usable_index = 0;
+    let mut example_id: Option<String> = None;
+    for host_id in available_hosts {
+        let host = cpal::host_from_id(host_id)?;
+        let devices = host.devices()?;
+        for device in devices {
+            let id = device
+                .id()
+                .map_or("Unknown ID".to_string(), |id| id.to_string());
+            let output_configs = match device.supported_output_configs() {
+                Ok(f) => f.collect(),
+                Err(_) => Vec::new(),
+            };
+            if !output_configs.is_empty() {
+                if example_id.is_none() {
+                    example_id = Some(id.clone());
+                }
+                // Construct [number] and right-justify it in a fixed-width field
+                let index_str = format!("[{}]", usable_index);
+                if let Ok(desc) = device.description() {
+                    println!("{:>6} {}\n       Description: {}", index_str, id, desc);
+                } else {
+                    println!("{:>6} {}", index_str, id);
+                }
+                usable_index += 1;
+            }
+        }
+    }
+
+    if usable_index == 0 {
+        println!("\nNo devices found");
+    } else {
+        println!("\nTo select an audio device by index:");
+        println!("  player --audio-device 0");
+        if let Some(id) = example_id {
+            println!("Or by device id string:");
+            println!("  player --audio-device \"{}\"", id);
+        }
+    }
+    Ok(())
+}
+
+/// Accepts either an index (as printed by print_devices) or a device id string.
+fn find_device(device_query: &str) -> Result<Option<cpal::Device>, Box<dyn std::error::Error>> {
+    let available_hosts = cpal::available_hosts();
+    let idx_query = device_query.parse::<usize>().ok();
+    let mut usable_index = 0;
+
+    for host_id in available_hosts {
+        let host = cpal::host_from_id(host_id)?;
+        let devices = host.devices()?;
+        for device in devices {
+            let id = device
+                .id()
+                .map_or("Unknown ID".to_string(), |id| id.to_string());
+            let output_configs = match device.supported_output_configs() {
+                Ok(f) => f.collect(),
+                Err(_) => Vec::new(),
+            };
+            if !output_configs.is_empty() {
+                if let Some(idx) = idx_query {
+                    if usable_index == idx {
+                        return Ok(Some(device));
+                    }
+                } else if id == device_query {
+                    return Ok(Some(device));
+                }
+                usable_index += 1;
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Environment variable helpers
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -39,6 +119,18 @@ struct Args {
     /// Client name
     #[arg(short, long, default_value = "Sendspin-RS Player")]
     name: String,
+
+    /// Player ID (optional, generates random UUID if not provided)
+    #[arg(short = 'i', long = "id")]
+    id: Option<String>,
+
+    /// List all available audio output devices and exit
+    #[arg(long = "list-audio-devices")]
+    list_audio_devices: bool,
+
+    /// Audio output device ID (optional, uses default if not specified)
+    #[arg(long = "audio-device")]
+    audio_device: Option<String>,
 }
 
 #[tokio::main]
@@ -47,9 +139,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
+    // Handle --list-audio-devices flag
+    if args.list_audio_devices {
+        print_devices()?;
+        return Ok(());
+    }
+
+    // Resolve device if specified
+    let device = if let Some(device_name) = &args.audio_device {
+        match find_device(device_name) {
+            Ok(Some(dev)) => Some(dev),
+            Ok(None) => {
+                return Err(format!("Device '{}' not found", device_name).into());
+            }
+            Err(e) => {
+                eprintln!("Failed to find device: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Use provided ID or generate a random UUID
+    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
+        .client_id(client_id)
         .name(args.name.clone())
         .build();
 
@@ -294,7 +411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match SyncedPlayer::new(
                                     fmt.clone(),
                                     Arc::clone(&clock_sync),
-                                    None,
+                                    device.as_ref().cloned(),
                                     100,
                                     false,
                                 ) {

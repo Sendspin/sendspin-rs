@@ -296,7 +296,7 @@ impl SyncedPlayer {
 
         let config = StreamConfig {
             channels: format.channels as u16,
-            sample_rate: cpal::SampleRate(format.sample_rate),
+            sample_rate: cpal::SampleRate::from(format.sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 

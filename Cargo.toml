@@ -29,7 +29,7 @@ log = "0.4"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
 # Audio output
-cpal = "0.15"
+cpal = "0.17"
 
 # Concurrency
 crossbeam = "0.8"
