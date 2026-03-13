@@ -19,6 +19,7 @@ fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Available audio output devices:\n");
     let mut usable_index = 0;
+    let mut example_id: Option<String> = None;
     for host_id in available_hosts {
         let host = cpal::host_from_id(host_id)?;
         let devices = host.devices()?;
@@ -31,6 +32,9 @@ fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
                 Err(_) => Vec::new(),
             };
             if !output_configs.is_empty() {
+                if example_id.is_none() {
+                    example_id = Some(id.clone());
+                }
                 // Construct [number] and right-justify it in a fixed-width field
                 let index_str = format!("[{}]", usable_index);
                 if let Ok(desc) = device.description() {
@@ -43,10 +47,16 @@ fn print_devices() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\nTo select an audio device by index:");
-    println!("  player --audio-device 0");
-    println!("Or by device id string:");
-    println!("  player --audio-device \"<device_id_string>\"");
+    if usable_index == 0 {
+        println!("\nNo devices found");
+    } else {
+        println!("\nTo select an audio device by index:");
+        println!("  player --audio-device 0");
+        if let Some(id) = example_id {
+            println!("Or by device id string:");
+            println!("  player --audio-device \"{}\"", id);
+        }
+    }
     Ok(())
 }
 
