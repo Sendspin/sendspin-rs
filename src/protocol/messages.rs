@@ -343,11 +343,66 @@ pub struct MetadataState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackProgress {
     /// Current position in milliseconds
+    #[serde(deserialize_with = "deserialize_number_as_i64")]
     pub track_progress: i64,
     /// Total duration in milliseconds (0 for unknown/live streams)
+    #[serde(deserialize_with = "deserialize_number_as_i64")]
     pub track_duration: i64,
     /// Playback speed multiplier * 1000 (1000 = normal, 0 = paused)
+    #[serde(deserialize_with = "deserialize_number_as_i32")]
     pub playback_speed: i32,
+}
+
+/// Deserialize a JSON number (int or float) as i64
+fn deserialize_number_as_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct NumberVisitor;
+    impl<'de> de::Visitor<'de> for NumberVisitor {
+        type Value = i64;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number (integer or float)")
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+    }
+    deserializer.deserialize_any(NumberVisitor)
+}
+
+/// Deserialize a JSON number (int or float) as i32
+fn deserialize_number_as_i32<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct NumberVisitor;
+    impl<'de> de::Visitor<'de> for NumberVisitor {
+        type Value = i32;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a number (integer or float)")
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> {
+            Ok(v as i32)
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> {
+            Ok(v as i32)
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i32, E> {
+            Ok(v as i32)
+        }
+    }
+    deserializer.deserialize_any(NumberVisitor)
 }
 
 /// Repeat mode

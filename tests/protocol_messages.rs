@@ -3,7 +3,7 @@ use sendspin::protocol::messages::{
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
     ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
     ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerState, PlayerStateCommand,
-    PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
+    PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig, TrackProgress,
 };
 
 // =============================================================================
@@ -168,6 +168,38 @@ fn test_server_state_metadata_deserialization() {
         }
         _ => panic!("Expected ServerState"),
     }
+}
+
+#[test]
+fn test_track_progress_accepts_float_values() {
+    // Music Assistant sends track_progress, track_duration, and playback_speed
+    // as floats (e.g., 292333.0) instead of integers. Verify the custom
+    // deserializers accept them and truncate to the integer type.
+    let json = r#"{
+        "track_progress": 292333.0,
+        "track_duration": 180000.5,
+        "playback_speed": 1000.0
+    }"#;
+
+    let progress: TrackProgress = serde_json::from_str(json).unwrap();
+    assert_eq!(progress.track_progress, 292333);
+    assert_eq!(progress.track_duration, 180000);
+    assert_eq!(progress.playback_speed, 1000);
+}
+
+#[test]
+fn test_track_progress_still_accepts_integers() {
+    // Regression guard: integer values must continue to deserialize as before.
+    let json = r#"{
+        "track_progress": 60000,
+        "track_duration": 180000,
+        "playback_speed": 1000
+    }"#;
+
+    let progress: TrackProgress = serde_json::from_str(json).unwrap();
+    assert_eq!(progress.track_progress, 60000);
+    assert_eq!(progress.track_duration, 180000);
+    assert_eq!(progress.playback_speed, 1000);
 }
 
 #[test]
