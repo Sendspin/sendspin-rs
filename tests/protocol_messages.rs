@@ -559,3 +559,146 @@ fn test_server_time_fields_feed_clock_sync() {
     let diff = (client.unwrap() - 3_000_100).abs();
     assert!(diff < 50, "offset drift too large: {}", diff);
 }
+
+// =============================================================================
+// Deserialization Error Path Tests
+// =============================================================================
+
+#[test]
+fn test_malformed_json_rejected() {
+    let result = serde_json::from_str::<Message>("not valid json at all");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_empty_json_object_rejected() {
+    let result = serde_json::from_str::<Message>("{}");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_unknown_message_type_rejected() {
+    let json = r#"{"type": "invalid/type", "payload": {}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_missing_payload_rejected() {
+    let json = r#"{"type": "client/hello"}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_client_hello_missing_required_fields() {
+    // Missing client_id, name, version, supported_roles
+    let json = r#"{"type": "client/hello", "payload": {}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_server_hello_missing_required_fields() {
+    let json = r#"{"type": "server/hello", "payload": {"server_id": "s1"}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_connection_reason_rejected() {
+    let json = r#"{
+        "type": "server/hello",
+        "payload": {
+            "server_id": "s1",
+            "name": "Test",
+            "version": 1,
+            "active_roles": [],
+            "connection_reason": "invalid_reason"
+        }
+    }"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_playback_state_rejected() {
+    let result = serde_json::from_str::<PlaybackState>(r#""paused""#);
+    assert!(
+        result.is_err(),
+        "only 'playing' and 'stopped' are valid per spec"
+    );
+}
+
+#[test]
+fn test_invalid_repeat_mode_rejected() {
+    let result = serde_json::from_str::<RepeatMode>(r#""shuffle""#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_invalid_goodbye_reason_rejected() {
+    let result = serde_json::from_str::<GoodbyeReason>(r#""timeout""#);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_wrong_type_in_payload_field_rejected() {
+    // version should be u32, not string
+    let json = r#"{
+        "type": "client/hello",
+        "payload": {
+            "client_id": "c1",
+            "name": "Test",
+            "version": "not_a_number",
+            "supported_roles": []
+        }
+    }"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_null_payload_rejected() {
+    let json = r#"{"type": "client/hello", "payload": null}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_client_state_empty_payload_accepted() {
+    // ClientState with player: None should be valid
+    let json = r#"{"type": "client/state", "payload": {}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_ok());
+    match result.unwrap() {
+        Message::ClientState(state) => assert!(state.player.is_none()),
+        _ => panic!("Expected ClientState"),
+    }
+}
+
+#[test]
+fn test_server_state_empty_payload_accepted() {
+    // ServerState with no metadata or controller should be valid
+    let json = r#"{"type": "server/state", "payload": {}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_ok());
+    match result.unwrap() {
+        Message::ServerState(state) => {
+            assert!(state.metadata.is_none());
+            assert!(state.controller.is_none());
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_stream_end_empty_roles_accepted() {
+    let json = r#"{"type": "stream/end", "payload": {}}"#;
+    let result = serde_json::from_str::<Message>(json);
+    assert!(result.is_ok());
+    match result.unwrap() {
+        Message::StreamEnd(end) => assert!(end.roles.is_none()),
+        _ => panic!("Expected StreamEnd"),
+    }
+}
