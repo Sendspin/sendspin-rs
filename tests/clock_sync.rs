@@ -105,19 +105,23 @@ fn test_sync_quality_recovery() {
 }
 
 #[test]
-fn test_sync_quality_lost_after_high_rtt() {
+fn test_sync_quality_unchanged_after_high_rtt() {
     let mut sync = ClockSync::new();
 
-    // Good RTT first
+    // First, establish a good RTT (30µs)
     sync.update(1_000_000, 500_000, 500_010, 1_000_040);
     assert_eq!(sync.quality(), SyncQuality::Good);
+    assert_eq!(sync.rtt_micros(), Some(30));
 
-    // RTT > 100ms is discarded by update(), but quality() reports Lost
-    // when no valid RTT is stored. Since the filter discards RTT > 100ms,
-    // the last stored RTT remains the good one. Let's verify Lost for
-    // a fresh sync with no updates.
-    let fresh = ClockSync::new();
-    assert_eq!(fresh.quality(), SyncQuality::Lost);
+    // Now provide a very high RTT (> 100_000µs), which should be discarded
+    // RTT = (t4 - t1) - (t3 - t2) = (3_100_020 - 3_000_000) - (700_010 - 700_000)
+    //     = 100_020 - 10 = 100_010µs
+    sync.update(3_000_000, 700_000, 700_010, 3_100_020);
+
+    // The high RTT should not overwrite the previously stored good RTT,
+    // and the quality should remain unchanged.
+    assert_eq!(sync.quality(), SyncQuality::Good);
+    assert_eq!(sync.rtt_micros(), Some(30));
 }
 
 #[test]
