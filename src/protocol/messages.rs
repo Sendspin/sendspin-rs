@@ -246,6 +246,9 @@ pub struct ServerTime {
 /// Client state update message (wraps role-specific state)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientState {
+    /// Client operational state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<ClientSyncState>,
     /// Player state (if player role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerState>,
@@ -254,25 +257,29 @@ pub struct ClientState {
 /// Player state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerState {
-    /// Sync state: "synchronized" or "error"
-    pub state: PlayerSyncState,
     /// Current volume level (0-100)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
     /// Whether audio is muted
     #[serde(skip_serializing_if = "Option::is_none")]
     pub muted: Option<bool>,
+    /// Static delay in milliseconds (0-5000) to compensate for external speaker/amplifier latency
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub static_delay_ms: Option<u16>,
+    /// Supported player state commands (e.g., "set_static_delay")
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub supported_commands: Option<Vec<String>>,
 }
 
-/// Player synchronization state
+/// Client synchronization state (top-level in client/state)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum PlayerSyncState {
-    /// Player is synchronized with server clock
+pub enum ClientSyncState {
+    /// Client is operational and synchronized with server timestamps
     Synchronized,
-    /// Player encountered an error
+    /// Client has a problem preventing normal operation
     Error,
-    /// Player is in use by an external system (e.g., different audio source, HDMI input)
+    /// Client is in use by an external system (e.g., different audio source, HDMI input)
     ExternalSource,
 }
 
@@ -373,7 +380,7 @@ pub struct ServerCommand {
 /// Player-specific command from server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCommand {
-    /// Command name: "volume" or "mute"
+    /// Command name: "volume", "mute", or "set_static_delay"
     pub command: String,
     /// Optional volume level (0-100)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -381,6 +388,9 @@ pub struct PlayerCommand {
     /// Optional mute state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
+    /// Optional static delay in milliseconds (0-5000)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub static_delay_ms: Option<u16>,
 }
 
 /// Client command message (controller commands to server)
@@ -394,7 +404,7 @@ pub struct ClientCommand {
 /// Controller command from client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerCommand {
-    /// Command name (play, pause, stop, next, previous, volume, mute, etc.)
+    /// Command name (play, stop, next, previous, volume, mute, etc.)
     pub command: String,
     /// Optional volume level (0-100) for volume command
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -441,8 +451,21 @@ pub struct StreamPlayerConfig {
 /// Stream artwork configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamArtworkConfig {
-    /// Active artwork channels
-    pub channels: Vec<u8>,
+    /// Configuration for each active artwork channel, array index is the channel number
+    pub channels: Vec<StreamArtworkChannelConfig>,
+}
+
+/// Configuration for a single artwork channel in stream/start
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamArtworkChannelConfig {
+    /// Artwork source type
+    pub source: ArtworkSource,
+    /// Format of the encoded image
+    pub format: ImageFormat,
+    /// Width in pixels of the encoded image
+    pub width: u32,
+    /// Height in pixels of the encoded image
+    pub height: u32,
 }
 
 /// Stream visualizer configuration
@@ -502,10 +525,10 @@ pub struct ArtworkFormatRequest {
     pub channel: u8,
     /// Preferred image source
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Preferred image format (jpeg, png, bmp)
+    pub source: Option<ArtworkSource>,
+    /// Preferred image format
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub format: Option<String>,
+    pub format: Option<ImageFormat>,
     /// Display width in pixels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_width: Option<u32>,
@@ -574,7 +597,3 @@ pub enum GoodbyeReason {
 /// Legacy type alias for backwards compatibility
 #[deprecated(note = "Use PlayerV1Support instead")]
 pub type PlayerSupport = PlayerV1Support;
-
-/// Legacy type alias for backwards compatibility
-#[deprecated(note = "Use ClientState instead")]
-pub type PlayerUpdate = ClientState;

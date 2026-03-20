@@ -2,7 +2,7 @@
 // ABOUTME: Just connects and prints everything the server sends
 
 use clap::Parser;
-use sendspin::protocol::messages::{ClientState, Message, PlayerState, PlayerSyncState};
+use sendspin::protocol::messages::{ClientState, ClientSyncState, Message, PlayerState};
 use sendspin::ProtocolClientBuilder;
 
 /// Minimal Sendspin test client
@@ -34,10 +34,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send client/state (handshake step 3)
     let client_state = Message::ClientState(ClientState {
+        state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
-            state: PlayerSyncState::Synchronized,
             volume: Some(100),
             muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: None,
         }),
     });
     ws_tx.send_message(client_state).await?;
