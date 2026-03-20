@@ -874,10 +874,7 @@ fn test_player_state_supported_commands_roundtrip() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
-            supported_commands: Some(vec![
-                "set_static_delay".to_string(),
-                "volume".to_string(),
-            ]),
+            supported_commands: Some(vec!["set_static_delay".to_string(), "volume".to_string()]),
         }),
     };
 
@@ -891,7 +888,9 @@ fn test_player_state_supported_commands_roundtrip() {
     match parsed {
         Message::ClientState(cs) => {
             let player = cs.player.expect("Expected player");
-            let cmds = player.supported_commands.expect("Expected supported_commands");
+            let cmds = player
+                .supported_commands
+                .expect("Expected supported_commands");
             assert_eq!(cmds, vec!["set_static_delay", "volume"]);
         }
         _ => panic!("Expected ClientState"),
@@ -913,8 +912,16 @@ fn test_artwork_format_request_typed_enums() {
     let json = serde_json::to_string(&request).unwrap();
 
     // Enums should serialize as lowercase strings, not struct representations
-    assert!(json.contains("\"source\":\"album\""), "source not serialized as string: {}", json);
-    assert!(json.contains("\"format\":\"jpeg\""), "format not serialized as string: {}", json);
+    assert!(
+        json.contains("\"source\":\"album\""),
+        "source not serialized as string: {}",
+        json
+    );
+    assert!(
+        json.contains("\"format\":\"jpeg\""),
+        "format not serialized as string: {}",
+        json
+    );
 
     // Roundtrip
     let parsed: ArtworkFormatRequest = serde_json::from_str(&json).unwrap();
