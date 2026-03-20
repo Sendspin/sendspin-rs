@@ -283,7 +283,6 @@ pub enum ClientSyncState {
     ExternalSource,
 }
 
-
 /// Server state update message (metadata and controller info)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerState {
