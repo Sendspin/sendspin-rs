@@ -36,7 +36,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_state = Message::ClientState(ClientState {
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
-
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
