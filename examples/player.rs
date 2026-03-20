@@ -4,7 +4,9 @@
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
-use sendspin::protocol::messages::{ClientState, ClientSyncState, ClientTime, Message, PlayerState};
+use sendspin::protocol::messages::{
+    ClientState, ClientSyncState, ClientTime, Message, PlayerState,
+};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -178,7 +180,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_state = Message::ClientState(ClientState {
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
-
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
