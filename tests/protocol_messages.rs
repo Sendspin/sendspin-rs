@@ -1,8 +1,9 @@
 use sendspin::protocol::messages::{
-    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ClientCommand, ClientGoodbye,
-    ClientHello, ClientState, ClientTime, ConnectionReason, ControllerCommand, DeviceInfo,
-    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerState, PlayerSyncState,
-    PlayerV1Support, RepeatMode, ServerTime,
+    ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
+    ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
+    ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
+    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerState, PlayerStateCommand,
+    PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
 };
 
 // =============================================================================
@@ -78,10 +79,12 @@ fn test_server_hello_deserialization() {
 #[test]
 fn test_client_state_serialization() {
     let state = ClientState {
+        state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
-            state: PlayerSyncState::Synchronized,
             volume: Some(100),
             muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: None,
         }),
     };
 
@@ -91,22 +94,33 @@ fn test_client_state_serialization() {
     assert!(json.contains("\"type\":\"client/state\""));
     assert!(json.contains("\"state\":\"synchronized\""));
     assert!(json.contains("\"volume\":100"));
+    assert!(json.contains("\"static_delay_ms\":0"));
 }
 
 #[test]
-fn test_player_sync_state_error() {
+fn test_client_sync_state_error() {
     let state = ClientState {
-        player: Some(PlayerState {
-            state: PlayerSyncState::Error,
-            volume: None,
-            muted: None,
-        }),
+        state: Some(ClientSyncState::Error),
+        player: None,
     };
 
     let message = Message::ClientState(state);
     let json = serde_json::to_string(&message).unwrap();
 
     assert!(json.contains("\"state\":\"error\""));
+}
+
+#[test]
+fn test_client_sync_state_external_source() {
+    let state = ClientState {
+        state: Some(ClientSyncState::ExternalSource),
+        player: None,
+    };
+
+    let message = Message::ClientState(state);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"state\":\"external_source\""));
 }
 
 #[test]
@@ -162,7 +176,7 @@ fn test_server_state_controller_deserialization() {
         "type": "server/state",
         "payload": {
             "controller": {
-                "supported_commands": ["play", "pause", "next", "previous", "volume", "mute"],
+                "supported_commands": ["play", "next", "previous", "volume", "mute"],
                 "volume": 75,
                 "muted": false
             }
@@ -193,7 +207,7 @@ fn test_server_state_controller_deserialization() {
 fn test_client_command_serialization() {
     let command = ClientCommand {
         controller: Some(ControllerCommand {
-            command: "play".to_string(),
+            command: ControllerCommandType::Play,
             volume: None,
             mute: None,
         }),
@@ -212,7 +226,7 @@ fn test_server_command_deserialization() {
         "type": "server/command",
         "payload": {
             "player": {
-                "command": "play",
+                "command": "volume",
                 "volume": 80
             }
         }
@@ -223,9 +237,35 @@ fn test_server_command_deserialization() {
     match message {
         Message::ServerCommand(cmd) => {
             let player = cmd.player.expect("Expected player command");
-            assert_eq!(player.command, "play");
+            assert_eq!(player.command, PlayerCommandType::Volume);
             assert_eq!(player.volume, Some(80));
             assert!(player.mute.is_none());
+            assert!(player.static_delay_ms.is_none());
+        }
+        _ => panic!("Expected ServerCommand"),
+    }
+}
+
+#[test]
+fn test_server_command_set_static_delay() {
+    let json = r#"{
+        "type": "server/command",
+        "payload": {
+            "player": {
+                "command": "set_static_delay",
+                "static_delay_ms": 250
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerCommand(cmd) => {
+            let player = cmd.player.expect("Expected player command");
+            assert_eq!(player.command, PlayerCommandType::SetStaticDelay);
+            assert_eq!(player.static_delay_ms, Some(250));
+            assert!(player.volume.is_none());
         }
         _ => panic!("Expected ServerCommand"),
     }
@@ -235,7 +275,7 @@ fn test_server_command_deserialization() {
 fn test_client_command_volume() {
     let command = ClientCommand {
         controller: Some(ControllerCommand {
-            command: "volume".to_string(),
+            command: ControllerCommandType::Volume,
             volume: Some(50),
             mute: None,
         }),
@@ -344,9 +384,9 @@ fn test_group_update_deserialization() {
     }
 }
 
+// Test all playback state variants (per spec: only 'playing' and 'stopped')
 #[test]
 fn test_playback_state_variants() {
-    // Test all playback state variants (per spec: only 'playing' and 'stopped')
     let states = [
         (r#""playing""#, PlaybackState::Playing),
         (r#""stopped""#, PlaybackState::Stopped),
@@ -561,6 +601,92 @@ fn test_server_time_fields_feed_clock_sync() {
 }
 
 // =============================================================================
+// Stream Artwork Config Tests
+// =============================================================================
+
+#[test]
+fn test_stream_start_artwork_deserialization() {
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "artwork": {
+                "channels": [
+                    {
+                        "source": "album",
+                        "format": "jpeg",
+                        "width": 800,
+                        "height": 800
+                    }
+                ]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::StreamStart(start) => {
+            assert!(start.player.is_none());
+            let artwork = start.artwork.expect("Expected artwork config");
+            assert_eq!(artwork.channels.len(), 1);
+            let ch = &artwork.channels[0];
+            assert_eq!(ch.source, ArtworkSource::Album);
+            assert_eq!(ch.format, ImageFormat::Jpeg);
+            assert_eq!(ch.width, 800);
+            assert_eq!(ch.height, 800);
+        }
+        _ => panic!("Expected StreamStart"),
+    }
+}
+
+#[test]
+fn test_stream_start_artwork_multi_channel() {
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "artwork": {
+                "channels": [
+                    { "source": "album", "format": "jpeg", "width": 800, "height": 800 },
+                    { "source": "artist", "format": "png", "width": 400, "height": 400 }
+                ]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::StreamStart(start) => {
+            let artwork = start.artwork.expect("Expected artwork config");
+            assert_eq!(artwork.channels.len(), 2);
+            assert_eq!(artwork.channels[0].source, ArtworkSource::Album);
+            assert_eq!(artwork.channels[1].source, ArtworkSource::Artist);
+            assert_eq!(artwork.channels[1].format, ImageFormat::Png);
+        }
+        _ => panic!("Expected StreamStart"),
+    }
+}
+
+#[test]
+fn test_stream_artwork_channel_config_roundtrip() {
+    let config = StreamArtworkChannelConfig {
+        source: ArtworkSource::Album,
+        format: ImageFormat::Jpeg,
+        width: 256,
+        height: 256,
+    };
+
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(json.contains("\"source\":\"album\""));
+    assert!(json.contains("\"format\":\"jpeg\""));
+    assert!(json.contains("\"width\":256"));
+
+    let parsed: StreamArtworkChannelConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.source, ArtworkSource::Album);
+    assert_eq!(parsed.width, 256);
+}
+
+// =============================================================================
 // Deserialization Error Path Tests
 // =============================================================================
 
@@ -701,4 +827,125 @@ fn test_stream_end_empty_roles_accepted() {
         Message::StreamEnd(end) => assert!(end.roles.is_none()),
         _ => panic!("Expected StreamEnd"),
     }
+}
+
+// =============================================================================
+// Deprecation & Wire Format Tests
+// =============================================================================
+
+/// Old JSON that includes `state` inside the player object (from pre-0.2.0
+/// clients/servers) should still deserialize without error. The unknown field
+/// is ignored since PlayerState no longer has a `state` field.
+#[test]
+fn test_player_state_ignores_legacy_state_field() {
+    let json = r#"{
+        "type": "client/state",
+        "payload": {
+            "player": {
+                "state": "error",
+                "volume": 50,
+                "muted": true
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ClientState(cs) => {
+            assert!(cs.state.is_none());
+
+            let player = cs.player.expect("Expected player");
+            assert_eq!(player.volume, Some(50));
+            assert_eq!(player.muted, Some(true));
+            assert!(player.static_delay_ms.is_none());
+            assert!(player.supported_commands.is_none());
+        }
+        _ => panic!("Expected ClientState"),
+    }
+}
+
+/// supported_commands roundtrip: serialize with commands, deserialize, verify.
+#[test]
+fn test_player_state_supported_commands_roundtrip() {
+    let state = ClientState {
+        state: Some(ClientSyncState::Synchronized),
+        player: Some(PlayerState {
+            volume: Some(100),
+            muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
+        }),
+    };
+
+    let message = Message::ClientState(state);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"supported_commands\":[\"set_static_delay\"]"));
+
+    // Roundtrip
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    match parsed {
+        Message::ClientState(cs) => {
+            let player = cs.player.expect("Expected player");
+            let cmds = player
+                .supported_commands
+                .expect("Expected supported_commands");
+            assert_eq!(cmds, vec![PlayerStateCommand::SetStaticDelay]);
+        }
+        _ => panic!("Expected ClientState"),
+    }
+}
+
+/// ArtworkFormatRequest uses typed enums for source and format,
+/// verify they serialize to the correct wire strings.
+#[test]
+fn test_artwork_format_request_typed_enums() {
+    let request = ArtworkFormatRequest {
+        channel: 0,
+        source: Some(ArtworkSource::Album),
+        format: Some(ImageFormat::Jpeg),
+        media_width: Some(800),
+        media_height: Some(800),
+    };
+
+    let json = serde_json::to_string(&request).unwrap();
+
+    // Enums should serialize as lowercase strings, not struct representations
+    assert!(
+        json.contains("\"source\":\"album\""),
+        "source not serialized as string: {}",
+        json
+    );
+    assert!(
+        json.contains("\"format\":\"jpeg\""),
+        "format not serialized as string: {}",
+        json
+    );
+
+    // Roundtrip
+    let parsed: ArtworkFormatRequest = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.source, Some(ArtworkSource::Album));
+    assert_eq!(parsed.format, Some(ImageFormat::Jpeg));
+    assert_eq!(parsed.channel, 0);
+}
+
+/// ArtworkFormatRequest should deserialize from wire JSON with string values
+/// (this is what a real server would send).
+#[test]
+fn test_artwork_format_request_from_wire_json() {
+    let json = r#"{
+        "channel": 1,
+        "source": "artist",
+        "format": "png",
+        "media_width": 400,
+        "media_height": 400
+    }"#;
+
+    let parsed: ArtworkFormatRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.channel, 1);
+    assert_eq!(parsed.source, Some(ArtworkSource::Artist));
+    assert_eq!(parsed.format, Some(ImageFormat::Png));
+    assert_eq!(parsed.media_width, Some(400));
+    assert_eq!(parsed.media_height, Some(400));
 }
