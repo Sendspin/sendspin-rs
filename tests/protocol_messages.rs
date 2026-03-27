@@ -1,9 +1,9 @@
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
-    ConnectionReason, ControllerCommand, DeviceInfo, GoodbyeReason, ImageFormat, Message,
-    PlaybackState, PlayerState, PlayerV1Support, RepeatMode, ServerTime,
-    StreamArtworkChannelConfig,
+    ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
+    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerState, PlayerStateCommand,
+    PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
 };
 
 // =============================================================================
@@ -207,7 +207,7 @@ fn test_server_state_controller_deserialization() {
 fn test_client_command_serialization() {
     let command = ClientCommand {
         controller: Some(ControllerCommand {
-            command: "play".to_string(),
+            command: ControllerCommandType::Play,
             volume: None,
             mute: None,
         }),
@@ -226,7 +226,7 @@ fn test_server_command_deserialization() {
         "type": "server/command",
         "payload": {
             "player": {
-                "command": "play",
+                "command": "volume",
                 "volume": 80
             }
         }
@@ -237,7 +237,7 @@ fn test_server_command_deserialization() {
     match message {
         Message::ServerCommand(cmd) => {
             let player = cmd.player.expect("Expected player command");
-            assert_eq!(player.command, "play");
+            assert_eq!(player.command, PlayerCommandType::Volume);
             assert_eq!(player.volume, Some(80));
             assert!(player.mute.is_none());
             assert!(player.static_delay_ms.is_none());
@@ -263,7 +263,7 @@ fn test_server_command_set_static_delay() {
     match message {
         Message::ServerCommand(cmd) => {
             let player = cmd.player.expect("Expected player command");
-            assert_eq!(player.command, "set_static_delay");
+            assert_eq!(player.command, PlayerCommandType::SetStaticDelay);
             assert_eq!(player.static_delay_ms, Some(250));
             assert!(player.volume.is_none());
         }
@@ -275,7 +275,7 @@ fn test_server_command_set_static_delay() {
 fn test_client_command_volume() {
     let command = ClientCommand {
         controller: Some(ControllerCommand {
-            command: "volume".to_string(),
+            command: ControllerCommandType::Volume,
             volume: Some(50),
             mute: None,
         }),
@@ -874,14 +874,14 @@ fn test_player_state_supported_commands_roundtrip() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
-            supported_commands: Some(vec!["set_static_delay".to_string(), "volume".to_string()]),
+            supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         }),
     };
 
     let message = Message::ClientState(state);
     let json = serde_json::to_string(&message).unwrap();
 
-    assert!(json.contains("\"supported_commands\":[\"set_static_delay\",\"volume\"]"));
+    assert!(json.contains("\"supported_commands\":[\"set_static_delay\"]"));
 
     // Roundtrip
     let parsed: Message = serde_json::from_str(&json).unwrap();
@@ -891,7 +891,7 @@ fn test_player_state_supported_commands_roundtrip() {
             let cmds = player
                 .supported_commands
                 .expect("Expected supported_commands");
-            assert_eq!(cmds, vec!["set_static_delay", "volume"]);
+            assert_eq!(cmds, vec![PlayerStateCommand::SetStaticDelay]);
         }
         _ => panic!("Expected ClientState"),
     }

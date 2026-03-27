@@ -266,9 +266,17 @@ pub struct PlayerState {
     /// Static delay in milliseconds (0-5000) to compensate for external speaker/amplifier latency
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub static_delay_ms: Option<u16>,
-    /// Supported player state commands (e.g., "set_static_delay")
+    /// Supported player state commands
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub supported_commands: Option<Vec<String>>,
+    pub supported_commands: Option<Vec<PlayerStateCommand>>,
+}
+
+/// Commands that can appear in PlayerState.supported_commands
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerStateCommand {
+    /// Client supports set_static_delay command
+    SetStaticDelay,
 }
 
 /// Client synchronization state (top-level in client/state)
@@ -380,8 +388,8 @@ pub struct ServerCommand {
 /// Player-specific command from server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerCommand {
-    /// Command name: "volume", "mute", or "set_static_delay"
-    pub command: String,
+    /// Command to execute
+    pub command: PlayerCommandType,
     /// Optional volume level (0-100)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
@@ -391,6 +399,21 @@ pub struct PlayerCommand {
     /// Optional static delay in milliseconds (0-5000)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub static_delay_ms: Option<u16>,
+}
+
+/// Player command type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlayerCommandType {
+    /// Set volume level
+    Volume,
+    /// Set mute state
+    Mute,
+    /// Set static delay
+    SetStaticDelay,
+    /// Unknown command (forward compatibility)
+    #[serde(other)]
+    Unknown,
 }
 
 /// Client command message (controller commands to server)
@@ -404,14 +427,46 @@ pub struct ClientCommand {
 /// Controller command from client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControllerCommand {
-    /// Command name (play, stop, next, previous, volume, mute, etc.)
-    pub command: String,
+    /// Command to execute
+    pub command: ControllerCommandType,
     /// Optional volume level (0-100) for volume command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
     /// Optional mute state for mute command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
+}
+
+/// Controller command type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerCommandType {
+    /// Resume playback
+    Play,
+    /// Pause playback
+    Pause,
+    /// Stop playback and reset position
+    Stop,
+    /// Skip to next track
+    Next,
+    /// Skip to previous track
+    Previous,
+    /// Set group volume
+    Volume,
+    /// Set group mute state
+    Mute,
+    /// Disable repeat
+    RepeatOff,
+    /// Repeat current track
+    RepeatOne,
+    /// Repeat all tracks
+    RepeatAll,
+    /// Randomize playback order
+    Shuffle,
+    /// Restore original playback order
+    Unshuffle,
+    /// Switch to next group
+    Switch,
 }
 
 // =============================================================================
