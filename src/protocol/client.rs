@@ -2,7 +2,9 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
-use crate::protocol::messages::{ClientHello, ClientTime, Message};
+use crate::protocol::messages::{
+    ClientGoodbye, ClientHello, ClientState, ClientTime, GoodbyeReason, Message,
+};
 use crate::sync::ClockSync;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -43,6 +45,12 @@ impl WsSender {
         tx.send(WsMessage::Text(json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))
+    }
+
+    /// Gracefully disconnect by sending `client/goodbye` with the given reason
+    pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
+        let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
+        self.send_message(goodbye).await
     }
 }
 
@@ -271,7 +279,11 @@ impl Drop for ConnectionGuard {
 
 impl ProtocolClient {
     /// Connect to Sendspin server
-    pub async fn connect<R>(request: R, hello: ClientHello) -> Result<Self, Error>
+    pub async fn connect<R>(
+        request: R,
+        hello: ClientHello,
+        initial_state: Option<ClientState>,
+    ) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
     {
@@ -348,6 +360,18 @@ impl ProtocolClient {
                 log::error!("Connection closed before receiving server/hello");
                 return Err(Error::Connection("No server hello received".to_string()));
             }
+        }
+
+        // Send initial client/state if provided
+        if let Some(state) = initial_state {
+            let state_msg = Message::ClientState(state);
+            let state_json =
+                serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
+            log::debug!("Sending initial client/state: {}", state_json);
+            write
+                .send(WsMessage::Text(state_json))
+                .await
+                .map_err(|e| Error::WebSocket(e.to_string()))?;
         }
 
         // Create channels for message routing
@@ -569,6 +593,12 @@ impl ProtocolClient {
         tx.send(WsMessage::Text(json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))
+    }
+
+    /// Gracefully disconnect by sending `client/goodbye` with the given reason
+    pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
+        let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
+        self.send_message(&goodbye).await
     }
 
     /// Get reference to clock sync

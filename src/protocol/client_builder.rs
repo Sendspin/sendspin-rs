@@ -2,8 +2,8 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientHello, DeviceInfo, PlayerV1Support,
-    VisualizerV1Support,
+    ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
+    PlayerState, PlayerV1Support, VisualizerV1Support,
 };
 use crate::ProtocolClient;
 use typed_builder::TypedBuilder;
@@ -19,6 +19,7 @@ pub struct ProtocolClientBuilderRaw {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_player_state: Option<PlayerState>,
 }
 
 impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
@@ -68,6 +69,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             player_v1_support,
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
+            initial_player_state: raw.initial_player_state,
         }
     }
 }
@@ -90,6 +92,8 @@ pub struct ProtocolClientBuilderFields {
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
+    #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
+    initial_player_state: Option<PlayerState>,
 }
 
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
@@ -103,6 +107,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
+            initial_player_state: fields.initial_player_state,
         };
         raw.into()
     }
@@ -120,6 +125,7 @@ pub struct ProtocolClientBuilder {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_player_state: Option<PlayerState>,
 }
 
 impl ProtocolClientBuilder {
@@ -154,6 +160,12 @@ impl ProtocolClientBuilder {
             artwork_v1_support: self.artwork_v1_support.clone(),
             visualizer_v1_support: self.visualizer_v1_support.clone(),
         };
-        ProtocolClient::connect(url, hello).await
+
+        let initial_state = ClientState {
+            state: Some(ClientSyncState::Synchronized),
+            player: self.initial_player_state,
+        };
+
+        ProtocolClient::connect(url, hello, Some(initial_state)).await
     }
 }

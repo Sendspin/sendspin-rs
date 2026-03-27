@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .headers_mut()
         .insert("cookie", "ingress_session=<session_token>".parse().unwrap());
 
-    let _client = ProtocolClient::connect(request, hello).await?;
+    let _client = ProtocolClient::connect(request, hello, None).await?;
 
     println!("Connected! Waiting for server hello...");
 

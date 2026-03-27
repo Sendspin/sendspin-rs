@@ -4,9 +4,7 @@
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
-use sendspin::protocol::messages::{
-    ClientState, ClientSyncState, ClientTime, Message, PlayerState,
-};
+use sendspin::protocol::messages::{ClientTime, Message, PlayerState};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -168,6 +166,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test = ProtocolClientBuilder::builder()
         .client_id(client_id)
         .name(args.name.clone())
+        .initial_player_state(PlayerState {
+            volume: Some(100),
+            muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: None,
+        })
         .build();
 
     let client = test.connect(&args.server).await?;
@@ -175,28 +179,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Split client into separate receivers for concurrent processing
     let (mut message_rx, mut audio_rx, clock_sync, ws_tx, _guard) = client.split();
-
-    // Send initial client/state message (handshake step 3)
-    let client_state = Message::ClientState(ClientState {
-        state: Some(ClientSyncState::Synchronized),
-        player: Some(PlayerState {
-            volume: Some(100),
-            muted: Some(false),
-            static_delay_ms: Some(0),
-            supported_commands: None,
-        }),
-    });
-    ws_tx.send_message(client_state).await?;
-    println!("Sent initial client/state");
-
-    // Send immediate initial clock sync
-    let client_transmitted = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
-    let time_msg = Message::ClientTime(ClientTime { client_transmitted });
-    ws_tx.send_message(time_msg).await?;
-    println!("Sent initial client/time for clock sync");
 
     println!("Waiting for stream to start...");
 
