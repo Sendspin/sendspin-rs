@@ -167,12 +167,10 @@ async fn test_disconnect_sends_goodbye() {
     while let Ok(Some(msg_text)) =
         tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
     {
-        if let Ok(parsed) = serde_json::from_str::<Message>(&msg_text) {
-            if let Message::ClientGoodbye(goodbye) = parsed {
-                assert_eq!(goodbye.reason, GoodbyeReason::Shutdown);
-                found_goodbye = true;
-                break;
-            }
+        if let Ok(Message::ClientGoodbye(goodbye)) = serde_json::from_str::<Message>(&msg_text) {
+            assert_eq!(goodbye.reason, GoodbyeReason::Shutdown);
+            found_goodbye = true;
+            break;
         }
     }
     assert!(found_goodbye, "never received client/goodbye");
