@@ -593,8 +593,11 @@ impl ProtocolClient {
     /// and aborts background tasks.
     pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
         let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
-        self.send_message(&goodbye).await?;
+        let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
         let mut tx = self.ws_tx.lock().await;
+        tx.send(WsMessage::Text(json))
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))?;
         tx.close()
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))

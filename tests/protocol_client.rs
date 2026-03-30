@@ -214,11 +214,9 @@ async fn test_disconnect_closes_socket_and_stops_background_tasks() {
 
     assert!(found_goodbye, "never received client/goodbye");
 
-    // At most one straggler message due to lock contention window
-    assert!(
-        messages_after_goodbye <= 1,
-        "expected at most 1 message after goodbye, got {}",
-        messages_after_goodbye
+    assert_eq!(
+        messages_after_goodbye, 0,
+        "no messages should arrive after goodbye"
     );
 
     // Server task should have exited (socket closed)
