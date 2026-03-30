@@ -39,8 +39,7 @@ fn test_supported_roles_with_artwork_v1_support() {
         })
         .build();
 
-    // Default player@v1 is always present, plus the artwork@v1 we added
-    assert_eq!(builder.supported_roles(), &["player@v1", "artwork@v1"]);
+    assert_eq!(builder.supported_roles(), &["artwork@v1"]);
 }
 
 #[test]
@@ -53,8 +52,7 @@ fn test_supported_roles_with_visualizer_v1_support() {
         })
         .build();
 
-    // Default player@v1 is always present, plus the visualizer@v1 we added
-    assert_eq!(builder.supported_roles(), &["player@v1", "visualizer@v1"]);
+    assert_eq!(builder.supported_roles(), &["visualizer@v1"]);
 }
 
 #[test]
@@ -83,11 +81,12 @@ fn test_supported_roles_with_multiple_supports() {
         .visualizer_v1_support(VisualizerV1Support {
             buffer_capacity: 1024,
         })
+        .controller()
         .build();
 
     assert_eq!(
         builder.supported_roles(),
-        &["player@v1", "artwork@v1", "visualizer@v1"]
+        &["player@v1", "artwork@v1", "visualizer@v1", "controller@v1"]
     );
 }
 
@@ -146,4 +145,27 @@ fn test_explicit_player_support_is_preserved() {
         .expect("should have player support");
     assert_eq!(support.supported_formats[0].codec, "opus");
     assert_eq!(support.buffer_capacity, 1024);
+}
+
+#[test]
+fn test_controller_role_added_to_supported_roles() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .controller()
+        .build();
+
+    assert_eq!(builder.supported_roles(), &["controller@v1"]);
+}
+
+#[test]
+fn test_controller_role_not_present_by_default() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .build();
+
+    assert!(!builder
+        .supported_roles()
+        .contains(&"controller@v1".to_string()));
 }
