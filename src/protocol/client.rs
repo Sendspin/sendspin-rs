@@ -46,12 +46,6 @@ impl WsSender {
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))
     }
-
-    /// Gracefully disconnect by sending `client/goodbye` with the given reason
-    pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
-        let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
-        self.send_message(goodbye).await
-    }
 }
 
 /// Binary message type IDs per Sendspin spec
@@ -595,10 +589,16 @@ impl ProtocolClient {
             .map_err(|e| Error::WebSocket(e.to_string()))
     }
 
-    /// Gracefully disconnect by sending `client/goodbye` with the given reason
+    /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
+    /// and aborts background tasks.
     pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
         let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
-        self.send_message(&goodbye).await
+        self.send_message(&goodbye).await?;
+        let mut tx = self.ws_tx.lock().await;
+        tx.close()
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))
+        // dropping self aborts background tasks via ConnectionGuard
     }
 
     /// Get reference to clock sync
