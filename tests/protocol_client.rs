@@ -176,6 +176,61 @@ async fn test_disconnect_sends_goodbye() {
     assert!(found_goodbye, "never received client/goodbye");
 }
 
+#[tokio::test]
+async fn test_disconnect_closes_socket_and_stops_background_tasks() {
+    let (url, mut rx, handle) = start_test_server().await;
+
+    let hello = ClientHello {
+        client_id: "test-client".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+
+    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+
+    // Let clock sync send at least one client/time
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    client.disconnect(GoodbyeReason::Shutdown).await.unwrap();
+
+    // Drain remaining messages — should find goodbye then channel closes
+    let mut found_goodbye = false;
+    let mut messages_after_goodbye = 0;
+    while let Ok(Some(msg_text)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+    {
+        if found_goodbye {
+            messages_after_goodbye += 1;
+        }
+        if let Ok(Message::ClientGoodbye(_)) = serde_json::from_str::<Message>(&msg_text) {
+            found_goodbye = true;
+        }
+    }
+
+    assert!(found_goodbye, "never received client/goodbye");
+
+    // At most one straggler message due to lock contention window
+    assert!(
+        messages_after_goodbye <= 1,
+        "expected at most 1 message after goodbye, got {}",
+        messages_after_goodbye
+    );
+
+    // Server task should have exited (socket closed)
+    let server_exited = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .is_ok();
+    assert!(
+        server_exited,
+        "server task did not exit — socket not closed"
+    );
+}
+
 #[test]
 #[ignore] // Requires running server
 fn test_client_receives_stream_start() {
