@@ -2,7 +2,7 @@
 // ABOUTME: Just connects and prints everything the server sends
 
 use clap::Parser;
-use sendspin::protocol::messages::{ClientState, ClientSyncState, Message, PlayerState};
+use sendspin::protocol::messages::PlayerState;
 use sendspin::ProtocolClientBuilder;
 
 /// Minimal Sendspin test client
@@ -24,26 +24,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test = ProtocolClientBuilder::builder()
         .client_id(uuid::Uuid::new_v4().to_string())
         .name("Minimal Test Client".to_string())
+        .initial_player_state(PlayerState {
+            volume: Some(100),
+            muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: None,
+        })
         .build();
 
     let client = test.connect(&args.server).await?;
     println!("Connected! Server said hello.");
 
     // Split client
-    let (mut message_rx, mut audio_rx, _clock_sync, ws_tx, _guard) = client.split();
-
-    // Send client/state (handshake step 3)
-    let client_state = Message::ClientState(ClientState {
-        state: Some(ClientSyncState::Synchronized),
-        player: Some(PlayerState {
-            volume: Some(100),
-            muted: Some(false),
-            static_delay_ms: Some(0),
-            supported_commands: None,
-        }),
-    });
-    ws_tx.send_message(client_state).await?;
-    println!("Sent client/state");
+    let (mut message_rx, mut audio_rx, _clock_sync, _ws_tx, _guard) = client.split();
 
     println!("\nListening for ALL messages from server...\n");
 
