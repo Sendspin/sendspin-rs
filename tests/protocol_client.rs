@@ -1,9 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
-use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{
-    ClientCommand, ClientHello, ClientState, ClientSyncState, ControllerCommandType, GoodbyeReason,
-    Message, PlayerState, RepeatMode,
+    AudioFormatSpec, ClientCommand, ClientSyncState, ControllerCommandType, GoodbyeReason, Message,
+    PlayerState, PlayerV1Support, RepeatMode,
 };
+use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -70,30 +70,28 @@ async fn start_test_server() -> (
 async fn test_connect_sends_initial_state() {
     let (url, mut rx, _handle) = start_test_server().await;
 
-    let initial_state = ClientState {
-        state: Some(ClientSyncState::Synchronized),
-        player: Some(PlayerState {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 1024,
+            supported_commands: vec![],
+        })
+        .initial_player_state(PlayerState {
             volume: Some(75),
             muted: Some(false),
             static_delay_ms: Some(100),
             supported_commands: None,
-        }),
-    };
+        })
+        .build();
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
-
-    let _client = ProtocolClient::connect(&url, hello, Some(initial_state))
-        .await
-        .unwrap();
+    let _client = builder.connect(&url).await.unwrap();
 
     // First message after handshake should be client/state
     let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -115,52 +113,43 @@ async fn test_connect_sends_initial_state() {
 }
 
 #[tokio::test]
-async fn test_connect_without_initial_state_sends_nothing() {
+async fn test_connect_without_player_state_sends_state_without_player() {
     let (url, mut rx, _handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build();
 
-    let _client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let _client = builder.connect(&url).await.unwrap();
 
-    // First message should be client/time (from the clock sync task), not client/state
+    // Builder always sends client/state (with state=Synchronized), even without player state
     let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
         .expect("timed out waiting for message")
         .expect("channel closed");
 
     let parsed: Message = serde_json::from_str(&first_msg).unwrap();
-    assert!(
-        matches!(parsed, Message::ClientTime(_)),
-        "expected ClientTime, got {:?}",
-        parsed
-    );
+    match parsed {
+        Message::ClientState(cs) => {
+            assert_eq!(cs.state, Some(ClientSyncState::Synchronized));
+            assert!(cs.player.is_none(), "expected no player state");
+        }
+        other => panic!("expected ClientState, got {:?}", other),
+    }
 }
 
 #[tokio::test]
 async fn test_disconnect_sends_goodbye() {
     let (url, mut rx, _handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
-
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
 
     client.disconnect(GoodbyeReason::Shutdown).await.unwrap();
 
@@ -182,18 +171,13 @@ async fn test_disconnect_sends_goodbye() {
 async fn test_disconnect_closes_socket_and_stops_background_tasks() {
     let (url, mut rx, handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
-
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
 
     // Let clock sync send at least one client/time
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -235,18 +219,13 @@ async fn test_disconnect_closes_socket_and_stops_background_tasks() {
 async fn test_connection_disconnect_sends_goodbye_and_closes() {
     let (url, mut rx, handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
-
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
     let conn = client.split();
     let sender = conn.sender;
     let guard = conn.guard;
@@ -299,18 +278,24 @@ async fn connect_with_controller() -> (
 ) {
     let (url, rx, handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string(), "controller@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
-
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 1024,
+            supported_commands: vec![],
+        })
+        .controller()
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
     let mut conn = client.split();
     let controller = conn
         .controller
@@ -484,18 +469,25 @@ async fn start_test_server_with_roles(
 async fn test_no_controller_when_server_denies_role() {
     let (url, _rx, _handle) = start_test_server_with_roles(vec!["player@v1".to_string()]).await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string(), "controller@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 1024,
+            supported_commands: vec![],
+        })
+        .controller()
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
 
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
     let conn = client.split();
     assert!(
         conn.controller.is_none(),
@@ -507,18 +499,14 @@ async fn test_no_controller_when_server_denies_role() {
 async fn test_no_controller_when_role_not_declared() {
     let (url, _rx, _handle) = start_test_server().await;
 
-    let hello = ClientHello {
-        client_id: "test-client".to_string(),
-        name: "Test".to_string(),
-        version: 1,
-        supported_roles: vec!["player@v1".to_string()],
-        device_info: None,
-        player_v1_support: None,
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
-    };
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
 
-    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
     let conn = client.split();
     assert!(
         conn.controller.is_none(),
