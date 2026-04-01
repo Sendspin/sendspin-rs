@@ -36,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected! Server said hello.");
 
     // Split client
-    let (mut message_rx, mut audio_rx, _clock_sync, _ws_tx, _guard) = client.split();
+    let conn = client.split();
+    let mut message_rx = conn.messages;
+    let mut audio_rx = conn.audio;
+    let _guard = conn.guard;
 
     println!("\nListening for ALL messages from server...\n");
 

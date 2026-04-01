@@ -8,5 +8,7 @@ pub mod client_builder;
 /// Protocol message type definitions and serialization
 pub mod messages;
 
+pub use client::Connection;
+pub use client::Controller;
 pub use client::WsSender;
 pub use messages::Message;

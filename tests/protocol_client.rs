@@ -1,7 +1,8 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::client::ProtocolClient;
 use sendspin::protocol::messages::{
-    ClientHello, ClientState, ClientSyncState, GoodbyeReason, Message, PlayerState,
+    ClientCommand, ClientHello, ClientState, ClientSyncState, ControllerCommandType, GoodbyeReason,
+    Message, PlayerState, RepeatMode,
 };
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
@@ -24,23 +25,24 @@ async fn start_test_server() -> (
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = accept_async(stream).await.unwrap();
 
-        // Receive client/hello
+        // Receive client/hello and echo back its roles
         let msg = ws.next().await.unwrap().unwrap();
-        if let WsMessage::Text(text) = msg {
-            let parsed: Message = serde_json::from_str(&text).unwrap();
-            assert!(
-                matches!(parsed, Message::ClientHello(_)),
-                "First message should be client/hello"
-            );
-        }
+        let active_roles = if let WsMessage::Text(ref text) = msg {
+            match serde_json::from_str::<Message>(text).unwrap() {
+                Message::ClientHello(hello) => hello.supported_roles,
+                other => panic!("First message should be client/hello, got {:?}", other),
+            }
+        } else {
+            panic!("Expected text message for client/hello");
+        };
 
-        // Send server/hello
+        // Send server/hello with the roles the client requested
         let server_hello = serde_json::to_string(&Message::ServerHello(
             sendspin::protocol::messages::ServerHello {
                 server_id: "test-server".to_string(),
                 name: "Test Server".to_string(),
                 version: 1,
-                active_roles: vec!["player@v1".to_string()],
+                active_roles,
                 connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
             },
         ))
@@ -226,6 +228,301 @@ async fn test_disconnect_closes_socket_and_stops_background_tasks() {
     assert!(
         server_exited,
         "server task did not exit — socket not closed"
+    );
+}
+
+#[tokio::test]
+async fn test_connection_disconnect_sends_goodbye_and_closes() {
+    let (url, mut rx, handle) = start_test_server().await;
+
+    let hello = ClientHello {
+        client_id: "test-client".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+
+    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let conn = client.split();
+    let sender = conn.sender;
+    let guard = conn.guard;
+
+    // Let clock sync send at least one client/time
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    guard
+        .disconnect(&sender, GoodbyeReason::Shutdown)
+        .await
+        .unwrap();
+
+    // Drain remaining messages — should find goodbye then channel closes
+    let mut found_goodbye = false;
+    let mut messages_after_goodbye = 0;
+    while let Ok(Some(msg_text)) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+    {
+        if found_goodbye {
+            messages_after_goodbye += 1;
+        }
+        if let Ok(Message::ClientGoodbye(_)) = serde_json::from_str::<Message>(&msg_text) {
+            found_goodbye = true;
+        }
+    }
+
+    assert!(found_goodbye, "never received client/goodbye");
+
+    assert_eq!(
+        messages_after_goodbye, 0,
+        "no messages should arrive after goodbye"
+    );
+
+    // Server task should have exited (socket closed)
+    let server_exited = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+        .await
+        .is_ok();
+    assert!(
+        server_exited,
+        "server task did not exit — socket not closed"
+    );
+}
+
+/// Helper: connect with controller role, return the rx channel and a Controller handle
+async fn connect_with_controller() -> (
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    sendspin::protocol::client::Controller,
+    sendspin::protocol::client::Connection,
+    tokio::task::JoinHandle<()>,
+) {
+    let (url, rx, handle) = start_test_server().await;
+
+    let hello = ClientHello {
+        client_id: "test-client".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string(), "controller@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+
+    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let mut conn = client.split();
+    let controller = conn
+        .controller
+        .take()
+        .expect("should have controller when role declared");
+
+    (rx, controller, conn, handle)
+}
+
+/// Helper: drain client/time messages and return the next client/command
+async fn next_client_command(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> ClientCommand {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+
+        let parsed: Message = serde_json::from_str(&msg_text).unwrap();
+        if let Message::ClientCommand(cmd) = parsed {
+            return cmd;
+        }
+    }
+}
+
+// Macro to generate tests for simple controller commands (no parameters).
+// Defined once to prevent copy-paste typo errors across the six methods.
+macro_rules! test_simple_controller_command {
+    ($name:ident, $method:ident, $expected:expr) => {
+        #[tokio::test]
+        async fn $name() {
+            let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+            controller.$method().await.unwrap();
+
+            let cmd = next_client_command(&mut rx).await;
+            let ctrl = cmd.controller.expect("expected controller command");
+            assert_eq!(ctrl.command, $expected);
+        }
+    };
+}
+
+test_simple_controller_command!(test_controller_play, play, ControllerCommandType::Play);
+test_simple_controller_command!(test_controller_pause, pause, ControllerCommandType::Pause);
+test_simple_controller_command!(test_controller_stop, stop, ControllerCommandType::Stop);
+test_simple_controller_command!(test_controller_next, next, ControllerCommandType::Next);
+test_simple_controller_command!(
+    test_controller_previous,
+    previous,
+    ControllerCommandType::Previous
+);
+test_simple_controller_command!(
+    test_controller_switch,
+    switch,
+    ControllerCommandType::Switch
+);
+
+#[tokio::test]
+async fn test_controller_set_volume_sends_value() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.set_volume(25).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::Volume);
+    assert_eq!(ctrl.volume, Some(25));
+}
+
+#[tokio::test]
+async fn test_controller_set_volume_clamps_above_100() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.set_volume(200).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.volume, Some(100));
+}
+
+#[tokio::test]
+async fn test_controller_set_mute_sends_value() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.set_mute(true).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::Mute);
+    assert_eq!(ctrl.mute, Some(true));
+}
+
+#[tokio::test]
+async fn test_controller_repeat_sends_mode() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.repeat(RepeatMode::All).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::RepeatAll);
+}
+
+#[tokio::test]
+async fn test_controller_shuffle_sends_correct_command() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.shuffle(true).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::Shuffle);
+}
+
+#[tokio::test]
+async fn test_controller_unshuffle_sends_correct_command() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.shuffle(false).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::Unshuffle);
+}
+
+/// Start a test server that only grants specific roles, ignoring what the client requests.
+async fn start_test_server_with_roles(
+    granted_roles: Vec<String>,
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+
+        // Receive and discard client/hello
+        let _ = ws.next().await.unwrap().unwrap();
+
+        // Send server/hello with only the granted roles
+        let server_hello = serde_json::to_string(&Message::ServerHello(
+            sendspin::protocol::messages::ServerHello {
+                server_id: "test-server".to_string(),
+                name: "Test Server".to_string(),
+                version: 1,
+                active_roles: granted_roles,
+                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+            },
+        ))
+        .unwrap();
+        ws.send(WsMessage::Text(server_hello)).await.unwrap();
+
+        while let Some(Ok(msg)) = ws.next().await {
+            match msg {
+                WsMessage::Text(text) => {
+                    if tx.send(text).is_err() {
+                        break;
+                    }
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    (url, rx, handle)
+}
+
+#[tokio::test]
+async fn test_no_controller_when_server_denies_role() {
+    let (url, _rx, _handle) = start_test_server_with_roles(vec!["player@v1".to_string()]).await;
+
+    let hello = ClientHello {
+        client_id: "test-client".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string(), "controller@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+
+    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let conn = client.split();
+    assert!(
+        conn.controller.is_none(),
+        "should not have controller when server denies the role"
+    );
+}
+
+#[tokio::test]
+async fn test_no_controller_when_role_not_declared() {
+    let (url, _rx, _handle) = start_test_server().await;
+
+    let hello = ClientHello {
+        client_id: "test-client".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+
+    let client = ProtocolClient::connect(&url, hello, None).await.unwrap();
+    let conn = client.split();
+    assert!(
+        conn.controller.is_none(),
+        "should not have controller without role"
     );
 }
 

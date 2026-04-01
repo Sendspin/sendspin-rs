@@ -3,7 +3,8 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ClientGoodbye, ClientHello, ClientState, ClientTime, GoodbyeReason, Message,
+    ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime, ControllerCommand,
+    ControllerCommandType, GoodbyeReason, Message, RepeatMode,
 };
 use crate::sync::ClockSync;
 use futures_util::{
@@ -20,17 +21,47 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
-type FullSplit = (
-    UnboundedReceiver<Message>,
-    UnboundedReceiver<AudioChunk>,
-    UnboundedReceiver<ArtworkChunk>,
-    UnboundedReceiver<VisualizerChunk>,
-    Arc<Mutex<ClockSync>>,
-    WsSender,
-    ConnectionGuard,
-);
+
+/// Send a goodbye message and close the WebSocket, holding the lock
+/// across both operations to prevent other tasks from sending after goodbye.
+async fn send_goodbye_and_close(
+    tx: &tokio::sync::Mutex<WsSink>,
+    reason: GoodbyeReason,
+) -> Result<(), Error> {
+    let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
+    let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
+    let mut sink = tx.lock().await;
+    sink.send(WsMessage::Text(json))
+        .await
+        .map_err(|e| Error::WebSocket(e.to_string()))?;
+    sink.close()
+        .await
+        .map_err(|e| Error::WebSocket(e.to_string()))
+}
+
+/// Connection components returned by [`ProtocolClient::split()`].
+/// Use the fields you need; ignore the rest.
+pub struct Connection {
+    /// Protocol messages from the server
+    pub messages: UnboundedReceiver<Message>,
+    /// Audio chunks from the server
+    pub audio: UnboundedReceiver<AudioChunk>,
+    /// Artwork chunks from the server
+    pub artwork: UnboundedReceiver<ArtworkChunk>,
+    /// Visualizer chunks from the server
+    pub visualizer: UnboundedReceiver<VisualizerChunk>,
+    /// Clock synchronization state
+    pub clock_sync: Arc<Mutex<ClockSync>>,
+    /// Sender for writing messages to the server
+    pub sender: WsSender,
+    /// Controller handle, if the server granted the `controller@v1` role
+    pub controller: Option<Controller>,
+    /// Must be held alive; dropping aborts background tasks
+    pub guard: ConnectionGuard,
+}
 
 /// WebSocket sender wrapper for sending messages
+#[derive(Debug, Clone)]
 pub struct WsSender {
     tx: Arc<tokio::sync::Mutex<WsSink>>,
 }
@@ -45,6 +76,105 @@ impl WsSender {
         tx.send(WsMessage::Text(json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))
+    }
+}
+
+/// Controller handle for sending playback commands to the server.
+///
+/// Only available when the server grants the `controller@v1` role.
+/// Obtained via [`ProtocolClient::split()`].
+#[derive(Debug, Clone)]
+pub struct Controller {
+    sender: WsSender,
+}
+
+impl Controller {
+    async fn send_controller_command(&self, cmd: ControllerCommand) -> Result<(), Error> {
+        let msg = Message::ClientCommand(ClientCommand {
+            controller: Some(cmd),
+        });
+        self.sender.send_message(msg).await
+    }
+
+    async fn send_simple_command(&self, command: ControllerCommandType) -> Result<(), Error> {
+        self.send_controller_command(ControllerCommand {
+            command,
+            volume: None,
+            mute: None,
+        })
+        .await
+    }
+
+    /// Resume playback
+    pub async fn play(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Play).await
+    }
+
+    /// Pause playback
+    pub async fn pause(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Pause).await
+    }
+
+    /// Stop playback
+    pub async fn stop(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Stop).await
+    }
+
+    /// Skip to next track
+    pub async fn next(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Next).await
+    }
+
+    /// Skip to previous track
+    pub async fn previous(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Previous)
+            .await
+    }
+
+    /// Set group volume (0-100). Values above 100 are clamped.
+    pub async fn set_volume(&self, volume: u8) -> Result<(), Error> {
+        self.send_controller_command(ControllerCommand {
+            command: ControllerCommandType::Volume,
+            volume: Some(volume.clamp(0, 100)),
+            mute: None,
+        })
+        .await
+    }
+
+    /// Set group mute state
+    pub async fn set_mute(&self, muted: bool) -> Result<(), Error> {
+        self.send_controller_command(ControllerCommand {
+            command: ControllerCommandType::Mute,
+            volume: None,
+            mute: Some(muted),
+        })
+        .await
+    }
+
+    /// Set repeat mode
+    pub async fn repeat(&self, mode: RepeatMode) -> Result<(), Error> {
+        let command = match mode {
+            RepeatMode::Off => ControllerCommandType::RepeatOff,
+            RepeatMode::One => ControllerCommandType::RepeatOne,
+            RepeatMode::All => ControllerCommandType::RepeatAll,
+        };
+        self.send_simple_command(command).await
+    }
+
+    /// Enable or disable shuffle
+    pub async fn shuffle(&self, enabled: bool) -> Result<(), Error> {
+        let command = if enabled {
+            ControllerCommandType::Shuffle
+        } else {
+            ControllerCommandType::Unshuffle
+        };
+        self.send_simple_command(command).await
+    }
+
+    /// Switch to next group
+    pub async fn switch(&self) -> Result<(), Error> {
+        self.send_simple_command(ControllerCommandType::Switch)
+            .await
     }
 }
 
@@ -252,6 +382,7 @@ pub struct ProtocolClient {
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
+    has_controller: bool,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
@@ -262,6 +393,15 @@ pub struct ProtocolClient {
 pub struct ConnectionGuard {
     router_handle: tokio::task::JoinHandle<()>,
     sync_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectionGuard {
+    /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
+    /// and aborts background tasks.
+    pub async fn disconnect(self, sender: &WsSender, reason: GoodbyeReason) -> Result<(), Error> {
+        send_goodbye_and_close(&sender.tx, reason).await
+        // dropping self aborts background tasks
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -304,7 +444,7 @@ impl ProtocolClient {
         let mut read_temp = read;
         log::debug!("Waiting for server/hello...");
 
-        loop {
+        let server_hello = loop {
             if let Some(result) = read_temp.next().await {
                 match result {
                     Ok(WsMessage::Text(text)) => {
@@ -321,7 +461,7 @@ impl ProtocolClient {
                                     server_hello.name,
                                     server_hello.server_id
                                 );
-                                break; // Exit loop, we got the server/hello
+                                break server_hello;
                             }
                             _ => {
                                 log::error!("Expected server/hello, got: {:?}", msg);
@@ -330,7 +470,6 @@ impl ProtocolClient {
                         }
                     }
                     Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                        // Ping/Pong are handled automatically by tokio-tungstenite
                         log::debug!("Received Ping/Pong, continuing to wait for server/hello");
                         continue;
                     }
@@ -354,7 +493,12 @@ impl ProtocolClient {
                 log::error!("Connection closed before receiving server/hello");
                 return Err(Error::Connection("No server hello received".to_string()));
             }
-        }
+        };
+
+        let has_controller = server_hello
+            .active_roles
+            .iter()
+            .any(|r| r == "controller@v1");
 
         // Send initial client/state if provided
         if let Some(state) = initial_state {
@@ -451,6 +595,7 @@ impl ProtocolClient {
             visualizer_rx,
             message_rx,
             clock_sync,
+            has_controller,
             guard: ConnectionGuard {
                 router_handle,
                 sync_handle,
@@ -592,16 +737,8 @@ impl ProtocolClient {
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
     /// and aborts background tasks.
     pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
-        let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
-        let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
-        let mut tx = self.ws_tx.lock().await;
-        tx.send(WsMessage::Text(json))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
-        tx.close()
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))
-        // dropping self aborts background tasks via ConnectionGuard
+        let sender = WsSender { tx: self.ws_tx };
+        self.guard.disconnect(&sender, reason).await
     }
 
     /// Get reference to clock sync
@@ -609,43 +746,29 @@ impl ProtocolClient {
         Arc::clone(&self.clock_sync)
     }
 
-    /// Split into separate receivers for concurrent processing
+    /// Split into separate receivers for concurrent processing.
     ///
-    /// This allows using tokio::select! to process messages and binary data concurrently
-    /// without borrow checker issues. The returned `ConnectionGuard` must be held
-    /// alive; dropping it aborts the background tasks.
-    pub fn split(
-        self,
-    ) -> (
-        UnboundedReceiver<Message>,
-        UnboundedReceiver<AudioChunk>,
-        Arc<Mutex<ClockSync>>,
-        WsSender,
-        ConnectionGuard,
-    ) {
-        (
-            self.message_rx,
-            self.audio_rx,
-            self.clock_sync,
-            WsSender { tx: self.ws_tx },
-            self.guard,
-        )
-    }
-
-    /// Split into all receivers including artwork and visualizer
-    ///
-    /// Use this when you need to handle all binary frame types.
-    /// The returned `ConnectionGuard` must be held alive; dropping it
-    /// aborts the background tasks.
-    pub fn split_full(self) -> FullSplit {
-        (
-            self.message_rx,
-            self.audio_rx,
-            self.artwork_rx,
-            self.visualizer_rx,
-            self.clock_sync,
-            WsSender { tx: self.ws_tx },
-            self.guard,
-        )
+    /// This allows using `tokio::select!` to process messages and binary
+    /// data concurrently. Use the fields you need; ignore the rest.
+    pub fn split(self) -> Connection {
+        let controller = if self.has_controller {
+            Some(Controller {
+                sender: WsSender {
+                    tx: Arc::clone(&self.ws_tx),
+                },
+            })
+        } else {
+            None
+        };
+        Connection {
+            messages: self.message_rx,
+            audio: self.audio_rx,
+            artwork: self.artwork_rx,
+            visualizer: self.visualizer_rx,
+            clock_sync: self.clock_sync,
+            sender: WsSender { tx: self.ws_tx },
+            controller,
+            guard: self.guard,
+        }
     }
 }

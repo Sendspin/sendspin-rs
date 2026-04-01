@@ -20,15 +20,22 @@ pub struct ProtocolClientBuilderRaw {
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_player_state: Option<PlayerState>,
+    controller: bool,
 }
 
 impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
     fn from(raw: ProtocolClientBuilderRaw) -> Self {
         // Build supported_roles based on which supports are configured
         let mut supported_roles = Vec::new();
+        let has_explicit_role = raw.player_v1_support.is_some()
+            || raw.artwork_v1_support.is_some()
+            || raw.visualizer_v1_support.is_some()
+            || raw.controller;
 
-        // Default player support if not explicitly set
-        let player_v1_support = raw.player_v1_support.or_else(|| {
+        // Default to player@v1 if no roles were explicitly configured
+        let player_v1_support = if has_explicit_role {
+            raw.player_v1_support
+        } else {
             Some(PlayerV1Support {
                 supported_formats: vec![
                     AudioFormatSpec {
@@ -47,16 +54,19 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
                 buffer_capacity: 50 * 1024 * 1024,
                 supported_commands: vec!["volume".to_string(), "mute".to_string()],
             })
-        });
+        };
 
-        // Player role is always present (since we set a default)
-        supported_roles.push("player@v1".to_string());
-
+        if player_v1_support.is_some() {
+            supported_roles.push("player@v1".to_string());
+        }
         if raw.artwork_v1_support.is_some() {
             supported_roles.push("artwork@v1".to_string());
         }
         if raw.visualizer_v1_support.is_some() {
             supported_roles.push("visualizer@v1".to_string());
+        }
+        if raw.controller {
+            supported_roles.push("controller@v1".to_string());
         }
 
         ProtocolClientBuilder {
@@ -94,6 +104,8 @@ pub struct ProtocolClientBuilderFields {
     visualizer_v1_support: Option<VisualizerV1Support>,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
+    #[builder(default = false, setter(transform = || true))]
+    controller: bool,
 }
 
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
@@ -108,6 +120,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
             initial_player_state: fields.initial_player_state,
+            controller: fields.controller,
         };
         raw.into()
     }
