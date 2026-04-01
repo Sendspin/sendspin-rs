@@ -6,11 +6,12 @@ use crate::protocol::messages::{
     PlayerState, PlayerV1Support, VisualizerV1Support,
 };
 use crate::ProtocolClient;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use typed_builder::TypedBuilder;
 
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
-pub struct ProtocolClientBuilderRaw {
+pub(crate) struct ProtocolClientBuilderRaw {
     client_id: String,
     name: String,
     product_name: Option<String>,
@@ -158,7 +159,13 @@ impl ProtocolClientBuilder {
     }
 
     /// Connect to Sendspin server
-    pub async fn connect(self, url: &str) -> Result<ProtocolClient, Error> {
+    ///
+    /// Accepts anything that implements `IntoClientRequest` — a URL string for simple
+    /// connections, or an `http::Request` for custom headers (e.g., auth cookies).
+    pub async fn connect<R: IntoClientRequest + Unpin>(
+        self,
+        request: R,
+    ) -> Result<ProtocolClient, Error> {
         let hello = ClientHello {
             client_id: self.client_id.clone(),
             name: self.name.clone(),
@@ -179,6 +186,6 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        ProtocolClient::connect(url, hello, Some(initial_state)).await
+        ProtocolClient::connect(request, hello, initial_state).await
     }
 }

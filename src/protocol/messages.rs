@@ -104,7 +104,7 @@ pub struct ClientHello {
 }
 
 /// Device information (all fields optional per spec)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeviceInfo {
     /// Product name (e.g., "Sendspin-RS Player")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -244,7 +244,7 @@ pub struct ServerTime {
 // =============================================================================
 
 /// Client state update message (wraps role-specific state)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientState {
     /// Client operational state
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -255,7 +255,7 @@ pub struct ClientState {
 }
 
 /// Player state
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PlayerState {
     /// Current volume level (0-100)
     #[serde(skip_serializing_if = "Option::is_none")]

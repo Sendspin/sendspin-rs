@@ -413,10 +413,10 @@ impl Drop for ConnectionGuard {
 
 impl ProtocolClient {
     /// Connect to Sendspin server
-    pub async fn connect<R>(
+    pub(crate) async fn connect<R>(
         request: R,
         hello: ClientHello,
-        initial_state: Option<ClientState>,
+        initial_state: ClientState,
     ) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
@@ -500,17 +500,15 @@ impl ProtocolClient {
             .iter()
             .any(|r| r == "controller@v1");
 
-        // Send initial client/state if provided
-        if let Some(state) = initial_state {
-            let state_msg = Message::ClientState(state);
-            let state_json =
-                serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
-            log::debug!("Sending initial client/state: {}", state_json);
-            write
-                .send(WsMessage::Text(state_json))
-                .await
-                .map_err(|e| Error::WebSocket(e.to_string()))?;
-        }
+        // Send initial client/state
+        let state_msg = Message::ClientState(initial_state);
+        let state_json =
+            serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
+        log::debug!("Sending initial client/state: {}", state_json);
+        write
+            .send(WsMessage::Text(state_json))
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))?;
 
         // Create channels for message routing
         let (audio_tx, audio_rx) = unbounded_channel();
@@ -701,37 +699,6 @@ impl ProtocolClient {
                 _ => {}
             }
         }
-    }
-
-    /// Receive next audio chunk
-    pub async fn recv_audio_chunk(&mut self) -> Option<AudioChunk> {
-        self.audio_rx.recv().await
-    }
-
-    /// Receive next artwork chunk
-    pub async fn recv_artwork_chunk(&mut self) -> Option<ArtworkChunk> {
-        self.artwork_rx.recv().await
-    }
-
-    /// Receive next visualizer chunk
-    pub async fn recv_visualizer_chunk(&mut self) -> Option<VisualizerChunk> {
-        self.visualizer_rx.recv().await
-    }
-
-    /// Receive next protocol message
-    pub async fn recv_message(&mut self) -> Option<Message> {
-        self.message_rx.recv().await
-    }
-
-    /// Send a message to the server
-    pub async fn send_message(&self, msg: &Message) -> Result<(), Error> {
-        let json = serde_json::to_string(msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        log::debug!("Sending message: {}", json);
-
-        let mut tx = self.ws_tx.lock().await;
-        tx.send(WsMessage::Text(json))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))
     }
 
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
