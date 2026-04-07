@@ -49,7 +49,7 @@ impl TimeFilter {
     }
 
     fn update(&mut self, measurement: i64, max_error: i64, time_added: i64) {
-        if time_added == self.last_update {
+        if time_added <= self.last_update {
             return;
         }
 
