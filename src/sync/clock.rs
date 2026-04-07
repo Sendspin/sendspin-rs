@@ -328,3 +328,102 @@ impl Default for ClockSync {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feed enough samples to exit the count==0 and count==1 bootstrap paths
+    /// and put the filter into the steady-state Kalman branch, where negative
+    /// `dt` would actually corrupt the prediction/covariance math.
+    fn primed_filter() -> TimeFilter {
+        let mut f = TimeFilter::new(0.01, 1.001);
+        f.update(100, 10, 1_000);
+        f.update(120, 10, 2_000);
+        f.update(140, 10, 3_000);
+        assert_eq!(f.count, 3);
+        assert_eq!(f.last_update, 3_000);
+        f
+    }
+
+    /// Snapshot every bit of filter state that a monotonicity-guard bypass
+    /// could perturb. If the guard works, a rejected sample leaves all of
+    /// these untouched.
+    fn snapshot(f: &TimeFilter) -> (i64, u32, f64, f64, f64, f64, f64) {
+        (
+            f.last_update,
+            f.count,
+            f.offset,
+            f.drift,
+            f.offset_covariance,
+            f.drift_covariance,
+            f.offset_drift_covariance,
+        )
+    }
+
+    #[test]
+    fn update_rejects_backwards_time_added() {
+        let mut f = primed_filter();
+        let before = snapshot(&f);
+
+        // t4 < last_update: pre-fix code would compute negative dt and
+        // corrupt the Kalman prediction. Post-fix, the guard rejects it.
+        f.update(999, 10, 2_500);
+
+        assert_eq!(snapshot(&f), before, "backwards t4 must not mutate state");
+    }
+
+    #[test]
+    fn update_rejects_duplicate_time_added() {
+        let mut f = primed_filter();
+        let before = snapshot(&f);
+
+        // Equal t4: original == guard already handled this; make sure the
+        // <= relaxation didn't accidentally change behavior for duplicates.
+        f.update(999, 10, 3_000);
+
+        assert_eq!(snapshot(&f), before, "duplicate t4 must not mutate state");
+    }
+
+    #[test]
+    fn update_accepts_forward_time_added() {
+        let mut f = primed_filter();
+        let before = snapshot(&f);
+
+        f.update(160, 10, 4_000);
+
+        assert_ne!(snapshot(&f), before, "forward t4 must advance the filter");
+        assert_eq!(f.last_update, 4_000);
+    }
+
+    #[test]
+    fn backwards_sample_does_not_affect_later_predictions() {
+        // End-to-end: a rejected backwards sample must leave future
+        // conversions identical to a filter that never saw it at all.
+        let mut with_bad = TimeFilter::new(0.01, 1.001);
+        let mut without_bad = TimeFilter::new(0.01, 1.001);
+
+        for (m, t) in [(100, 1_000), (120, 2_000), (140, 3_000)] {
+            with_bad.update(m, 10, t);
+            without_bad.update(m, 10, t);
+        }
+
+        // Inject a backwards sample into one filter only.
+        with_bad.update(9_999, 10, 1_500);
+
+        // Then drive both forward identically.
+        for (m, t) in [(160, 4_000), (180, 5_000)] {
+            with_bad.update(m, 10, t);
+            without_bad.update(m, 10, t);
+        }
+
+        assert_eq!(
+            with_bad.compute_server_time(10_000),
+            without_bad.compute_server_time(10_000),
+        );
+        assert_eq!(
+            with_bad.compute_client_time(10_000),
+            without_bad.compute_client_time(10_000),
+        );
+    }
+}
