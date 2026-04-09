@@ -413,7 +413,7 @@ impl SyncedPlayer {
         let mut drop_counter = 0u32;
         let mut started = false;
         let mut last_generation = 0u64;
-        let initial_gain = cb_config.gain_control.target_gain();
+        let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
 
         let stream = device
@@ -466,7 +466,7 @@ impl SyncedPlayer {
                                 for sample in data.iter_mut() {
                                     *sample = 0.0;
                                 }
-                                let target = cb_config.gain_control.target_gain();
+                                let target = cb_config.gain_control.gain();
                                 let frames = data.len() / channels;
                                 gain_ramp.advance(frames, target);
                                 if let Some(ref mut cb) = cb_config.process_callback {
@@ -538,7 +538,7 @@ impl SyncedPlayer {
                         for sample in data.iter_mut() {
                             *sample = 0.0;
                         }
-                        let target = cb_config.gain_control.target_gain();
+                        let target = cb_config.gain_control.gain();
                         let frames = data.len() / channels;
                         gain_ramp.advance(frames, target);
                         if let Some(ref mut cb) = cb_config.process_callback {
@@ -604,7 +604,7 @@ impl SyncedPlayer {
                     } // queue lock dropped before user callback
 
                     // Apply gain with per-frame ramping
-                    let target = cb_config.gain_control.target_gain();
+                    let target = cb_config.gain_control.gain();
                     gain_ramp.apply(data, channels, target);
 
                     if let Some(ref mut cb) = cb_config.process_callback {
