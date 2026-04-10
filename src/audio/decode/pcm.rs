@@ -39,9 +39,26 @@ impl PcmDecoder {
 
 impl Decoder for PcmDecoder {
     fn decode(&self, data: &[u8]) -> Result<Arc<[Sample]>, Error> {
+        let bytes_per_sample: usize = match self.bit_depth {
+            16 => 2,
+            24 => 3,
+            other => return Err(Error::Protocol(format!("Unsupported bit depth: {}", other))),
+        };
+
+        if data.is_empty() {
+            return Err(Error::Protocol("Empty PCM data".to_string()));
+        }
+        if !data.len().is_multiple_of(bytes_per_sample) {
+            return Err(Error::Protocol(format!(
+                "Truncated {}-bit PCM: {} bytes is not a multiple of {}",
+                self.bit_depth,
+                data.len(),
+                bytes_per_sample,
+            )));
+        }
+
         match (self.bit_depth, self.endian) {
             (16, PcmEndian::Little) => {
-                // Convert 16-bit little-endian PCM to Sample
                 let samples: Vec<Sample> = data
                     .chunks_exact(2)
                     .map(|c| {
@@ -52,7 +69,6 @@ impl Decoder for PcmDecoder {
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (16, PcmEndian::Big) => {
-                // Convert 16-bit big-endian PCM to Sample
                 let samples: Vec<Sample> = data
                     .chunks_exact(2)
                     .map(|c| {
@@ -63,7 +79,6 @@ impl Decoder for PcmDecoder {
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (24, PcmEndian::Little) => {
-                // Convert 24-bit little-endian PCM to Sample
                 let samples: Vec<Sample> = data
                     .chunks_exact(3)
                     .map(|c| Sample::from_i24_le([c[0], c[1], c[2]]))
@@ -71,17 +86,14 @@ impl Decoder for PcmDecoder {
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (24, PcmEndian::Big) => {
-                // Convert 24-bit big-endian PCM to Sample
                 let samples: Vec<Sample> = data
                     .chunks_exact(3)
                     .map(|c| Sample::from_i24_be([c[0], c[1], c[2]]))
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
-            _ => Err(Error::Protocol(format!(
-                "Unsupported bit depth: {}",
-                self.bit_depth
-            ))),
+            // Unreachable: bit_depth validated above
+            _ => unreachable!(),
         }
     }
 }

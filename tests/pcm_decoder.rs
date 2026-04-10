@@ -42,36 +42,31 @@ fn test_decode_pcm_24bit() {
 #[test]
 fn test_decode_pcm_16bit_empty_input() {
     let decoder = PcmDecoder::new(16);
-    let samples = decoder.decode(&[]).unwrap();
-    assert_eq!(samples.len(), 0);
+    let result = decoder.decode(&[]);
+    assert!(result.is_err(), "empty input should be rejected");
 }
 
 #[test]
 fn test_decode_pcm_24bit_empty_input() {
     let decoder = PcmDecoder::new(24);
-    let samples = decoder.decode(&[]).unwrap();
-    assert_eq!(samples.len(), 0);
+    let result = decoder.decode(&[]);
+    assert!(result.is_err(), "empty input should be rejected");
 }
 
 #[test]
-fn test_decode_pcm_16bit_misaligned_trailing_byte_dropped() {
+fn test_decode_pcm_16bit_misaligned_trailing_byte_rejected() {
     let decoder = PcmDecoder::new(16);
-    // 3 bytes: one complete 16-bit sample + 1 trailing byte
-    let data = vec![0x00, 0x04, 0xFF];
-    let samples = decoder.decode(&data).unwrap();
-    // chunks_exact(2) silently drops the trailing byte
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].to_i16(), 1024);
+    // 3 bytes: not a multiple of 2
+    let result = decoder.decode(&[0x00, 0x04, 0xFF]);
+    assert!(result.is_err(), "truncated 16-bit PCM should be rejected");
 }
 
 #[test]
-fn test_decode_pcm_24bit_misaligned_trailing_bytes_dropped() {
+fn test_decode_pcm_24bit_misaligned_trailing_bytes_rejected() {
     let decoder = PcmDecoder::new(24);
-    // 5 bytes: one complete 24-bit sample + 2 trailing bytes
-    let data = vec![0x00, 0x10, 0x00, 0xAB, 0xCD];
-    let samples = decoder.decode(&data).unwrap();
-    assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample(4096));
+    // 5 bytes: not a multiple of 3
+    let result = decoder.decode(&[0x00, 0x10, 0x00, 0xAB, 0xCD]);
+    assert!(result.is_err(), "truncated 24-bit PCM should be rejected");
 }
 
 #[test]
@@ -135,14 +130,20 @@ fn test_decode_pcm_32bit_unsupported() {
 fn test_decode_pcm_16bit_sub_sample_input() {
     let decoder = PcmDecoder::new(16);
     // Single byte — not enough for one 16-bit sample
-    let samples = decoder.decode(&[0xFF]).unwrap();
-    assert_eq!(samples.len(), 0);
+    let result = decoder.decode(&[0xFF]);
+    assert!(
+        result.is_err(),
+        "sub-sample 16-bit input should be rejected"
+    );
 }
 
 #[test]
 fn test_decode_pcm_24bit_sub_sample_input() {
     let decoder = PcmDecoder::new(24);
     // Two bytes — not enough for one 24-bit sample
-    let samples = decoder.decode(&[0xFF, 0xFF]).unwrap();
-    assert_eq!(samples.len(), 0);
+    let result = decoder.decode(&[0xFF, 0xFF]);
+    assert!(
+        result.is_err(),
+        "sub-sample 24-bit input should be rejected"
+    );
 }
