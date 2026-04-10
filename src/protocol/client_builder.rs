@@ -158,27 +158,29 @@ impl ProtocolClientBuilder {
         self.player_v1_support.as_ref()
     }
 
-    /// Connect to Sendspin server
+    /// Connect to Sendspin server.
     ///
-    /// Accepts anything that implements `IntoClientRequest` — a URL string for simple
-    /// connections, or an `http::Request` for custom headers (e.g., auth cookies).
+    /// Accepts anything that implements [`IntoClientRequest`], such as a URL string
+    /// for simple connections. For custom headers (for example, auth cookies), callers
+    /// will typically build an `http::Request<()>` — see the [`IntoClientRequest`] docs
+    /// for the full set of supported request types.
     pub async fn connect<R: IntoClientRequest + Unpin>(
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
         let hello = ClientHello {
-            client_id: self.client_id.clone(),
-            name: self.name.clone(),
+            client_id: self.client_id,
+            name: self.name,
             version: 1,
-            supported_roles: self.supported_roles.clone(),
+            supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
-                product_name: self.product_name.clone(),
-                manufacturer: Some(self.manufacturer.unwrap_or("Sendspin".to_string())),
-                software_version: self.software_version.clone(),
+                product_name: self.product_name,
+                manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),
+                software_version: self.software_version,
             }),
-            player_v1_support: self.player_v1_support.clone(),
-            artwork_v1_support: self.artwork_v1_support.clone(),
-            visualizer_v1_support: self.visualizer_v1_support.clone(),
+            player_v1_support: self.player_v1_support,
+            artwork_v1_support: self.artwork_v1_support,
+            visualizer_v1_support: self.visualizer_v1_support,
         };
 
         let initial_state = ClientState {

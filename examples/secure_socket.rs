@@ -1,22 +1,23 @@
-// ABOUTME: Basic example demonstrating secure WebSocket connection and handshake
-// ABOUTME: Connects to server, sends client/hello, receives server/hello
+// ABOUTME: Example demonstrating builder capabilities with custom headers
+// ABOUTME: Shows player format configuration, controller role, and auth proxy setup
 // ABOUTME: Run with: cargo run --example secure_socket --features native-tls
 
 use clap::Parser;
+use sendspin::protocol::messages::{AudioFormatSpec, PlayerState, PlayerV1Support};
 use sendspin::ProtocolClientBuilder;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Sendspin basic client
+/// Sendspin advanced client
 #[derive(Parser, Debug)]
-#[command(name = "basic_client")]
-#[command(about = "Test connection to Sendspin server", long_about = None)]
+#[command(name = "advanced_client")]
+#[command(about = "Demonstrates builder capabilities with custom headers", long_about = None)]
 struct Args {
     /// WebSocket URL of the Sendspin server
     #[arg(short, long, default_value = "wss://localhost:8927/sendspin")]
     server: String,
 
     /// Client name
-    #[arg(short, long, default_value = "Sendspin-RS Basic Client")]
+    #[arg(short, long, default_value = "Sendspin-RS Advanced Client")]
     name: String,
 }
 
@@ -34,19 +35,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .headers_mut()
         .insert("cookie", "ingress_session=<session_token>".parse().unwrap());
 
-    let _client = ProtocolClientBuilder::builder()
+    // Configure the builder with explicit player support and controller role
+    let client = ProtocolClientBuilder::builder()
         .client_id(uuid::Uuid::new_v4().to_string())
         .name(args.name)
-        .product_name(Some("Sendspin-RS Basic Client".to_string()))
-        .software_version(Some("0.1.0".to_string()))
+        .product_name(Some("Sendspin-RS Advanced Client".to_string()))
+        .software_version(Some(env!("CARGO_PKG_VERSION").to_string()))
+        // Declare player capabilities: 24-bit/48kHz stereo PCM
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 50 * 1024 * 1024,
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
+        })
+        // Request controller role for playback control
+        .controller()
+        // Set initial player state
+        .initial_player_state(PlayerState {
+            volume: Some(80),
+            muted: Some(false),
+            ..Default::default()
+        })
         .build()
         .connect(request)
         .await?;
 
-    println!("Connected! Waiting for server hello...");
+    println!("Connected!");
 
-    // This would block waiting for messages
-    // For now, just demonstrate connection works
+    // Split into conn channels for concurrent use
+    let conn = client.split();
+
+    if let Some(controller) = conn.controller {
+        println!("Controller role granted — can send playback commands");
+        // e.g., controller.play().await?;
+        drop(controller);
+    } else {
+        println!("Controller role not granted by server");
+    }
 
     Ok(())
 }
