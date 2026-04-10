@@ -611,6 +611,11 @@ impl ProtocolClient {
         message_tx: UnboundedSender<Message>,
         clock_sync: Arc<Mutex<ClockSync>>,
     ) {
+        let mut audio_closed = false;
+        let mut artwork_closed = false;
+        let mut visualizer_closed = false;
+        let mut message_closed = false;
+
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
@@ -622,7 +627,12 @@ impl ProtocolClient {
                                 chunk.timestamp,
                                 chunk.data.len()
                             );
-                            let _ = audio_tx.send(chunk);
+                            if !audio_closed && audio_tx.send(chunk).is_err() {
+                                log::error!(
+                                    "Audio receiver dropped — audio data will be discarded"
+                                );
+                                audio_closed = true;
+                            }
                         }
                         Ok(BinaryFrame::Artwork(chunk)) => {
                             log::debug!(
@@ -631,7 +641,12 @@ impl ProtocolClient {
                                 chunk.timestamp,
                                 chunk.data.len()
                             );
-                            let _ = artwork_tx.send(chunk);
+                            if !artwork_closed && artwork_tx.send(chunk).is_err() {
+                                log::error!(
+                                    "Artwork receiver dropped — artwork data will be discarded"
+                                );
+                                artwork_closed = true;
+                            }
                         }
                         Ok(BinaryFrame::Visualizer(chunk)) => {
                             log::debug!(
@@ -639,7 +654,10 @@ impl ProtocolClient {
                                 chunk.timestamp,
                                 chunk.data.len()
                             );
-                            let _ = visualizer_tx.send(chunk);
+                            if !visualizer_closed && visualizer_tx.send(chunk).is_err() {
+                                log::error!("Visualizer receiver dropped — visualizer data will be discarded");
+                                visualizer_closed = true;
+                            }
                         }
                         Ok(BinaryFrame::Unknown { type_id, .. }) => {
                             log::warn!("Received unknown binary type: {}", type_id);
@@ -678,8 +696,11 @@ impl ProtocolClient {
                                         );
                                     }
                                 }
-                            } else {
-                                let _ = message_tx.send(msg);
+                            } else if !message_closed && message_tx.send(msg).is_err() {
+                                log::error!(
+                                    "Message receiver dropped — messages will be discarded"
+                                );
+                                message_closed = true;
                             }
                         }
                         Err(e) => {
