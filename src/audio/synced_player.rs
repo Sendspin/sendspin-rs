@@ -321,6 +321,13 @@ impl SyncedPlayer {
             cb_config,
             error_clone,
         )?;
+
+        let buffer_size = stream.buffer_size().map_err(|e| Error::Output(e.to_string()))?;
+        log::debug!(
+            "Built audio stream with config: {:?}, buffer size: {:?}",
+            config,
+            buffer_size
+        );
         stream.play().map_err(|e| Error::Output(e.to_string()))?;
 
         Ok(Self {
