@@ -3,11 +3,11 @@
 
 use crate::audio::gain::{GainControl, GainRamp};
 use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
-use crate::audio::{AudioBuffer, AudioFormat, Sample};
+use crate::audio::{AudioBuffer, AudioFormat, SendspinSample};
 use crate::error::Error;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, FromSample, Sample, SampleFormat, Stream, StreamConfig};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ impl PlaybackQueue {
         }
     }
 
-    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[Sample]> {
+    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[SendspinSample]> {
         let needs_buffer = match self.current {
             None => true,
             Some(ref c) => self.index + channels > c.samples.len(),
@@ -407,7 +407,7 @@ impl SyncedPlayer {
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
-        let mut last_frame = vec![Sample::ZERO; channels];
+        let mut last_frame = vec![SendspinSample::ZERO; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
         let mut drop_counter = 0u32;
@@ -416,210 +416,244 @@ impl SyncedPlayer {
         let initial_gain = cb_config.gain_control.target_gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
 
-        let stream = device
-            .build_output_stream(
-                config,
-                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    // Read all queue state in a single lock to avoid
-                    // a TOCTOU window between generation and cursor reads.
-                    // After clear(), force_reanchor is true but cursor_us
-                    // is None (initialized=false), so the reanchor block
-                    // is normally skipped and the flag persists. If clear()
-                    // races with an in-flight reanchor, the flag can be
-                    // cleared early; next_frame() re-anchors from the
-                    // first buffer's timestamp in that case.
-                    let (generation, cursor_us, force_reanchor) = {
-                        let queue = queue.lock();
-                        let cursor = if queue.initialized {
-                            Some(queue.cursor_us)
-                        } else {
-                            None
-                        };
-                        (queue.generation, cursor, queue.force_reanchor)
-                    };
-                    if generation != last_generation {
-                        last_generation = generation;
-                        started = false;
-                        schedule = CorrectionSchedule::default();
-                        insert_counter = 0;
-                        drop_counter = 0;
-                        for sample in last_frame.iter_mut() {
-                            *sample = Sample::ZERO;
-                        }
-                    }
-
-                    let callback_instant = Instant::now();
-                    let ts = info.timestamp();
-                    let playback_delta = ts
-                        .playback
-                        .duration_since(&ts.callback)
-                        .unwrap_or(Duration::ZERO);
-                    let playback_instant = callback_instant + playback_delta;
-
-                    // try_lock: skip sync if contended rather than blocking
-                    // the audio thread. force_reanchor is sticky in the
-                    // queue, so it will be retried on the next callback.
-                    if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
-                        if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
-                            let early_window = Duration::from_millis(1);
-                            if !started && playback_instant + early_window < expected_instant {
-                                for sample in data.iter_mut() {
-                                    *sample = 0.0;
-                                }
-                                let target = cb_config.gain_control.target_gain();
-                                let frames = data.len() / channels;
-                                gain_ramp.advance(frames, target);
-                                if let Some(ref mut cb) = cb_config.process_callback {
-                                    cb(data);
-                                }
-                                return;
-                            }
-                            started = true;
-
-                            let error_us = if playback_instant >= expected_instant {
-                                playback_instant
-                                    .duration_since(expected_instant)
-                                    .as_micros() as i64
+        macro_rules! output_stream {
+            ($sample:ty) => {
+                device.build_output_stream(
+                    config,
+                    move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                        // Read all queue state in a single lock to avoid
+                        // a TOCTOU window between generation and cursor reads.
+                        // After clear(), force_reanchor is true but cursor_us
+                        // is None (initialized=false), so the reanchor block
+                        // is normally skipped and the flag persists. If clear()
+                        // races with an in-flight reanchor, the flag can be
+                        // cleared early; next_frame() re-anchors from the
+                        // first buffer's timestamp in that case.
+                        let (generation, cursor_us, force_reanchor) = {
+                            let queue = queue.lock();
+                            let cursor = if queue.initialized {
+                                Some(queue.cursor_us)
                             } else {
-                                -(expected_instant
-                                    .duration_since(playback_instant)
-                                    .as_micros() as i64)
+                                None
                             };
-                            let new_schedule =
-                                planner.plan(error_us, sample_rate, schedule.is_correcting());
-                            if new_schedule != schedule {
-                                if new_schedule.is_correcting() != schedule.is_correcting() {
-                                    if new_schedule.is_correcting() {
-                                        log::debug!(
-                                            "Sync correction engaged: \
-                                             error={:.1}ms, insert_every={}, drop_every={}",
-                                            error_us as f64 / 1000.0,
-                                            new_schedule.insert_every_n_frames,
-                                            new_schedule.drop_every_n_frames,
-                                        );
-                                    } else {
-                                        log::debug!(
-                                            "Sync correction disengaged: \
-                                             error={:.1}ms",
-                                            error_us as f64 / 1000.0,
-                                        );
-                                    }
-                                }
-                                schedule = new_schedule;
-                                insert_counter = schedule.insert_every_n_frames;
-                                drop_counter = schedule.drop_every_n_frames;
-                            }
-
-                            if schedule.reanchor || force_reanchor {
-                                if let Some(client_micros) =
-                                    sync.instant_to_client_micros(playback_instant)
-                                {
-                                    if let Some(server_time) =
-                                        sync.client_to_server_micros(client_micros)
-                                    {
-                                        let mut queue = queue.lock();
-                                        queue.cursor_us = server_time;
-                                        queue.cursor_remainder = 0;
-                                        queue.force_reanchor = false;
-                                    }
-                                }
-                                schedule = CorrectionSchedule::default();
-                                insert_counter = 0;
-                                drop_counter = 0;
+                            (queue.generation, cursor, queue.force_reanchor)
+                        };
+                        if generation != last_generation {
+                            last_generation = generation;
+                            started = false;
+                            schedule = CorrectionSchedule::default();
+                            insert_counter = 0;
+                            drop_counter = 0;
+                            for sample in last_frame.iter_mut() {
+                                *sample = SendspinSample::ZERO;
                             }
                         }
-                    }
 
-                    // If playback hasn't started yet (clock sync not converged,
-                    // lock contention, or pre-start gate active), output silence.
-                    // Audio data stays in the ring buffer for when sync converges
-                    // and reanchor positions the cursor correctly.
-                    if !started {
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
-                        let target = cb_config.gain_control.target_gain();
-                        let frames = data.len() / channels;
-                        gain_ramp.advance(frames, target);
-                        if let Some(ref mut cb) = cb_config.process_callback {
-                            cb(data);
-                        }
-                        return;
-                    }
+                        let callback_instant = Instant::now();
+                        let ts = info.timestamp();
+                        let playback_delta = ts
+                            .playback
+                            .duration_since(&ts.callback)
+                            .unwrap_or(Duration::ZERO);
+                        let playback_instant = callback_instant + playback_delta;
 
-                    {
-                        let mut queue = queue.lock();
-                        let frames = data.len() / channels;
-                        let mut out_index = 0;
+                        // try_lock: skip sync if contended rather than blocking
+                        // the audio thread. force_reanchor is sticky in the
+                        // queue, so it will be retried on the next callback.
+                        if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
+                            if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
+                                let early_window = Duration::from_millis(1);
+                                if !started && playback_instant + early_window < expected_instant {
+                                    for sample in data.iter_mut() {
+                                        *sample = <$sample>::from_sample(0.0);
+                                    }
+                                    let target = cb_config.gain_control.target_gain();
+                                    let frames = data.len() / channels;
+                                    gain_ramp.advance(frames, target);
+                                    if let Some(ref mut cb) = cb_config.process_callback {
+                                        let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
+                                        cb(&mut f32_data);
+                                    }
+                                    return;
+                                }
+                                started = true;
 
-                        for _ in 0..frames {
-                            if schedule.drop_every_n_frames > 0 {
-                                drop_counter = drop_counter.saturating_sub(1);
-                                if drop_counter == 0 {
-                                    // Discard one frame to catch up
-                                    let _ = queue.next_frame(channels, sample_rate);
-                                    drop_counter = schedule.drop_every_n_frames;
-                                    // Get and output the next frame (don't repeat last_frame)
-                                    if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                        last_frame.copy_from_slice(frame);
-                                        for sample in frame {
-                                            data[out_index] = sample.to_f32();
-                                            out_index += 1;
-                                        }
-                                    } else {
-                                        for sample in &last_frame {
-                                            data[out_index] = sample.to_f32();
-                                            out_index += 1;
+                                let error_us = if playback_instant >= expected_instant {
+                                    playback_instant
+                                        .duration_since(expected_instant)
+                                        .as_micros() as i64
+                                } else {
+                                    -(expected_instant
+                                        .duration_since(playback_instant)
+                                        .as_micros() as i64)
+                                };
+                                let new_schedule =
+                                    planner.plan(error_us, sample_rate, schedule.is_correcting());
+                                if new_schedule != schedule {
+                                    if new_schedule.is_correcting() != schedule.is_correcting() {
+                                        if new_schedule.is_correcting() {
+                                            log::debug!(
+                                                "Sync correction engaged: \
+                                                error={:.1}ms, insert_every={}, drop_every={}",
+                                                error_us as f64 / 1000.0,
+                                                new_schedule.insert_every_n_frames,
+                                                new_schedule.drop_every_n_frames,
+                                            );
+                                        } else {
+                                            log::debug!(
+                                                "Sync correction disengaged: \
+                                                error={:.1}ms",
+                                                error_us as f64 / 1000.0,
+                                            );
                                         }
                                     }
-                                    continue;
-                                }
-                            }
-
-                            if schedule.insert_every_n_frames > 0 {
-                                insert_counter = insert_counter.saturating_sub(1);
-                                if insert_counter == 0 {
+                                    schedule = new_schedule;
                                     insert_counter = schedule.insert_every_n_frames;
-                                    for sample in &last_frame {
-                                        data[out_index] = sample.to_f32();
+                                    drop_counter = schedule.drop_every_n_frames;
+                                }
+
+                                if schedule.reanchor || force_reanchor {
+                                    if let Some(client_micros) =
+                                        sync.instant_to_client_micros(playback_instant)
+                                    {
+                                        if let Some(server_time) =
+                                            sync.client_to_server_micros(client_micros)
+                                        {
+                                            let mut queue = queue.lock();
+                                            queue.cursor_us = server_time;
+                                            queue.cursor_remainder = 0;
+                                            queue.force_reanchor = false;
+                                        }
+                                    }
+                                    schedule = CorrectionSchedule::default();
+                                    insert_counter = 0;
+                                    drop_counter = 0;
+                                }
+                            }
+                        }
+
+                        // If playback hasn't started yet (clock sync not converged,
+                        // lock contention, or pre-start gate active), output silence.
+                        // Audio data stays in the ring buffer for when sync converges
+                        // and reanchor positions the cursor correctly.
+                        if !started {
+                            for sample in data.iter_mut() {
+                                *sample = <$sample>::from_sample(0.0);
+                            }
+                            let target = cb_config.gain_control.target_gain();
+                            let frames = data.len() / channels;
+                            gain_ramp.advance(frames, target);
+                            if let Some(ref mut cb) = cb_config.process_callback {
+                                let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
+
+                                cb(&mut f32_data);
+                            }
+                            return;
+                        }
+
+                        {
+                            let mut queue = queue.lock();
+                            let frames = data.len() / channels;
+                            let mut out_index = 0;
+
+                            for _ in 0..frames {
+                                if schedule.drop_every_n_frames > 0 {
+                                    drop_counter = drop_counter.saturating_sub(1);
+                                    if drop_counter == 0 {
+                                        // Discard one frame to catch up
+                                        let _ = queue.next_frame(channels, sample_rate);
+                                        drop_counter = schedule.drop_every_n_frames;
+                                        // Get and output the next frame (don't repeat last_frame)
+                                        if let Some(frame) = queue.next_frame(channels, sample_rate) {
+                                            last_frame.copy_from_slice(frame);
+                                            for sample in frame {
+                                                data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                                out_index += 1;
+                                            }
+                                        } else {
+                                            for sample in &last_frame {
+                                                data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                                out_index += 1;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                if schedule.insert_every_n_frames > 0 {
+                                    insert_counter = insert_counter.saturating_sub(1);
+                                    if insert_counter == 0 {
+                                        insert_counter = schedule.insert_every_n_frames;
+                                        for sample in &last_frame {
+                                            data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                            out_index += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(frame) = queue.next_frame(channels, sample_rate) {
+                                    last_frame.copy_from_slice(frame);
+                                    for sample in frame {
+                                        data[out_index] = <$sample>::from_sample(sample.to_f32());
                                         out_index += 1;
                                     }
-                                    continue;
-                                }
-                            }
+                                } else {
+                                    for _ in 0..channels {
+                                        data[out_index] = <$sample>::from_sample(0.0);
 
-                            if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                last_frame.copy_from_slice(frame);
-                                for sample in frame {
-                                    data[out_index] = sample.to_f32();
-                                    out_index += 1;
-                                }
-                            } else {
-                                for _ in 0..channels {
-                                    data[out_index] = 0.0;
-                                    out_index += 1;
+                                        out_index += 1;
+                                    }
                                 }
                             }
+                        } // queue lock dropped before user callback
+
+                        // Apply gain with per-frame ramping
+                        let target = cb_config.gain_control.target_gain();
+                        let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
+                        gain_ramp.apply(f32_data.as_mut_slice(), channels, target);
+
+                        if let Some(ref mut cb) = cb_config.process_callback {
+                            // Convert to f32 for the callback since it expects &mut [f32]
+                            cb(&mut f32_data);
                         }
-                    } // queue lock dropped before user callback
+                    },
+                    move |err| {
+                        eprintln!("Audio stream error: {}", err);
+                        *error_sink.lock() = Some(err.to_string());
+                    },
+                    None,
+                )
+                .map_err(|e| Error::Output(e.to_string()))
+            };
+        }
 
-                    // Apply gain with per-frame ramping
-                    let target = cb_config.gain_control.target_gain();
-                    gain_ramp.apply(data, channels, target);
-
-                    if let Some(ref mut cb) = cb_config.process_callback {
-                        cb(data);
-                    }
-                },
-                move |err| {
-                    eprintln!("Audio stream error: {}", err);
-                    *error_sink.lock() = Some(err.to_string());
-                },
-                None,
-            )
+        let device_config = device
+            .default_output_config()
             .map_err(|e| Error::Output(e.to_string()))?;
+        log::debug!(
+            "Using output device: {}, default config: {:?}",
+            device
+                .id()
+                .map(|id| format!("{:?}", id))
+                .unwrap_or("Unknown Device".to_string()),
+            device_config
+        );
+        let stream = match device_config.sample_format() {
+            SampleFormat::F32 => output_stream!(f32),
+            SampleFormat::I16 => output_stream!(i16),
+            SampleFormat::U16 => output_stream!(u16),
+            SampleFormat::I8 => output_stream!(i8),
+            SampleFormat::I32 => output_stream!(i32),
+            SampleFormat::I64 => output_stream!(i64),
+            SampleFormat::U8 => output_stream!(u8),
+            SampleFormat::U32 => output_stream!(u32),
+            SampleFormat::U64 => output_stream!(u64),
+            SampleFormat::F64 => output_stream!(f64),
+            _ => panic!("Unsupported sample format"),
+        };
 
-        Ok(stream)
+        Ok(stream?)
     }
 }
 
@@ -631,7 +665,7 @@ mod tests {
     // cannot run in CI.
 
     use super::PlaybackQueue;
-    use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, SendspinSample};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -658,7 +692,7 @@ mod tests {
     fn test_queue_clear_bumps_generation() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![SendspinSample::ZERO; 96];
         queue.push(AudioBuffer {
             timestamp: 1234,
             play_at: Instant::now(),
@@ -681,8 +715,10 @@ mod tests {
         // Use distinct sample values so we can verify which buffer was returned.
         // 4800 stereo frames at 48kHz = 100ms per buffer.
         // With cursor at 150ms, the first buffer (ts=0, ends at 100ms) is stale.
-        let stale_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(111)).collect();
-        let fresh_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(222)).collect();
+        let stale_samples: Vec<SendspinSample> =
+            (0..4800 * 2).map(|_| SendspinSample(111)).collect();
+        let fresh_samples: Vec<SendspinSample> =
+            (0..4800 * 2).map(|_| SendspinSample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -701,14 +737,14 @@ mod tests {
         queue.initialized = true;
 
         // Copy the frame data so we can release the mutable borrow on queue.
-        let frame_data: Vec<Sample> = queue
+        let frame_data: Vec<SendspinSample> = queue
             .next_frame(2, 48_000)
             .expect("expected a frame")
             .to_vec();
         assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
         // Verify we got the fresh buffer's data, not the stale one
-        assert_eq!(frame_data[0], Sample(222));
-        assert_eq!(frame_data[1], Sample(222));
+        assert_eq!(frame_data[0], SendspinSample(222));
+        assert_eq!(frame_data[1], SendspinSample(222));
     }
 
     #[test]
@@ -718,7 +754,7 @@ mod tests {
 
         // Push out of order: 300, 100, 200
         for ts in [300_000i64, 100_000, 200_000] {
-            let samples = vec![Sample(ts as i32); 48]; // 1ms of mono
+            let samples = vec![SendspinSample(ts as i32); 48]; // 1ms of mono
             queue.push(AudioBuffer {
                 timestamp: ts,
                 play_at: Instant::now(),
@@ -760,7 +796,7 @@ mod tests {
 
         // 480 stereo frames = 10ms at 48kHz
         let num_frames = 480;
-        let samples = vec![Sample::ZERO; num_frames * 2];
+        let samples = vec![SendspinSample::ZERO; num_frames * 2];
         let start_ts = 1_000_000i64; // 1 second
         queue.push(AudioBuffer {
             timestamp: start_ts,
@@ -790,7 +826,7 @@ mod tests {
         let format = test_format();
 
         // Push one buffer to initialize the cursor
-        let samples = vec![Sample::ZERO; 480 * 2]; // 10ms stereo
+        let samples = vec![SendspinSample::ZERO; 480 * 2]; // 10ms stereo
         let start_ts = 1_000_000i64;
         queue.push(AudioBuffer {
             timestamp: start_ts,
@@ -819,7 +855,8 @@ mod tests {
 
         // Push a new buffer after the underrun. It should NOT be
         // dropped as stale — the cursor hasn't raced ahead.
-        let fresh_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(999)).collect();
+        let fresh_samples: Vec<SendspinSample> =
+            (0..480 * 2).map(|_| SendspinSample(999)).collect();
         queue.push(AudioBuffer {
             timestamp: cursor_after_drain, // starts right where we left off
             play_at: Instant::now(),
@@ -832,7 +869,7 @@ mod tests {
             .expect("buffer should not be dropped as stale");
         assert_eq!(
             frame[0],
-            Sample(999),
+            SendspinSample(999),
             "should get the fresh buffer, not stale data"
         );
     }
@@ -845,7 +882,7 @@ mod tests {
         assert!(!queue.initialized);
         assert_eq!(queue.cursor_us, 0);
 
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![SendspinSample::ZERO; 96];
         queue.push(AudioBuffer {
             timestamp: 500_000,
             play_at: Instant::now(),
@@ -862,7 +899,7 @@ mod tests {
     fn test_push_does_not_regress_cursor_after_init() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![SendspinSample::ZERO; 96];
 
         // First buffer at 500ms — initializes cursor
         queue.push(AudioBuffer {
@@ -903,14 +940,14 @@ mod tests {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
 
-        let buf_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
-        let buf_b: Vec<Sample> = (0..2400 * 2)
+        let buf_a: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(111)).collect();
+        let buf_b: Vec<SendspinSample> = (0..2400 * 2)
             .map(|i| {
                 // First half (1200 frames) = 222, second half = 333
                 if i < 2400 {
-                    Sample(222)
+                    SendspinSample(222)
                 } else {
-                    Sample(333)
+                    SendspinSample(333)
                 }
             })
             .collect();
@@ -945,7 +982,7 @@ mod tests {
             .expect("should get a frame from buffer B");
         assert_eq!(
             frame[0],
-            Sample(333),
+            SendspinSample(333),
             "expected skip into second half of buffer B (past the overlap), \
              got first half — backward-timestamped audio was replayed"
         );
@@ -959,8 +996,8 @@ mod tests {
         let format = test_format();
 
         // 2400 frames = 50ms per buffer. Adjacent, non-overlapping.
-        let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
-        let samples_b: Vec<Sample> = (0..2400 * 2).map(|_| Sample(222)).collect();
+        let samples_a: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(111)).collect();
+        let samples_b: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(222)).collect();
 
         // Two consecutive, non-overlapping buffers.
         queue.push(AudioBuffer {
@@ -987,7 +1024,7 @@ mod tests {
             .expect("should get first frame of buffer B");
         assert_eq!(
             frame[0],
-            Sample(222),
+            SendspinSample(222),
             "buffer B should play from the start (no skip needed)"
         );
     }
@@ -998,7 +1035,7 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 (480 stereo frames)
-        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        let samples_a: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(111)).collect();
         queue.push(AudioBuffer {
             timestamp: 0,
             play_at: Instant::now(),
@@ -1008,7 +1045,7 @@ mod tests {
         assert_eq!(queue.queue.len(), 1);
 
         // Buffer B: 10ms at ts=5000 (5ms) — overlaps A's range [0, 10000)
-        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let samples_b: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(222)).collect();
         queue.push(AudioBuffer {
             timestamp: 5_000,
             play_at: Instant::now(),
@@ -1018,7 +1055,7 @@ mod tests {
 
         // Should replace A, not add a second entry
         assert_eq!(queue.queue.len(), 1);
-        assert_eq!(queue.queue[0].samples[0], Sample(222));
+        assert_eq!(queue.queue[0].samples[0], SendspinSample(222));
     }
 
     #[test]
@@ -1028,8 +1065,8 @@ mod tests {
 
         // Two adjacent 5ms chunks (240 stereo frames each).
         // Chunk A: [0, 5000), Chunk B: [5000, 10000) — no overlap.
-        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
-        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
+        let samples_a: Vec<SendspinSample> = (0..240 * 2).map(|_| SendspinSample(111)).collect();
+        let samples_b: Vec<SendspinSample> = (0..240 * 2).map(|_| SendspinSample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -1056,9 +1093,9 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 — range [0, 10000)
-        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        let samples_a: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(111)).collect();
         // Buffer B: 10ms at ts=12000 — range [12000, 22000). No overlap with A.
-        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let samples_b: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -1078,7 +1115,7 @@ mod tests {
         // Overlaps both A (9000 < 10000 && 0 < 29000) and B (9000 < 22000 && 12000 < 29000).
         // Both stale buffers should be removed — the server will send fresh
         // data for any gaps. Keeping either would cause duplicate audio.
-        let samples_c: Vec<Sample> = (0..960 * 2).map(|_| Sample(333)).collect();
+        let samples_c: Vec<SendspinSample> = (0..960 * 2).map(|_| SendspinSample(333)).collect();
         queue.push(AudioBuffer {
             timestamp: 9_000,
             play_at: Instant::now(),
@@ -1088,7 +1125,7 @@ mod tests {
 
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
-        assert_eq!(queue.queue[0].samples[0], Sample(333));
+        assert_eq!(queue.queue[0].samples[0], SendspinSample(333));
     }
 
     #[test]
@@ -1103,9 +1140,10 @@ mod tests {
         // so it ends at 50000 which is NOT < cursor (50000), surviving
         // the stale-drop. But the skip logic sees ts=49000 < cursor=50000
         // and tries to skip 1ms (48 frames) — exactly the buffer length.
-        let short_samples: Vec<Sample> = (0..48 * 2).map(|_| Sample(111)).collect();
+        let short_samples: Vec<SendspinSample> = (0..48 * 2).map(|_| SendspinSample(111)).collect();
         // Buffer that starts at cursor: 10ms at ts=50000
-        let ahead_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let ahead_samples: Vec<SendspinSample> =
+            (0..480 * 2).map(|_| SendspinSample(222)).collect();
 
         queue.initialized = true;
         queue.cursor_us = 50_000;
@@ -1130,7 +1168,7 @@ mod tests {
             .expect("should return a frame from the next buffer, not panic");
         assert_eq!(
             frame[0],
-            Sample(222),
+            SendspinSample(222),
             "expected frame from the ahead buffer"
         );
     }

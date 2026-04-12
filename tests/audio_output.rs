@@ -1,5 +1,5 @@
 use sendspin::audio::output::{AudioOutput, CpalOutput};
-use sendspin::audio::{AudioFormat, Codec, Sample};
+use sendspin::audio::{AudioFormat, Codec, SendspinSample};
 use std::sync::Arc;
 
 #[test]
@@ -30,7 +30,7 @@ fn test_audio_output_write() {
     let mut output = CpalOutput::new(format).unwrap();
 
     // Create some test samples (silence)
-    let samples: Vec<Sample> = vec![Sample::ZERO; 960]; // 10ms at 48kHz stereo
+    let samples: Vec<SendspinSample> = vec![SendspinSample::ZERO; 960]; // 10ms at 48kHz stereo
     let samples_arc = Arc::from(samples.into_boxed_slice());
 
     // Should be able to write without error

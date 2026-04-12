@@ -1,5 +1,5 @@
 // ABOUTME: Core audio type definitions
-// ABOUTME: Sample (24-bit), AudioFormat, AudioBuffer for zero-copy audio data
+// ABOUTME: SendspinSample (24-bit), AudioFormat, AudioBuffer for zero-copy audio data
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,9 +8,9 @@ use std::time::Instant;
 /// Range: -8388608 to 8388607 (±2^23)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct Sample(pub i32);
+pub struct SendspinSample(pub i32);
 
-impl Sample {
+impl SendspinSample {
     /// Maximum valid 24-bit sample value (2^23 - 1)
     pub const MAX: Self = Self(8_388_607);
     /// Minimum valid 24-bit sample value (-2^23)
@@ -130,7 +130,7 @@ pub struct AudioBuffer {
     /// [`SyncedPlayer`](crate::audio::SyncedPlayer) which computes timing from `timestamp`.
     pub play_at: Instant,
     /// Immutable, shareable sample data.
-    pub samples: Arc<[Sample]>,
+    pub samples: Arc<[SendspinSample]>,
     /// Audio format specification.
     pub format: AudioFormat,
 }

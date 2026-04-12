@@ -1,5 +1,5 @@
 use sendspin::audio::decode::{Decoder, PcmDecoder};
-use sendspin::audio::Sample;
+use sendspin::audio::SendspinSample;
 
 #[test]
 fn test_decode_pcm_16bit() {
@@ -35,8 +35,8 @@ fn test_decode_pcm_24bit() {
     let samples = decoder.decode(&data).unwrap();
 
     assert_eq!(samples.len(), 2);
-    assert_eq!(samples[0], Sample(4096));
-    assert_eq!(samples[1], Sample(-1));
+    assert_eq!(samples[0], SendspinSample(4096));
+    assert_eq!(samples[1], SendspinSample(-1));
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn test_decode_pcm_24bit_misaligned_trailing_bytes_dropped() {
     let data = vec![0x00, 0x10, 0x00, 0xAB, 0xCD];
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample(4096));
+    assert_eq!(samples[0], SendspinSample(4096));
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn test_decode_pcm_24bit_single_sample_max() {
     let data = vec![0xFF, 0xFF, 0x7F];
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample::MAX);
+    assert_eq!(samples[0], SendspinSample::MAX);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn test_decode_pcm_24bit_single_sample_min() {
     let data = vec![0x00, 0x00, 0x80]; // -8388608 in 24-bit LE
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample::MIN);
+    assert_eq!(samples[0], SendspinSample::MIN);
 }
 
 #[test]
