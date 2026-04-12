@@ -1,7 +1,9 @@
 // ABOUTME: Clock synchronization implementation
 // ABOUTME: Drift-aware time sync with RTT estimation and server/client time conversion
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use super::raw_clock::{Clock, DefaultClock};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const ADAPTIVE_FORGETTING_CUTOFF: f64 = 0.75;
 
@@ -183,7 +185,6 @@ pub enum SyncQuality {
 }
 
 /// Clock synchronization state
-#[derive(Debug)]
 pub struct ClockSync {
     /// Last known RTT in microseconds
     rtt_micros: Option<i64>,
@@ -191,23 +192,45 @@ pub struct ClockSync {
     last_update: Option<Instant>,
     /// Drift-aware time filter
     filter: TimeFilter,
+    /// Raw monotonic clock used for timestamps
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for ClockSync {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClockSync")
+            .field("rtt_micros", &self.rtt_micros)
+            .field("last_update", &self.last_update)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 impl ClockSync {
-    /// Create a new clock synchronization instance
-    pub fn new() -> Self {
+    /// Create a new clock synchronization instance with the given clock.
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             rtt_micros: None,
             last_update: None,
             filter: TimeFilter::new(0.01, 1.001),
+            clock,
         }
     }
 
-    /// Update clock sync with new measurement
-    /// t1 = client_transmitted (Unix µs)
-    /// t2 = server_received (server loop µs)
-    /// t3 = server_transmitted (server loop µs)
-    /// t4 = client_received (Unix µs)
+    /// Get a clone of the underlying clock.
+    ///
+    /// Useful for generating timestamps (t1, t4) in the same timebase
+    /// that the filter operates on, without holding the `ClockSync` lock.
+    pub fn clock(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
+    /// Update clock sync with new measurement.
+    ///
+    /// - `t1` = client_transmitted (raw monotonic µs from [`Clock::now_micros`])
+    /// - `t2` = server_received (server loop µs)
+    /// - `t3` = server_transmitted (server loop µs)
+    /// - `t4` = client_received (raw monotonic µs from [`Clock::now_micros`])
     pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
         // RTT = (t4 - t1) - (t3 - t2)
         let rtt = (t4 - t1) - (t3 - t2);
@@ -271,33 +294,12 @@ impl ClockSync {
     }
 
     fn client_micros_to_instant(&self, client_micros: i64) -> Option<Instant> {
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_micros() as i64;
-        let now_instant = Instant::now();
-        let delta_micros = client_micros - now_unix;
-
-        if delta_micros >= 0 {
-            Some(now_instant + Duration::from_micros(delta_micros as u64))
-        } else {
-            now_instant.checked_sub(Duration::from_micros((-delta_micros) as u64))
-        }
+        self.clock.micros_to_instant(client_micros)
     }
 
-    /// Convert a local Instant to client Unix microseconds.
-    pub fn instant_to_client_micros(&self, instant: Instant) -> Option<i64> {
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_micros() as i64;
-        let now_instant = Instant::now();
-        let delta_micros = if instant >= now_instant {
-            instant.duration_since(now_instant).as_micros() as i64
-        } else {
-            -(now_instant.duration_since(instant).as_micros() as i64)
-        };
-        Some(now_unix + delta_micros)
+    /// Convert a local Instant to client clock microseconds.
+    pub fn instant_to_client_micros(&self, instant: Instant) -> i64 {
+        self.clock.instant_to_micros(instant)
     }
 
     /// Get sync quality based on RTT
@@ -309,7 +311,13 @@ impl ClockSync {
         }
     }
 
-    /// Check if sync is stale (>5 seconds old)
+    /// Check if sync is stale (>5 seconds since last update).
+    ///
+    /// Uses `Instant::now()` (not the injected [`Clock`]) because staleness
+    /// is a wall-clock concept — we're measuring real elapsed time since the
+    /// last successful sync round, regardless of which timebase the filter
+    /// operates on. This means `is_stale()` always reflects real time even
+    /// when a mock clock is injected for testing.
     pub fn is_stale(&self) -> bool {
         match self.last_update {
             Some(last) => last.elapsed() > Duration::from_secs(5),
@@ -325,7 +333,7 @@ impl ClockSync {
 
 impl Default for ClockSync {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(DefaultClock::new()))
     }
 }
 

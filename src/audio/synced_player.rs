@@ -247,6 +247,7 @@ impl SyncedPlayer {
     /// # use parking_lot::Mutex;
     /// # use sendspin::audio::{AudioFormat, Codec, SyncedPlayer};
     /// # use sendspin::sync::ClockSync;
+    /// # use sendspin::DefaultClock;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let format = AudioFormat {
     ///     codec: Codec::Pcm,
@@ -255,7 +256,7 @@ impl SyncedPlayer {
     ///     bit_depth: 24,
     ///     codec_header: None,
     /// };
-    /// let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+    /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
     /// let player = SyncedPlayer::with_process_callback(
     ///     format, clock_sync, None,
     ///     100, false,
@@ -511,17 +512,14 @@ impl SyncedPlayer {
                             }
 
                             if schedule.reanchor || force_reanchor {
-                                if let Some(client_micros) =
-                                    sync.instant_to_client_micros(playback_instant)
+                                let client_micros = sync.instant_to_client_micros(playback_instant);
+                                if let Some(server_time) =
+                                    sync.client_to_server_micros(client_micros)
                                 {
-                                    if let Some(server_time) =
-                                        sync.client_to_server_micros(client_micros)
-                                    {
-                                        let mut queue = queue.lock();
-                                        queue.cursor_us = server_time;
-                                        queue.cursor_remainder = 0;
-                                        queue.force_reanchor = false;
-                                    }
+                                    let mut queue = queue.lock();
+                                    queue.cursor_us = server_time;
+                                    queue.cursor_remainder = 0;
+                                    queue.force_reanchor = false;
                                 }
                                 schedule = CorrectionSchedule::default();
                                 insert_counter = 0;
