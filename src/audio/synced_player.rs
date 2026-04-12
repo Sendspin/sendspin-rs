@@ -419,7 +419,7 @@ impl SyncedPlayer {
         macro_rules! output_stream {
             ($sample:ty) => {
                 device.build_output_stream(
-                    config,
+                    config.clone(),
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
                         // Read all queue state in a single lock to avoid
                         // a TOCTOU window between generation and cursor reads.
@@ -453,8 +453,8 @@ impl SyncedPlayer {
                         let ts = info.timestamp();
                         let playback_delta = ts
                             .playback
-                            .duration_since(&ts.callback)
-                            .unwrap_or(Duration::ZERO);
+                            .duration_since(ts.callback);
+                            // .unwrap_or(Duration::ZERO);
                         let playback_instant = callback_instant + playback_delta;
 
                         // try_lock: skip sync if contended rather than blocking
