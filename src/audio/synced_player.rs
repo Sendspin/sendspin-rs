@@ -7,7 +7,7 @@ use crate::audio::{AudioBuffer, AudioFormat, SendspinSample};
 use crate::error::Error;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, FromSample, Sample, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -421,6 +421,7 @@ impl SyncedPlayer {
                 device.build_output_stream(
                     config.clone(),
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                        let mut f32_buffer = vec![];
                         // Read all queue state in a single lock to avoid
                         // a TOCTOU window between generation and cursor reads.
                         // After clear(), force_reanchor is true but cursor_us
@@ -551,6 +552,7 @@ impl SyncedPlayer {
                             return;
                         }
 
+                        f32_buffer.resize(data.len(), 0.0);
                         {
                             let mut queue = queue.lock();
                             let frames = data.len() / channels;
@@ -567,12 +569,12 @@ impl SyncedPlayer {
                                         if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                             last_frame.copy_from_slice(frame);
                                             for sample in frame {
-                                                data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                                f32_buffer[out_index] = sample.to_f32();
                                                 out_index += 1;
                                             }
                                         } else {
                                             for sample in &last_frame {
-                                                data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                                f32_buffer[out_index] = sample.to_f32();
                                                 out_index += 1;
                                             }
                                         }
@@ -585,7 +587,7 @@ impl SyncedPlayer {
                                     if insert_counter == 0 {
                                         insert_counter = schedule.insert_every_n_frames;
                                         for sample in &last_frame {
-                                            data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                            f32_buffer[out_index] = sample.to_f32();
                                             out_index += 1;
                                         }
                                         continue;
@@ -595,13 +597,12 @@ impl SyncedPlayer {
                                 if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                     last_frame.copy_from_slice(frame);
                                     for sample in frame {
-                                        data[out_index] = <$sample>::from_sample(sample.to_f32());
+                                        f32_buffer[out_index] = sample.to_f32();
                                         out_index += 1;
                                     }
                                 } else {
                                     for _ in 0..channels {
-                                        data[out_index] = <$sample>::from_sample(0.0);
-
+                                        f32_buffer[out_index] = 0.0;
                                         out_index += 1;
                                     }
                                 }
@@ -610,12 +611,14 @@ impl SyncedPlayer {
 
                         // Apply gain with per-frame ramping
                         let target = cb_config.gain_control.target_gain();
-                        let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
-                        gain_ramp.apply(f32_data.as_mut_slice(), channels, target);
+                        gain_ramp.apply(&mut f32_buffer, channels, target);
 
                         if let Some(ref mut cb) = cb_config.process_callback {
-                            // Convert to f32 for the callback since it expects &mut [f32]
-                            cb(&mut f32_data);
+                            cb(&mut f32_buffer);
+                        }
+
+                        for (i, &f) in f32_buffer.iter().enumerate() {
+                            data[i] = <$sample>::from_sample(f);
                         }
                     },
                     move |err| {
