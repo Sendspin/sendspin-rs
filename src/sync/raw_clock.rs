@@ -85,6 +85,7 @@ pub struct DefaultClock {
     /// platforms where we derive microseconds from `Instant` arithmetic.
     /// On Linux this field is unused (we read `CLOCK_MONOTONIC_RAW` directly),
     /// but the cost of a single `Instant` isn't worth a `cfg` attr.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     epoch: Instant,
 }
 
@@ -141,7 +142,7 @@ impl Clock for DefaultClock {
                 );
             }
         }
-        ts.tv_sec as i64 * 1_000_000 + ts.tv_nsec as i64 / 1_000
+        ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000
     }
 
     #[cfg(not(target_os = "linux"))]
