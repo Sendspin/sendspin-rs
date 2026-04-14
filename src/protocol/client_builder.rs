@@ -6,11 +6,12 @@ use crate::protocol::messages::{
     PlayerState, PlayerV1Support, VisualizerV1Support,
 };
 use crate::ProtocolClient;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use typed_builder::TypedBuilder;
 
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
-pub struct ProtocolClientBuilderRaw {
+pub(crate) struct ProtocolClientBuilderRaw {
     client_id: String,
     name: String,
     product_name: Option<String>,
@@ -157,21 +158,29 @@ impl ProtocolClientBuilder {
         self.player_v1_support.as_ref()
     }
 
-    /// Connect to Sendspin server
-    pub async fn connect(self, url: &str) -> Result<ProtocolClient, Error> {
+    /// Connect to Sendspin server.
+    ///
+    /// Accepts anything that implements [`IntoClientRequest`], such as a URL string
+    /// for simple connections. For custom headers (for example, auth cookies), callers
+    /// will typically build an `http::Request<()>` — see the [`IntoClientRequest`] docs
+    /// for the full set of supported request types.
+    pub async fn connect<R: IntoClientRequest + Unpin>(
+        self,
+        request: R,
+    ) -> Result<ProtocolClient, Error> {
         let hello = ClientHello {
-            client_id: self.client_id.clone(),
-            name: self.name.clone(),
+            client_id: self.client_id,
+            name: self.name,
             version: 1,
-            supported_roles: self.supported_roles.clone(),
+            supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
-                product_name: self.product_name.clone(),
-                manufacturer: Some(self.manufacturer.unwrap_or("Sendspin".to_string())),
-                software_version: self.software_version.clone(),
+                product_name: self.product_name,
+                manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),
+                software_version: self.software_version,
             }),
-            player_v1_support: self.player_v1_support.clone(),
-            artwork_v1_support: self.artwork_v1_support.clone(),
-            visualizer_v1_support: self.visualizer_v1_support.clone(),
+            player_v1_support: self.player_v1_support,
+            artwork_v1_support: self.artwork_v1_support,
+            visualizer_v1_support: self.visualizer_v1_support,
         };
 
         let initial_state = ClientState {
@@ -179,6 +188,6 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        ProtocolClient::connect(url, hello, Some(initial_state)).await
+        ProtocolClient::connect(request, hello, initial_state).await
     }
 }

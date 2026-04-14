@@ -61,19 +61,16 @@ sendspin = "0.1"
 ### Basic Client Example
 
 ```rust
-use sendspin::protocol::messages::{ClientHello, DeviceInfo};
-use sendspin::protocol::client::ProtocolClient;
+use sendspin::ProtocolClientBuilder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let hello = ClientHello {
-        client_id: uuid::Uuid::new_v4().to_string(),
-        name: "My Player".to_string(),
-        version: 1,
-        // ... configure device info and capabilities
-    };
-
-    let client = ProtocolClient::connect("ws://localhost:8080/sendspin", hello).await?;
+    let client = ProtocolClientBuilder::builder()
+        .client_id(uuid::Uuid::new_v4().to_string())
+        .name("My Player".to_string())
+        .build()
+        .connect("ws://localhost:8080/sendspin")
+        .await?;
 
     // Client is now connected and ready to receive audio
 
