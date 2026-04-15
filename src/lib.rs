@@ -19,6 +19,7 @@ pub mod scheduler;
 /// Clock synchronization utilities
 pub mod sync;
 
+pub use audio::GainControl;
 pub use protocol::client::{Connection, Controller, ProtocolClient};
 pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::messages::ServerHello;
