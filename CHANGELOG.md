@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/Sendspin/sendspin-rs/compare/v0.1.2...v0.2.0) - 2026-04-16
+
+### Added
+
+- [**breaking**] Use raw monotonic clock for NTP-immune time sync ([#42](https://github.com/Sendspin/sendspin-rs/pull/42))
+- Expose GainControl for standalone use ([#39](https://github.com/Sendspin/sendspin-rs/pull/39))
+- [**breaking**] narrow public API surface — builder is the sole entry point ([#36](https://github.com/Sendspin/sendspin-rs/pull/36))
+- Harden audio pipeline against silent data loss and malformed input ([#40](https://github.com/Sendspin/sendspin-rs/pull/40))
+- [**breaking**] Add controller role support ([#35](https://github.com/Sendspin/sendspin-rs/pull/35))
+- [**breaking**] Implement graceful disconnect and initial client state in builder ([#34](https://github.com/Sendspin/sendspin-rs/pull/34))
+- [**breaking**] align protocol message types with Sendspin spec ([#31](https://github.com/Sendspin/sendspin-rs/pull/31))
+
+### Other
+
+- *(sync/clock)* add regression tests for time filter monotonicity guard ([#38](https://github.com/Sendspin/sendspin-rs/pull/38))
+- Fix time filter monotonicity guard (== -> <=) ([#37](https://github.com/Sendspin/sendspin-rs/pull/37))
+
 ## [0.1.2](https://github.com/Sendspin/sendspin-rs/compare/v0.1.1...v0.1.2) - 2026-03-16
 
 ### Other
