@@ -51,14 +51,13 @@ async fn start_test_server() -> (
 
         // Forward all subsequent messages to the channel
         while let Some(Ok(msg)) = ws.next().await {
-            match msg {
-                WsMessage::Text(text) => {
-                    if tx.send(text).is_err() {
-                        break;
-                    }
-                }
+            let text = match msg {
+                WsMessage::Text(text) => text,
                 WsMessage::Close(_) => break,
-                _ => {}
+                _ => continue,
+            };
+            if tx.send(text).is_err() {
+                break;
             }
         }
     });
@@ -450,14 +449,13 @@ async fn start_test_server_with_roles(
         ws.send(WsMessage::Text(server_hello)).await.unwrap();
 
         while let Some(Ok(msg)) = ws.next().await {
-            match msg {
-                WsMessage::Text(text) => {
-                    if tx.send(text).is_err() {
-                        break;
-                    }
-                }
+            let text = match msg {
+                WsMessage::Text(text) => text,
                 WsMessage::Close(_) => break,
-                _ => {}
+                _ => continue,
+            };
+            if tx.send(text).is_err() {
+                break;
             }
         }
     });

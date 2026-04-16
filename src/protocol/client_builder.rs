@@ -5,7 +5,9 @@ use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
     PlayerState, PlayerV1Support, VisualizerV1Support,
 };
+use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use typed_builder::TypedBuilder;
 
@@ -78,6 +80,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             software_version: raw.software_version,
             supported_roles,
             player_v1_support,
+            clock: Arc::new(DefaultClock::new()),
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
             initial_player_state: raw.initial_player_state,
@@ -140,6 +143,7 @@ pub struct ProtocolClientBuilder {
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_player_state: Option<PlayerState>,
+    clock: Arc<dyn Clock>,
 }
 
 impl ProtocolClientBuilder {
@@ -156,6 +160,17 @@ impl ProtocolClientBuilder {
     /// Get the player v1 support configuration
     pub fn player_v1_support(&self) -> Option<&PlayerV1Support> {
         self.player_v1_support.as_ref()
+    }
+
+    /// Override the default clock with a custom implementation.
+    ///
+    /// By default, the builder uses [`DefaultClock`] which reads
+    /// `CLOCK_MONOTONIC_RAW` on Linux (immune to NTP slew) and the
+    /// platform's native raw monotonic source elsewhere. Override this
+    /// for testing or for platforms with alternative high-precision clocks.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Connect to Sendspin server.
@@ -188,6 +203,6 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        ProtocolClient::connect(request, hello, initial_state).await
+        ProtocolClient::connect(request, hello, initial_state, self.clock).await
     }
 }

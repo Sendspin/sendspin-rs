@@ -6,6 +6,7 @@ use crate::protocol::messages::{
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime, ControllerCommand,
     ControllerCommandType, GoodbyeReason, Message, RepeatMode,
 };
+use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
 use futures_util::{
     stream::{SplitSink, SplitStream},
@@ -13,7 +14,6 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -417,6 +417,7 @@ impl ProtocolClient {
         request: R,
         hello: ClientHello,
         initial_state: ClientState,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
@@ -516,11 +517,12 @@ impl ProtocolClient {
         let (visualizer_tx, visualizer_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
 
-        let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let ws_tx = Arc::new(tokio::sync::Mutex::new(write));
 
         // Spawn message router task
         let clock_sync_clone = Arc::clone(&clock_sync);
+        let clock_router = Arc::clone(&clock);
         let router_handle = tokio::spawn(async move {
             Self::message_router(
                 read_temp,
@@ -529,6 +531,7 @@ impl ProtocolClient {
                 visualizer_tx,
                 message_tx,
                 clock_sync_clone,
+                clock_router,
             )
             .await;
         });
@@ -548,13 +551,7 @@ impl ProtocolClient {
                     // Acquire the write lock in a block so it's always
                     // released before sleeping, even on error paths.
                     let mut tx = ws_tx_sync.lock().await;
-                    let t1 = match SystemTime::now().duration_since(UNIX_EPOCH) {
-                        Ok(d) => d.as_micros() as i64,
-                        Err(e) => {
-                            log::warn!("Clock before Unix epoch, skipping sync send: {}", e);
-                            break 'send false;
-                        }
-                    };
+                    let t1 = clock.now_micros();
                     let msg = Message::ClientTime(ClientTime {
                         client_transmitted: t1,
                     });
@@ -608,6 +605,7 @@ impl ProtocolClient {
         visualizer_tx: UnboundedSender<VisualizerChunk>,
         message_tx: UnboundedSender<Message>,
         clock_sync: Arc<Mutex<ClockSync>>,
+        clock: Arc<dyn Clock>,
     ) {
         let mut audio_closed = false;
         let mut artwork_closed = false;
@@ -668,7 +666,7 @@ impl ProtocolClient {
                 Ok(WsMessage::Text(text)) => {
                     // Capture receive time before deserialization so
                     // t4 is as close to the true arrival time as possible.
-                    let receive_time = SystemTime::now();
+                    let t4 = clock.now_micros();
                     log::debug!("Received text message: {}", text);
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
@@ -677,23 +675,12 @@ impl ProtocolClient {
                             // and intentionally NOT forwarded to message_rx
                             // consumers — it's an internal protocol detail.
                             if let Message::ServerTime(ref st) = msg {
-                                match receive_time.duration_since(UNIX_EPOCH) {
-                                    Ok(d) => {
-                                        let t4 = d.as_micros() as i64;
-                                        clock_sync.lock().update(
-                                            st.client_transmitted,
-                                            st.server_received,
-                                            st.server_transmitted,
-                                            t4,
-                                        );
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "Clock before Unix epoch, skipping sync sample: {}",
-                                            e
-                                        );
-                                    }
-                                }
+                                clock_sync.lock().update(
+                                    st.client_transmitted,
+                                    st.server_received,
+                                    st.server_transmitted,
+                                    t4,
+                                );
                             } else if !message_closed && message_tx.send(msg).is_err() {
                                 log::error!(
                                     "Message receiver dropped — messages will be discarded"
