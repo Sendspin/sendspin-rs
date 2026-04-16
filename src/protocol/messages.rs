@@ -224,7 +224,7 @@ pub enum ConnectionReason {
 /// Client time sync message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientTime {
-    /// Client transmission timestamp (Unix microseconds)
+    /// Client transmission timestamp (raw monotonic microseconds)
     pub client_transmitted: i64,
 }
 

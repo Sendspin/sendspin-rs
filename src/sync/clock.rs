@@ -261,7 +261,7 @@ impl ClockSync {
         self.rtt_micros
     }
 
-    /// Convert server loop microseconds to client Unix microseconds
+    /// Convert server loop microseconds to client clock microseconds
     pub fn server_to_client_micros(&self, server_micros: i64) -> Option<i64> {
         if !self.filter.is_synchronized() {
             return None;
@@ -269,7 +269,7 @@ impl ClockSync {
         self.filter.compute_client_time(server_micros)
     }
 
-    /// Convert client Unix microseconds to server loop microseconds
+    /// Convert client clock microseconds to server loop microseconds
     pub fn client_to_server_micros(&self, client_micros: i64) -> Option<i64> {
         if !self.filter.is_synchronized() {
             return None;
