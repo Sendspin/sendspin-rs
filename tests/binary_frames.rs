@@ -197,6 +197,31 @@ fn test_visualizer_chunk_wrong_type() {
     assert!(result.is_err());
 }
 
+#[test]
+fn test_visualizer_chunk_minimum_valid() {
+    // Exactly 9 bytes — type byte + 8-byte timestamp with no FFT payload —
+    // is the smallest legal visualizer frame and must parse successfully.
+    // This is the lower bound of the length guard; a frame of exactly 9
+    // bytes is *valid*, not too-short.
+    let frame: Vec<u8> = vec![
+        0x10, // Type: visualizer
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, // Timestamp: 42
+    ];
+    let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
+    assert_eq!(chunk.timestamp, 42);
+    assert!(chunk.data.is_empty());
+}
+
+#[test]
+fn test_visualizer_chunk_too_short() {
+    // 8 bytes — type byte + partial timestamp — is one byte short of a
+    // valid frame and must be rejected. Paired with the 9-byte
+    // minimum-valid test above, these pin both sides of the length guard.
+    let frame: Vec<u8> = vec![0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+    let result = VisualizerChunk::from_bytes(&frame);
+    assert!(result.is_err());
+}
+
 // =============================================================================
 // Binary Frame Dispatch Tests
 // =============================================================================

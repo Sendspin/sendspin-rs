@@ -211,4 +211,55 @@ mod tests {
         );
         assert_eq!(schedule.drop_every_n_frames, 0);
     }
+
+    // -- Exact interval values --
+    //
+    // The tests above only check *which* field is set (drop vs insert).
+    // These pin down the actual interval arithmetic: `frames_error`, the
+    // `desired` / `max` corrections_per_sec cap, and the `interval_frames`
+    // rounding. Checking a single "correction engaged" bit lets the
+    // arithmetic drift silently; checking the computed cadence doesn't.
+
+    #[test]
+    fn test_drop_interval_below_speed_cap_matches_spec() {
+        // 5ms error at 48 kHz, already correcting (deadband threshold):
+        //   frames_error                = 5000 * 48000 / 1_000_000 = 240 frames
+        //   desired_corrections_per_sec = 240 / 2.0                = 120
+        //   max_corrections_per_sec     = 48000 * 0.04             = 1920 (not binding)
+        //   interval_frames             = round(48000 / 120)       = 400
+        let planner = CorrectionPlanner::new();
+        let s = planner.plan(5_000, 48_000, true);
+        assert_eq!(
+            s.drop_every_n_frames, 400,
+            "5ms drift should produce drop every 400 frames"
+        );
+        assert_eq!(s.insert_every_n_frames, 0);
+    }
+
+    #[test]
+    fn test_insert_interval_below_speed_cap_matches_spec() {
+        // Mirror of the drop test with a negative error.
+        let planner = CorrectionPlanner::new();
+        let s = planner.plan(-5_000, 48_000, true);
+        assert_eq!(
+            s.insert_every_n_frames, 400,
+            "-5ms drift should produce insert every 400 frames"
+        );
+        assert_eq!(s.drop_every_n_frames, 0);
+    }
+
+    #[test]
+    fn test_drop_interval_hits_max_speed_cap() {
+        // 200ms error — large enough that the desired rate exceeds the cap:
+        //   frames_error                = 200000 * 48000 / 1_000_000 = 9600
+        //   desired_corrections_per_sec = 9600 / 2.0                 = 4800
+        //   max_corrections_per_sec     = 48000 * 0.04               = 1920 (binding)
+        //   interval_frames             = round(48000 / 1920)        = 25
+        let planner = CorrectionPlanner::new();
+        let s = planner.plan(200_000, 48_000, true);
+        assert_eq!(
+            s.drop_every_n_frames, 25,
+            "large drift should be capped at max speed correction (interval = 25 frames)"
+        );
+    }
 }
