@@ -870,4 +870,63 @@ mod tests {
             data[19]
         );
     }
+
+    #[test]
+    fn test_is_muted_reports_false_when_unmuted() {
+        // `is_muted()` must reflect both states. The other tests all exercise
+        // the `true` branch (asserting the *setter* took effect), so this one
+        // pins the `false` branch and the `true → false` transition.
+        let gc = GainControl::new(100, false);
+        assert!(!gc.is_muted());
+        gc.set_mute(true);
+        gc.set_mute(false);
+        assert!(
+            !gc.is_muted(),
+            "set_mute(false) should clear the muted flag"
+        );
+    }
+
+    #[test]
+    fn test_debug_includes_volume_and_mute_fields() {
+        // The custom `fmt::Debug` impl must expose volume and mute state so
+        // debug prints are actually useful. Pin the contract rather than
+        // relying on the impl staying in sync with its fields.
+        let gc = GainControl::new(42, true);
+        let s = format!("{:?}", gc);
+        assert!(s.contains("42"), "Debug output missing volume: {s}");
+        assert!(s.contains("true"), "Debug output missing mute state: {s}");
+    }
+
+    #[test]
+    fn test_apply_stereo_buffer_shorter_than_ramp() {
+        // Pins the `data.len() / channels` frame calculation: for a stereo
+        // buffer with fewer frames than `ramp_frames_remaining`, the split
+        // point must be `frames * channels`, not `data.len() * channels`
+        // (which would overrun the buffer) or any other arithmetic variant.
+        let mut ramp = GainRamp::new(1000, 1.0); // 20-frame ramp
+        let mut data = vec![1.0; 6]; // 3 stereo frames, well under the 20-frame ramp
+        ramp.apply(&mut data, 2, 0.0);
+
+        // All samples should have been touched by the ramp (gain < 1.0 as it
+        // decays toward 0.0). Paired left/right in each frame share a gain.
+        for i in 0..3 {
+            assert!(
+                data[i * 2] < 1.0 && data[i * 2] >= 0.0,
+                "frame {i} L out of expected range: {}",
+                data[i * 2]
+            );
+            assert!(
+                (data[i * 2] - data[i * 2 + 1]).abs() < 1e-6,
+                "frame {i} L/R differ: {} vs {}",
+                data[i * 2],
+                data[i * 2 + 1]
+            );
+        }
+
+        // Exactly 3 frames of ramp should have been consumed.
+        assert_eq!(
+            ramp.ramp_frames_remaining, 17,
+            "3 frames consumed from a 20-frame ramp should leave 17 remaining"
+        );
+    }
 }
