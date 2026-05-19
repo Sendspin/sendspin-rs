@@ -232,9 +232,9 @@ impl SyncedPlayer {
         device: Option<Device>,
         volume: u8,
         muted: bool,
-        buffer_frames: Option<u32>,
+        buffer_size: Option<u32>,
     ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, device, None, volume, muted, buffer_frames)
+        Self::build(format, clock_sync, device, None, volume, muted, buffer_size)
     }
 
     /// Create a player with a process callback for post-gain audio processing.
@@ -274,7 +274,15 @@ impl SyncedPlayer {
         muted: bool,
         callback: ProcessCallback,
     ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, device, Some(callback), volume, muted, None)
+        Self::build(
+            format,
+            clock_sync,
+            device,
+            Some(callback),
+            volume,
+            muted,
+            None,
+        )
     }
 
     fn build(
@@ -284,7 +292,7 @@ impl SyncedPlayer {
         process_callback: Option<ProcessCallback>,
         volume: u8,
         muted: bool,
-        buffer_frames: Option<u32>,
+        buffer_size: Option<u32>,
     ) -> Result<Self, Error> {
         if format.channels == 0 {
             return Err(Error::Output("channels must be > 0".to_string()));
@@ -302,7 +310,7 @@ impl SyncedPlayer {
         let config = StreamConfig {
             channels: format.channels as u16,
             sample_rate: cpal::SampleRate::from(format.sample_rate),
-            buffer_size: match buffer_frames {
+            buffer_size: match buffer_size {
                 Some(frames) => cpal::BufferSize::Fixed(frames),
                 None => cpal::BufferSize::Default,
             },
@@ -438,7 +446,7 @@ impl SyncedPlayer {
                 device.build_output_stream(
                     config.clone(),
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
-                        let mut f32_buffer = vec![];
+                    let mut f32_buffer = vec![];
                     // Read all queue state in a single lock to avoid
                     // a TOCTOU window between generation and cursor reads.
                     // After clear(), force_reanchor is true but cursor_us
