@@ -2,7 +2,7 @@
 // ABOUTME: Supports 16-bit and 24-bit PCM decoding with zero-copy where possible
 
 use crate::audio::decode::Decoder;
-use crate::audio::SendspinSample;
+use crate::audio::Sample;
 use crate::error::Error;
 use std::sync::Arc;
 
@@ -38,7 +38,7 @@ impl PcmDecoder {
 }
 
 impl Decoder for PcmDecoder {
-    fn decode(&self, data: &[u8]) -> Result<Arc<[SendspinSample]>, Error> {
+    fn decode(&self, data: &[u8]) -> Result<Arc<[Sample]>, Error> {
         let bytes_per_sample: usize = match self.bit_depth {
             16 => 2,
             24 => 3,
@@ -59,36 +59,36 @@ impl Decoder for PcmDecoder {
 
         match (self.bit_depth, self.endian) {
             (16, PcmEndian::Little) => {
-                let samples: Vec<SendspinSample> = data
+                let samples: Vec<Sample> = data
                     .chunks_exact(2)
                     .map(|c| {
                         let i16_val = i16::from_le_bytes([c[0], c[1]]);
-                        SendspinSample::from_i16(i16_val)
+                        Sample::from_i16(i16_val)
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (16, PcmEndian::Big) => {
-                let samples: Vec<SendspinSample> = data
+                let samples: Vec<Sample> = data
                     .chunks_exact(2)
                     .map(|c| {
                         let i16_val = i16::from_be_bytes([c[0], c[1]]);
-                        SendspinSample::from_i16(i16_val)
+                        Sample::from_i16(i16_val)
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (24, PcmEndian::Little) => {
-                let samples: Vec<SendspinSample> = data
+                let samples: Vec<Sample> = data
                     .chunks_exact(3)
-                    .map(|c| SendspinSample::from_i24_le([c[0], c[1], c[2]]))
+                    .map(|c| Sample::from_i24_le([c[0], c[1], c[2]]))
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (24, PcmEndian::Big) => {
-                let samples: Vec<SendspinSample> = data
+                let samples: Vec<Sample> = data
                     .chunks_exact(3)
-                    .map(|c| SendspinSample::from_i24_be([c[0], c[1], c[2]]))
+                    .map(|c| Sample::from_i24_be([c[0], c[1], c[2]]))
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }

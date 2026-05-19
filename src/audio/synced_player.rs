@@ -3,7 +3,7 @@
 
 use crate::audio::gain::{GainControl, GainRamp};
 use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
-use crate::audio::{AudioBuffer, AudioFormat, SendspinSample};
+use crate::audio::{AudioBuffer, AudioFormat, Sample as SendspinSample};
 use crate::error::Error;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -679,7 +679,7 @@ mod tests {
     // cannot run in CI.
 
     use super::PlaybackQueue;
-    use crate::audio::{AudioBuffer, AudioFormat, Codec, SendspinSample};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -706,7 +706,7 @@ mod tests {
     fn test_queue_clear_bumps_generation() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![SendspinSample::ZERO; 96];
+        let samples = vec![Sample::ZERO; 96];
         queue.push(AudioBuffer {
             timestamp: 1234,
             play_at: Instant::now(),
@@ -729,10 +729,8 @@ mod tests {
         // Use distinct sample values so we can verify which buffer was returned.
         // 4800 stereo frames at 48kHz = 100ms per buffer.
         // With cursor at 150ms, the first buffer (ts=0, ends at 100ms) is stale.
-        let stale_samples: Vec<SendspinSample> =
-            (0..4800 * 2).map(|_| SendspinSample(111)).collect();
-        let fresh_samples: Vec<SendspinSample> =
-            (0..4800 * 2).map(|_| SendspinSample(222)).collect();
+        let stale_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(111)).collect();
+        let fresh_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -751,14 +749,14 @@ mod tests {
         queue.initialized = true;
 
         // Copy the frame data so we can release the mutable borrow on queue.
-        let frame_data: Vec<SendspinSample> = queue
+        let frame_data: Vec<Sample> = queue
             .next_frame(2, 48_000)
             .expect("expected a frame")
             .to_vec();
         assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
         // Verify we got the fresh buffer's data, not the stale one
-        assert_eq!(frame_data[0], SendspinSample(222));
-        assert_eq!(frame_data[1], SendspinSample(222));
+        assert_eq!(frame_data[0], Sample(222));
+        assert_eq!(frame_data[1], Sample(222));
     }
 
     #[test]
@@ -768,7 +766,7 @@ mod tests {
 
         // Push out of order: 300, 100, 200
         for ts in [300_000i64, 100_000, 200_000] {
-            let samples = vec![SendspinSample(ts as i32); 48]; // 1ms of mono
+            let samples = vec![Sample(ts as i32); 48]; // 1ms of mono
             queue.push(AudioBuffer {
                 timestamp: ts,
                 play_at: Instant::now(),
@@ -810,7 +808,7 @@ mod tests {
 
         // 480 stereo frames = 10ms at 48kHz
         let num_frames = 480;
-        let samples = vec![SendspinSample::ZERO; num_frames * 2];
+        let samples = vec![Sample::ZERO; num_frames * 2];
         let start_ts = 1_000_000i64; // 1 second
         queue.push(AudioBuffer {
             timestamp: start_ts,
@@ -840,7 +838,7 @@ mod tests {
         let format = test_format();
 
         // Push one buffer to initialize the cursor
-        let samples = vec![SendspinSample::ZERO; 480 * 2]; // 10ms stereo
+        let samples = vec![Sample::ZERO; 480 * 2]; // 10ms stereo
         let start_ts = 1_000_000i64;
         queue.push(AudioBuffer {
             timestamp: start_ts,
@@ -869,8 +867,7 @@ mod tests {
 
         // Push a new buffer after the underrun. It should NOT be
         // dropped as stale — the cursor hasn't raced ahead.
-        let fresh_samples: Vec<SendspinSample> =
-            (0..480 * 2).map(|_| SendspinSample(999)).collect();
+        let fresh_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(999)).collect();
         queue.push(AudioBuffer {
             timestamp: cursor_after_drain, // starts right where we left off
             play_at: Instant::now(),
@@ -883,7 +880,7 @@ mod tests {
             .expect("buffer should not be dropped as stale");
         assert_eq!(
             frame[0],
-            SendspinSample(999),
+            Sample(999),
             "should get the fresh buffer, not stale data"
         );
     }
@@ -896,7 +893,7 @@ mod tests {
         assert!(!queue.initialized);
         assert_eq!(queue.cursor_us, 0);
 
-        let samples = vec![SendspinSample::ZERO; 96];
+        let samples = vec![Sample::ZERO; 96];
         queue.push(AudioBuffer {
             timestamp: 500_000,
             play_at: Instant::now(),
@@ -913,7 +910,7 @@ mod tests {
     fn test_push_does_not_regress_cursor_after_init() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![SendspinSample::ZERO; 96];
+        let samples = vec![Sample::ZERO; 96];
 
         // First buffer at 500ms — initializes cursor
         queue.push(AudioBuffer {
@@ -954,14 +951,14 @@ mod tests {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
 
-        let buf_a: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(111)).collect();
-        let buf_b: Vec<SendspinSample> = (0..2400 * 2)
+        let buf_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
+        let buf_b: Vec<Sample> = (0..2400 * 2)
             .map(|i| {
                 // First half (1200 frames) = 222, second half = 333
                 if i < 2400 {
-                    SendspinSample(222)
+                    Sample(222)
                 } else {
-                    SendspinSample(333)
+                    Sample(333)
                 }
             })
             .collect();
@@ -996,7 +993,7 @@ mod tests {
             .expect("should get a frame from buffer B");
         assert_eq!(
             frame[0],
-            SendspinSample(333),
+            Sample(333),
             "expected skip into second half of buffer B (past the overlap), \
              got first half — backward-timestamped audio was replayed"
         );
@@ -1010,8 +1007,8 @@ mod tests {
         let format = test_format();
 
         // 2400 frames = 50ms per buffer. Adjacent, non-overlapping.
-        let samples_a: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(111)).collect();
-        let samples_b: Vec<SendspinSample> = (0..2400 * 2).map(|_| SendspinSample(222)).collect();
+        let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
+        let samples_b: Vec<Sample> = (0..2400 * 2).map(|_| Sample(222)).collect();
 
         // Two consecutive, non-overlapping buffers.
         queue.push(AudioBuffer {
@@ -1038,7 +1035,7 @@ mod tests {
             .expect("should get first frame of buffer B");
         assert_eq!(
             frame[0],
-            SendspinSample(222),
+            Sample(222),
             "buffer B should play from the start (no skip needed)"
         );
     }
@@ -1049,7 +1046,7 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 (480 stereo frames)
-        let samples_a: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(111)).collect();
+        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
         queue.push(AudioBuffer {
             timestamp: 0,
             play_at: Instant::now(),
@@ -1059,7 +1056,7 @@ mod tests {
         assert_eq!(queue.queue.len(), 1);
 
         // Buffer B: 10ms at ts=5000 (5ms) — overlaps A's range [0, 10000)
-        let samples_b: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(222)).collect();
+        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
         queue.push(AudioBuffer {
             timestamp: 5_000,
             play_at: Instant::now(),
@@ -1069,7 +1066,7 @@ mod tests {
 
         // Should replace A, not add a second entry
         assert_eq!(queue.queue.len(), 1);
-        assert_eq!(queue.queue[0].samples[0], SendspinSample(222));
+        assert_eq!(queue.queue[0].samples[0], Sample(222));
     }
 
     #[test]
@@ -1079,8 +1076,8 @@ mod tests {
 
         // Two adjacent 5ms chunks (240 stereo frames each).
         // Chunk A: [0, 5000), Chunk B: [5000, 10000) — no overlap.
-        let samples_a: Vec<SendspinSample> = (0..240 * 2).map(|_| SendspinSample(111)).collect();
-        let samples_b: Vec<SendspinSample> = (0..240 * 2).map(|_| SendspinSample(222)).collect();
+        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
+        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -1107,9 +1104,9 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 — range [0, 10000)
-        let samples_a: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(111)).collect();
+        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
         // Buffer B: 10ms at ts=12000 — range [12000, 22000). No overlap with A.
-        let samples_b: Vec<SendspinSample> = (0..480 * 2).map(|_| SendspinSample(222)).collect();
+        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
@@ -1129,7 +1126,7 @@ mod tests {
         // Overlaps both A (9000 < 10000 && 0 < 29000) and B (9000 < 22000 && 12000 < 29000).
         // Both stale buffers should be removed — the server will send fresh
         // data for any gaps. Keeping either would cause duplicate audio.
-        let samples_c: Vec<SendspinSample> = (0..960 * 2).map(|_| SendspinSample(333)).collect();
+        let samples_c: Vec<Sample> = (0..960 * 2).map(|_| Sample(333)).collect();
         queue.push(AudioBuffer {
             timestamp: 9_000,
             play_at: Instant::now(),
@@ -1139,7 +1136,7 @@ mod tests {
 
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
-        assert_eq!(queue.queue[0].samples[0], SendspinSample(333));
+        assert_eq!(queue.queue[0].samples[0], Sample(333));
     }
 
     #[test]
@@ -1154,10 +1151,9 @@ mod tests {
         // so it ends at 50000 which is NOT < cursor (50000), surviving
         // the stale-drop. But the skip logic sees ts=49000 < cursor=50000
         // and tries to skip 1ms (48 frames) — exactly the buffer length.
-        let short_samples: Vec<SendspinSample> = (0..48 * 2).map(|_| SendspinSample(111)).collect();
+        let short_samples: Vec<Sample> = (0..48 * 2).map(|_| Sample(111)).collect();
         // Buffer that starts at cursor: 10ms at ts=50000
-        let ahead_samples: Vec<SendspinSample> =
-            (0..480 * 2).map(|_| SendspinSample(222)).collect();
+        let ahead_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
 
         queue.initialized = true;
         queue.cursor_us = 50_000;
@@ -1182,7 +1178,7 @@ mod tests {
             .expect("should return a frame from the next buffer, not panic");
         assert_eq!(
             frame[0],
-            SendspinSample(222),
+            Sample(222),
             "expected frame from the ahead buffer"
         );
     }

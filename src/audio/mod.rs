@@ -18,4 +18,4 @@ pub use gain::GainControl;
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
 pub use synced_player::{ProcessCallback, SyncedPlayer};
-pub use types::{AudioBuffer, AudioFormat, Codec, SendspinSample};
+pub use types::{AudioBuffer, AudioFormat, Codec, Sample};

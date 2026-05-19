@@ -8,9 +8,9 @@ use std::time::Instant;
 /// Range: -8388608 to 8388607 (±2^23)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(transparent)]
-pub struct SendspinSample(pub i32);
+pub struct Sample(pub i32);
 
-impl SendspinSample {
+impl Sample {
     /// Maximum valid 24-bit sample value (2^23 - 1)
     pub const MAX: Self = Self(8_388_607);
     /// Minimum valid 24-bit sample value (-2^23)
@@ -133,7 +133,7 @@ pub struct AudioBuffer {
     /// [`SyncedPlayer`](crate::audio::SyncedPlayer) which computes timing from `timestamp`.
     pub play_at: Instant,
     /// Immutable, shareable sample data.
-    pub samples: Arc<[SendspinSample]>,
+    pub samples: Arc<[Sample]>,
     /// Audio format specification.
     pub format: AudioFormat,
 }
