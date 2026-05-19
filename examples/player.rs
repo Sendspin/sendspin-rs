@@ -4,13 +4,10 @@
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
-use sendspin::protocol::messages::{
-    ClientState, ClientTime, Message, PlayerState, PlayerSyncState,
-};
+use sendspin::protocol::messages::{Message, PlayerState};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::interval;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -168,57 +165,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test = ProtocolClientBuilder::builder()
         .client_id(client_id)
         .name(args.name.clone())
+        .initial_player_state(PlayerState {
+            volume: Some(100),
+            muted: Some(false),
+            static_delay_ms: Some(0),
+            supported_commands: None,
+        })
         .build();
 
     let client = test.connect(&args.server).await?;
     println!("Connected!");
 
     // Split client into separate receivers for concurrent processing
-    let (mut message_rx, mut audio_rx, clock_sync, ws_tx, _guard) = client.split();
-
-    // Send initial client/state message (handshake step 3)
-    let client_state = Message::ClientState(ClientState {
-        player: Some(PlayerState {
-            state: PlayerSyncState::Synchronized,
-            volume: Some(100),
-            muted: Some(false),
-        }),
-    });
-    ws_tx.send_message(client_state).await?;
-    println!("Sent initial client/state");
-
-    // Send immediate initial clock sync
-    let client_transmitted = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as i64;
-    let time_msg = Message::ClientTime(ClientTime { client_transmitted });
-    ws_tx.send_message(time_msg).await?;
-    println!("Sent initial client/time for clock sync");
+    let conn = client.split();
+    let mut message_rx = conn.messages;
+    let mut audio_rx = conn.audio;
+    let clock_sync = conn.clock_sync;
+    let _guard = conn.guard;
 
     println!("Waiting for stream to start...");
-
-    // Spawn clock sync task that sends client/time every 5 seconds
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-
-            // Get current Unix epoch microseconds
-            let client_transmitted = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_micros() as i64;
-
-            let time_msg = Message::ClientTime(ClientTime { client_transmitted });
-
-            // Send time sync message
-            if let Err(e) = ws_tx.send_message(time_msg).await {
-                eprintln!("Failed to send time sync: {}", e);
-                break;
-            }
-        }
-    });
 
     // Configuration from environment variables
     let start_buffer_ms = env_u64("SS_PLAY_START_BUFFER_MS", 500);

@@ -2,15 +2,18 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientHello, DeviceInfo, PlayerV1Support,
-    VisualizerV1Support,
+    ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
+    PlayerState, PlayerV1Support, VisualizerV1Support,
 };
+use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
+use std::sync::Arc;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use typed_builder::TypedBuilder;
 
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
-pub struct ProtocolClientBuilderRaw {
+pub(crate) struct ProtocolClientBuilderRaw {
     client_id: String,
     name: String,
     product_name: Option<String>,
@@ -19,15 +22,23 @@ pub struct ProtocolClientBuilderRaw {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_player_state: Option<PlayerState>,
+    controller: bool,
 }
 
 impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
     fn from(raw: ProtocolClientBuilderRaw) -> Self {
         // Build supported_roles based on which supports are configured
         let mut supported_roles = Vec::new();
+        let has_explicit_role = raw.player_v1_support.is_some()
+            || raw.artwork_v1_support.is_some()
+            || raw.visualizer_v1_support.is_some()
+            || raw.controller;
 
-        // Default player support if not explicitly set
-        let player_v1_support = raw.player_v1_support.or_else(|| {
+        // Default to player@v1 if no roles were explicitly configured
+        let player_v1_support = if has_explicit_role {
+            raw.player_v1_support
+        } else {
             Some(PlayerV1Support {
                 supported_formats: vec![
                     AudioFormatSpec {
@@ -46,16 +57,19 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
                 buffer_capacity: 50 * 1024 * 1024,
                 supported_commands: vec!["volume".to_string(), "mute".to_string()],
             })
-        });
+        };
 
-        // Player role is always present (since we set a default)
-        supported_roles.push("player@v1".to_string());
-
+        if player_v1_support.is_some() {
+            supported_roles.push("player@v1".to_string());
+        }
         if raw.artwork_v1_support.is_some() {
             supported_roles.push("artwork@v1".to_string());
         }
         if raw.visualizer_v1_support.is_some() {
             supported_roles.push("visualizer@v1".to_string());
+        }
+        if raw.controller {
+            supported_roles.push("controller@v1".to_string());
         }
 
         ProtocolClientBuilder {
@@ -66,8 +80,10 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             software_version: raw.software_version,
             supported_roles,
             player_v1_support,
+            clock: Arc::new(DefaultClock::new()),
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
+            initial_player_state: raw.initial_player_state,
         }
     }
 }
@@ -90,6 +106,10 @@ pub struct ProtocolClientBuilderFields {
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
+    #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
+    initial_player_state: Option<PlayerState>,
+    #[builder(default = false, setter(transform = || true))]
+    controller: bool,
 }
 
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
@@ -103,6 +123,8 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
+            initial_player_state: fields.initial_player_state,
+            controller: fields.controller,
         };
         raw.into()
     }
@@ -120,6 +142,8 @@ pub struct ProtocolClientBuilder {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_player_state: Option<PlayerState>,
+    clock: Arc<dyn Clock>,
 }
 
 impl ProtocolClientBuilder {
@@ -138,22 +162,47 @@ impl ProtocolClientBuilder {
         self.player_v1_support.as_ref()
     }
 
-    /// Connect to Sendspin server
-    pub async fn connect(self, url: &str) -> Result<ProtocolClient, Error> {
+    /// Override the default clock with a custom implementation.
+    ///
+    /// By default, the builder uses [`DefaultClock`] which reads
+    /// `CLOCK_MONOTONIC_RAW` on Linux (immune to NTP slew) and the
+    /// platform's native raw monotonic source elsewhere. Override this
+    /// for testing or for platforms with alternative high-precision clocks.
+    pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Connect to Sendspin server.
+    ///
+    /// Accepts anything that implements [`IntoClientRequest`], such as a URL string
+    /// for simple connections. For custom headers (for example, auth cookies), callers
+    /// will typically build an `http::Request<()>` — see the [`IntoClientRequest`] docs
+    /// for the full set of supported request types.
+    pub async fn connect<R: IntoClientRequest + Unpin>(
+        self,
+        request: R,
+    ) -> Result<ProtocolClient, Error> {
         let hello = ClientHello {
-            client_id: self.client_id.clone(),
-            name: self.name.clone(),
+            client_id: self.client_id,
+            name: self.name,
             version: 1,
-            supported_roles: self.supported_roles.clone(),
+            supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
-                product_name: self.product_name.clone(),
-                manufacturer: Some(self.manufacturer.unwrap_or("Sendspin".to_string())),
-                software_version: self.software_version.clone(),
+                product_name: self.product_name,
+                manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),
+                software_version: self.software_version,
             }),
-            player_v1_support: self.player_v1_support.clone(),
-            artwork_v1_support: self.artwork_v1_support.clone(),
-            visualizer_v1_support: self.visualizer_v1_support.clone(),
+            player_v1_support: self.player_v1_support,
+            artwork_v1_support: self.artwork_v1_support,
+            visualizer_v1_support: self.visualizer_v1_support,
         };
-        ProtocolClient::connect(url, hello).await
+
+        let initial_state = ClientState {
+            state: Some(ClientSyncState::Synchronized),
+            player: self.initial_player_state,
+        };
+
+        ProtocolClient::connect(request, hello, initial_state, self.clock).await
     }
 }

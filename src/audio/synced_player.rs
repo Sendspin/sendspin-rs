@@ -247,6 +247,7 @@ impl SyncedPlayer {
     /// # use parking_lot::Mutex;
     /// # use sendspin::audio::{AudioFormat, Codec, SyncedPlayer};
     /// # use sendspin::sync::ClockSync;
+    /// # use sendspin::DefaultClock;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let format = AudioFormat {
     ///     codec: Codec::Pcm,
@@ -255,7 +256,7 @@ impl SyncedPlayer {
     ///     bit_depth: 24,
     ///     codec_header: None,
     /// };
-    /// let clock_sync = Arc::new(Mutex::new(ClockSync::new()));
+    /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
     /// let player = SyncedPlayer::with_process_callback(
     ///     format, clock_sync, None,
     ///     100, false,
@@ -424,7 +425,7 @@ impl SyncedPlayer {
         let mut drop_counter = 0u32;
         let mut started = false;
         let mut last_generation = 0u64;
-        let initial_gain = cb_config.gain_control.target_gain();
+        let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
 
         macro_rules! output_stream {
@@ -433,116 +434,114 @@ impl SyncedPlayer {
                     config.clone(),
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
                         let mut f32_buffer = vec![];
-                        // Read all queue state in a single lock to avoid
-                        // a TOCTOU window between generation and cursor reads.
-                        // After clear(), force_reanchor is true but cursor_us
-                        // is None (initialized=false), so the reanchor block
-                        // is normally skipped and the flag persists. If clear()
-                        // races with an in-flight reanchor, the flag can be
-                        // cleared early; next_frame() re-anchors from the
-                        // first buffer's timestamp in that case.
-                        let (generation, cursor_us, force_reanchor) = {
-                            let queue = queue.lock();
-                            let cursor = if queue.initialized {
-                                Some(queue.cursor_us)
-                            } else {
-                                None
-                            };
-                            (queue.generation, cursor, queue.force_reanchor)
+                    // Read all queue state in a single lock to avoid
+                    // a TOCTOU window between generation and cursor reads.
+                    // After clear(), force_reanchor is true but cursor_us
+                    // is None (initialized=false), so the reanchor block
+                    // is normally skipped and the flag persists. If clear()
+                    // races with an in-flight reanchor, the flag can be
+                    // cleared early; next_frame() re-anchors from the
+                    // first buffer's timestamp in that case.
+                    let (generation, cursor_us, force_reanchor) = {
+                        let queue = queue.lock();
+                        let cursor = if queue.initialized {
+                            Some(queue.cursor_us)
+                        } else {
+                            None
                         };
-                        if generation != last_generation {
-                            last_generation = generation;
-                            started = false;
-                            schedule = CorrectionSchedule::default();
-                            insert_counter = 0;
-                            drop_counter = 0;
-                            for sample in last_frame.iter_mut() {
-                                *sample = SendspinSample::ZERO;
+                        (queue.generation, cursor, queue.force_reanchor)
+                    };
+                    if generation != last_generation {
+                        last_generation = generation;
+                        started = false;
+                        schedule = CorrectionSchedule::default();
+                        insert_counter = 0;
+                        drop_counter = 0;
+                        for sample in last_frame.iter_mut() {
+                            *sample = SendspinSample::ZERO;
+                        }
+                    }
+
+                    let callback_instant = Instant::now();
+                    let ts = info.timestamp();
+                    let playback_delta = ts
+                        .playback
+                        .duration_since(ts.callback);
+                        // .unwrap_or(Duration::ZERO);
+                    let playback_instant = callback_instant + playback_delta;
+
+                    // try_lock: skip sync if contended rather than blocking
+                    // the audio thread. force_reanchor is sticky in the
+                    // queue, so it will be retried on the next callback.
+                    if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
+                        if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
+                            let early_window = Duration::from_millis(1);
+                            if !started && playback_instant + early_window < expected_instant {
+                                for sample in data.iter_mut() {
+                                    *sample =  <$sample>::from_sample(0.0);
+                                }
+                                let target = cb_config.gain_control.gain();
+                                let frames = data.len() / channels;
+                                gain_ramp.advance(frames, target);
+                                if let Some(ref mut cb) = cb_config.process_callback {
+                                    let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
+                                    cb(&mut f32_data);
+                                }
+                                return;
+                            }
+                            started = true;
+
+                            let error_us = if playback_instant >= expected_instant {
+                                playback_instant
+                                    .duration_since(expected_instant)
+                                    .as_micros() as i64
+                            } else {
+                                -(expected_instant
+                                    .duration_since(playback_instant)
+                                    .as_micros() as i64)
+                            };
+                            let new_schedule =
+                                planner.plan(error_us, sample_rate, schedule.is_correcting());
+                            if new_schedule != schedule {
+                                if new_schedule.is_correcting() != schedule.is_correcting() {
+                                    if new_schedule.is_correcting() {
+                                        log::debug!(
+                                            "Sync correction engaged: \
+                                             error={:.1}ms, insert_every={}, drop_every={}",
+                                            error_us as f64 / 1000.0,
+                                            new_schedule.insert_every_n_frames,
+                                            new_schedule.drop_every_n_frames,
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "Sync correction disengaged: \
+                                             error={:.1}ms",
+                                            error_us as f64 / 1000.0,
+                                        );
+                                    }
+                                }
+                                schedule = new_schedule;
+                                insert_counter = schedule.insert_every_n_frames;
+                                drop_counter = schedule.drop_every_n_frames;
+                            }
+
+                            if schedule.reanchor || force_reanchor {
+                                let client_micros = sync.instant_to_client_micros(playback_instant);
+                                if let Some(server_time) =
+                                    sync.client_to_server_micros(client_micros)
+                                {
+                                    let mut queue = queue.lock();
+                                    queue.cursor_us = server_time;
+                                    queue.cursor_remainder = 0;
+                                    queue.force_reanchor = false;
+                                }
+                                schedule = CorrectionSchedule::default();
+                                insert_counter = 0;
+                                drop_counter = 0;
                             }
                         }
+                    }
 
-                        let callback_instant = Instant::now();
-                        let ts = info.timestamp();
-                        let playback_delta = ts
-                            .playback
-                            .duration_since(ts.callback);
-                            // .unwrap_or(Duration::ZERO);
-                        let playback_instant = callback_instant + playback_delta;
-
-                        // try_lock: skip sync if contended rather than blocking
-                        // the audio thread. force_reanchor is sticky in the
-                        // queue, so it will be retried on the next callback.
-                        if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
-                            if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
-                                let early_window = Duration::from_millis(1);
-                                if !started && playback_instant + early_window < expected_instant {
-                                    for sample in data.iter_mut() {
-                                        *sample = <$sample>::from_sample(0.0);
-                                    }
-                                    let target = cb_config.gain_control.target_gain();
-                                    let frames = data.len() / channels;
-                                    gain_ramp.advance(frames, target);
-                                    if let Some(ref mut cb) = cb_config.process_callback {
-                                        let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
-                                        cb(&mut f32_data);
-                                    }
-                                    return;
-                                }
-                                started = true;
-
-                                let error_us = if playback_instant >= expected_instant {
-                                    playback_instant
-                                        .duration_since(expected_instant)
-                                        .as_micros() as i64
-                                } else {
-                                    -(expected_instant
-                                        .duration_since(playback_instant)
-                                        .as_micros() as i64)
-                                };
-                                let new_schedule =
-                                    planner.plan(error_us, sample_rate, schedule.is_correcting());
-                                if new_schedule != schedule {
-                                    if new_schedule.is_correcting() != schedule.is_correcting() {
-                                        if new_schedule.is_correcting() {
-                                            log::debug!(
-                                                "Sync correction engaged: \
-                                                error={:.1}ms, insert_every={}, drop_every={}",
-                                                error_us as f64 / 1000.0,
-                                                new_schedule.insert_every_n_frames,
-                                                new_schedule.drop_every_n_frames,
-                                            );
-                                        } else {
-                                            log::debug!(
-                                                "Sync correction disengaged: \
-                                                error={:.1}ms",
-                                                error_us as f64 / 1000.0,
-                                            );
-                                        }
-                                    }
-                                    schedule = new_schedule;
-                                    insert_counter = schedule.insert_every_n_frames;
-                                    drop_counter = schedule.drop_every_n_frames;
-                                }
-
-                                if schedule.reanchor || force_reanchor {
-                                    if let Some(client_micros) =
-                                        sync.instant_to_client_micros(playback_instant)
-                                    {
-                                        if let Some(server_time) =
-                                            sync.client_to_server_micros(client_micros)
-                                        {
-                                            let mut queue = queue.lock();
-                                            queue.cursor_us = server_time;
-                                            queue.cursor_remainder = 0;
-                                            queue.force_reanchor = false;
-                                        }
-                                    }
-                                    schedule = CorrectionSchedule::default();
-                                    insert_counter = 0;
-                                    drop_counter = 0;
-                                }
-                            }
-                        }
 
                         // If playback hasn't started yet (clock sync not converged,
                         // lock contention, or pre-start gate active), output silence.
@@ -552,7 +551,7 @@ impl SyncedPlayer {
                             for sample in data.iter_mut() {
                                 *sample = <$sample>::from_sample(0.0);
                             }
-                            let target = cb_config.gain_control.target_gain();
+                            let target = cb_config.gain_control.gain();
                             let frames = data.len() / channels;
                             gain_ramp.advance(frames, target);
                             if let Some(ref mut cb) = cb_config.process_callback {
@@ -564,6 +563,7 @@ impl SyncedPlayer {
                         }
 
                         f32_buffer.resize(data.len(), 0.0);
+
                         {
                             let mut queue = queue.lock();
                             let frames = data.len() / channels;
@@ -621,7 +621,7 @@ impl SyncedPlayer {
                         } // queue lock dropped before user callback
 
                         // Apply gain with per-frame ramping
-                        let target = cb_config.gain_control.target_gain();
+                        let target = cb_config.gain_control.gain();
                         gain_ramp.apply(&mut f32_buffer, channels, target);
 
                         if let Some(ref mut cb) = cb_config.process_callback {

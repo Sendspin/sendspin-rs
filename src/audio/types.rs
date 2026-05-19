@@ -109,7 +109,10 @@ impl AudioFormat {
         debug_assert!(self.channels > 0, "AudioFormat with 0 channels");
         debug_assert!(self.sample_rate > 0, "AudioFormat with 0 sample_rate");
         let frames = num_samples / self.channels.max(1) as usize;
-        (frames as i64 * 1_000_000) / self.sample_rate.max(1) as i64
+        let rate = self.sample_rate.max(1) as i64;
+        // Round to nearest instead of truncating so that duration_us stays
+        // consistent with the remainder-tracking in advance_cursor().
+        (frames as i64 * 1_000_000 + rate / 2) / rate
     }
 }
 

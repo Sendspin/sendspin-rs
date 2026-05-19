@@ -19,10 +19,12 @@ pub mod scheduler;
 /// Clock synchronization utilities
 pub mod sync;
 
-pub use protocol::client::ProtocolClient;
+pub use audio::GainControl;
+pub use protocol::client::{Connection, Controller, ProtocolClient};
 pub use protocol::client_builder::ProtocolClientBuilder;
-pub use protocol::messages::{ClientHello, ServerHello};
+pub use protocol::messages::ServerHello;
 pub use scheduler::AudioScheduler;
+pub use sync::raw_clock::{Clock, DefaultClock};
 
 /// Result type for sendspin operations
 pub type Result<T> = std::result::Result<T, error::Error>;

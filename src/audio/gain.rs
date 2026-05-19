@@ -12,13 +12,10 @@ struct GainState {
     volume_pct: AtomicU8,
 }
 
-/// Shared volume/mute control for a `SyncedPlayer`.
+/// Shared volume/mute control for a `SyncedPlayer` or custom playback pipeline.
 ///
-/// Cloned from [`super::SyncedPlayer::gain_control()`]. All methods are lock-free
-/// and safe to call from any thread. Cloning is cheap (single `Arc` increment).
-///
-/// Consumers obtain handles via [`super::SyncedPlayer::gain_control()`]; the
-/// constructor is crate-internal.
+/// All methods are lock-free and safe to call from any thread. Cloning is cheap
+/// (single `Arc` increment, no data copy).
 #[derive(Clone)]
 pub struct GainControl {
     state: Arc<GainState>,
@@ -33,9 +30,7 @@ fn volume_to_gain(volume: u8) -> (u8, f32) {
 
 impl GainControl {
     /// Create a new `GainControl` at the given volume and mute state.
-    ///
-    /// Consumers obtain handles via [`super::SyncedPlayer::gain_control()`].
-    pub(crate) fn new(volume: u8, muted: bool) -> Self {
+    pub fn new(volume: u8, muted: bool) -> Self {
         let (clamped, gain) = volume_to_gain(volume);
         Self {
             state: Arc::new(GainState {
@@ -81,8 +76,12 @@ impl GainControl {
         self.state.muted.load(Ordering::Relaxed)
     }
 
-    /// Read the effective gain (0.0-1.0). Returns 0.0 when muted.
-    pub(crate) fn target_gain(&self) -> f32 {
+    /// Read the effective linear gain (0.0-1.0).
+    ///
+    /// Returns `0.0` when muted. This is useful for custom playback pipelines
+    /// that want to reuse sendspin-rs volume/mute state handling while applying
+    /// gain themselves.
+    pub fn gain(&self) -> f32 {
         if self.state.muted.load(Ordering::Relaxed) {
             return 0.0;
         }
@@ -241,7 +240,7 @@ impl GainRamp {
     /// Detect a target change and (re)start the ramp if needed.
     fn update_target(&mut self, target: f32) {
         debug_assert!(target.is_finite(), "target gain must be finite");
-        // NaN/Inf can't reach here through GainControl::target_gain(), but
+        // NaN/Inf can't reach here through GainControl::gain(), but
         // guard defensively to avoid corrupting ramp state if called directly.
         if !target.is_finite() {
             return;
@@ -273,13 +272,13 @@ mod tests {
         let gc = GainControl::new(100, false);
 
         gc.set_volume(0);
-        assert!((gc.target_gain() - 0.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 0.0).abs() < f32::EPSILON);
 
         gc.set_volume(100);
-        assert!((gc.target_gain() - 1.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 1.0).abs() < f32::EPSILON);
 
         gc.set_volume(50);
-        assert!((gc.target_gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
+        assert!((gc.gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
     }
 
     #[test]
@@ -296,7 +295,7 @@ mod tests {
         let gc = GainControl::new(100, false);
         gc.set_volume(75);
         gc.set_mute(true);
-        assert!((gc.target_gain() - 0.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 0.0).abs() < f32::EPSILON);
         // volume() still reports the stored volume
         assert_eq!(gc.volume(), 75);
     }
@@ -305,16 +304,16 @@ mod tests {
     fn test_unmute_restores_previous_gain() {
         let gc = GainControl::new(100, false);
         gc.set_volume(75);
-        let expected_gain = gc.target_gain();
+        let expected_gain = gc.gain();
 
         gc.set_mute(true);
-        assert!((gc.target_gain() - 0.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 0.0).abs() < f32::EPSILON);
 
         gc.set_mute(false);
         assert!(
-            (gc.target_gain() - expected_gain).abs() < f32::EPSILON,
+            (gc.gain() - expected_gain).abs() < f32::EPSILON,
             "unmute should restore gain to {expected_gain}, got {}",
-            gc.target_gain()
+            gc.gain()
         );
     }
 
@@ -323,7 +322,7 @@ mod tests {
         let gc = GainControl::new(100, false);
         gc.set_volume(255);
         assert_eq!(gc.volume(), 100);
-        assert!((gc.target_gain() - 1.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 1.0).abs() < f32::EPSILON);
 
         gc.set_volume(101);
         assert_eq!(gc.volume(), 100);
@@ -529,19 +528,19 @@ mod tests {
         let gc = GainControl::new(100, false);
         gc.set_volume(75);
         gc.set_mute(true);
-        assert!((gc.target_gain()).abs() < f32::EPSILON);
+        assert!((gc.gain()).abs() < f32::EPSILON);
 
         // Change volume while muted
         gc.set_volume(25);
         // Still muted — gain should be 0
-        assert!((gc.target_gain()).abs() < f32::EPSILON);
+        assert!((gc.gain()).abs() < f32::EPSILON);
 
         // Unmute — gain should reflect volume=25, not volume=75
         gc.set_mute(false);
         assert!(
-            (gc.target_gain() - 0.125).abs() < 1e-3, // (25/100)^1.5
+            (gc.gain() - 0.125).abs() < 1e-3, // (25/100)^1.5
             "after unmute, gain should match volume=25 (0.125), got {}",
-            gc.target_gain()
+            gc.gain()
         );
     }
 
@@ -642,7 +641,7 @@ mod tests {
         let mut prev_gain = -1.0_f32;
         for v in 0..=100u8 {
             gc.set_volume(v);
-            let gain = gc.target_gain();
+            let gain = gc.gain();
             assert!(
                 gain > prev_gain || (v == 0 && gain == 0.0),
                 "non-monotonic at volume {v}: gain {gain} <= prev {prev_gain}"
@@ -659,18 +658,18 @@ mod tests {
             .target_gain_bits
             .store(1.5_f32.to_bits(), Ordering::Relaxed);
         assert!(
-            (gc.target_gain() - 1.0).abs() < f32::EPSILON,
+            (gc.gain() - 1.0).abs() < f32::EPSILON,
             "out-of-range gain should be clamped to 1.0, got {}",
-            gc.target_gain()
+            gc.gain()
         );
 
         gc.state
             .target_gain_bits
             .store((-0.5_f32).to_bits(), Ordering::Relaxed);
         assert!(
-            (gc.target_gain() - 0.0).abs() < f32::EPSILON,
+            (gc.gain() - 0.0).abs() < f32::EPSILON,
             "negative gain should be clamped to 0.0, got {}",
-            gc.target_gain()
+            gc.gain()
         );
     }
 
@@ -685,18 +684,14 @@ mod tests {
         gc.state
             .target_gain_bits
             .store(f32::NAN.to_bits(), Ordering::Relaxed);
-        assert_eq!(
-            gc.target_gain(),
-            0.0,
-            "NaN gain should fail safe to 0.0 (silence)"
-        );
+        assert_eq!(gc.gain(), 0.0, "NaN gain should fail safe to 0.0 (silence)");
 
         // +Inf → silence
         gc.state
             .target_gain_bits
             .store(f32::INFINITY.to_bits(), Ordering::Relaxed);
         assert_eq!(
-            gc.target_gain(),
+            gc.gain(),
             0.0,
             "+Inf gain should fail safe to 0.0 (silence)"
         );
@@ -706,7 +701,7 @@ mod tests {
             .target_gain_bits
             .store(f32::NEG_INFINITY.to_bits(), Ordering::Relaxed);
         assert_eq!(
-            gc.target_gain(),
+            gc.gain(),
             0.0,
             "-Inf gain should fail safe to 0.0 (silence)"
         );
@@ -813,7 +808,7 @@ mod tests {
     fn test_gain_control_initial_volume() {
         let gc = GainControl::new(50, false);
         assert_eq!(gc.volume(), 50);
-        assert!((gc.target_gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
+        assert!((gc.gain() - 0.353_553).abs() < 1e-3); // (50/100)^1.5
     }
 
     #[test]
@@ -821,25 +816,25 @@ mod tests {
         let gc = GainControl::new(75, true);
         assert_eq!(gc.volume(), 75);
         assert!(gc.is_muted());
-        assert_eq!(gc.target_gain(), 0.0);
+        assert_eq!(gc.gain(), 0.0);
 
         // Unmuting restores the gain for volume 75
         gc.set_mute(false);
-        assert!((gc.target_gain() - 0.649_519).abs() < 1e-3); // (75/100)^1.5
+        assert!((gc.gain() - 0.649_519).abs() < 1e-3); // (75/100)^1.5
     }
 
     #[test]
     fn test_gain_control_initial_volume_clamps_above_100() {
         let gc = GainControl::new(200, false);
         assert_eq!(gc.volume(), 100);
-        assert!((gc.target_gain() - 1.0).abs() < f32::EPSILON);
+        assert!((gc.gain() - 1.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn test_gain_control_initial_zero_volume() {
         let gc = GainControl::new(0, false);
         assert_eq!(gc.volume(), 0);
-        assert_eq!(gc.target_gain(), 0.0);
+        assert_eq!(gc.gain(), 0.0);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "sendspin"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Sendspin Contributors"]
 description = "Hyper-efficient Rust implementation of the Sendspin Protocol for synchronized multi-room audio streaming"
@@ -37,6 +37,9 @@ crossbeam = "0.8"
 # Fast mutexes
 parking_lot = "0.12"
 typed-builder = "0.23.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
