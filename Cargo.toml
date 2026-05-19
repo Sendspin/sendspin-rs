@@ -29,7 +29,7 @@ log = "0.4"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
 # Audio output
-cpal = { git = "https://github.com/RustAudio/cpal", branch = "master" }
+cpal = { git = "https://github.com/rustaudio/cpal", rev = "c3afb40df0b3aa7386ac42b4aa221a7b1ba3ce40" }
 
 # Concurrency
 crossbeam = "0.8"

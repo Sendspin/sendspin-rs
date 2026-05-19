@@ -294,6 +294,8 @@ impl SyncedPlayer {
                 .ok_or_else(|| Error::Output("No output device available".to_string()))?,
         };
 
+        // Get the one close to the requested settings?
+        // SupportedStreamConfigRange
         let config = StreamConfig {
             channels: format.channels as u16,
             sample_rate: cpal::SampleRate::from(format.sample_rate),
@@ -314,7 +316,7 @@ impl SyncedPlayer {
 
         let stream = Self::build_stream(
             &device,
-            &config,
+            config,
             queue_clone,
             clock_sync,
             format_clone,
@@ -322,7 +324,9 @@ impl SyncedPlayer {
             error_clone,
         )?;
 
-        let buffer_size = stream.buffer_size().map_err(|e| Error::Output(e.to_string()))?;
+        let buffer_size = stream
+            .buffer_size()
+            .map_err(|e| Error::Output(e.to_string()))?;
         log::debug!(
             "Built audio stream with config: {:?}, buffer size: {:?}",
             config,
@@ -404,7 +408,7 @@ impl SyncedPlayer {
 
     fn build_stream(
         device: &Device,
-        config: &StreamConfig,
+        config: StreamConfig,
         queue: Arc<Mutex<PlaybackQueue>>,
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
