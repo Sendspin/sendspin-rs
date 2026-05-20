@@ -644,6 +644,7 @@ impl SyncedPlayer {
                         for (i, &f) in f32_buffer.iter().enumerate() {
                             data[i] = <$sample>::from_sample(f);
                         }
+                        log::trace!("RingBuffer ({} frames): {:?}", f32_buffer.len(), f32_buffer);
                     },
                     move |err| {
                         eprintln!("Audio stream error: {}", err);
