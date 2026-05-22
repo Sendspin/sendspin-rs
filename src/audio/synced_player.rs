@@ -226,6 +226,7 @@ impl SyncedPlayer {
     /// The player starts at `volume` (0-100) and `muted` state. These are
     /// applied immediately — the first audio callback uses the correct gain
     /// with no ramp from a default value.
+    /// The `buffer_size` overrides cpal audio device default. If not set, the default buffer size is used.
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
@@ -260,7 +261,7 @@ impl SyncedPlayer {
     /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
     /// let player = SyncedPlayer::with_process_callback(
     ///     format, clock_sync, None,
-    ///     100, false,
+    ///     100, false, None,
     ///     Box::new(|data| { /* e.g. feed a VU meter or visualizer */ }),
     /// )?;
     /// # Ok(())
