@@ -378,8 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Arc::clone(&clock_sync),
                                     device.as_ref().cloned(),
                                     100,
-                                    false,
-                                    None
+                                    false
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
