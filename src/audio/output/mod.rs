@@ -6,14 +6,14 @@ pub mod cpal_output;
 
 pub use cpal_output::CpalOutput;
 
-use crate::audio::{AudioFormat, Sample};
+use crate::audio::AudioFormat;
 use crate::error::Error;
 use std::sync::Arc;
 
 /// Audio output trait for playing audio samples
 pub trait AudioOutput {
     /// Write samples to the audio output
-    fn write(&mut self, samples: &Arc<[Sample]>) -> Result<(), Error>;
+    fn write(&mut self, samples: &Arc<[i32]>) -> Result<(), Error>;
 
     /// Get the current output latency in microseconds
     fn latency_micros(&self) -> u64;

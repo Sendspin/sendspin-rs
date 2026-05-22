@@ -2,10 +2,10 @@
 // ABOUTME: Cross-platform audio output using the cpal library
 
 use crate::audio::output::AudioOutput;
-use crate::audio::{AudioFormat, Sample};
+use crate::audio::AudioFormat;
 use crate::error::Error;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, Sample, Stream, StreamConfig};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 pub struct CpalOutput {
     format: AudioFormat,
     _stream: Stream,
-    sample_tx: SyncSender<Arc<[Sample]>>,
+    sample_tx: SyncSender<Arc<[i32]>>,
     latency_micros: Arc<AtomicU64>,
 }
 
@@ -55,7 +55,7 @@ impl CpalOutput {
         };
 
         // Use bounded channel for backpressure (10 buffers max = ~200ms at 20ms chunks)
-        let (sample_tx, sample_rx) = sync_channel::<Arc<[Sample]>>(10);
+        let (sample_tx, sample_rx) = sync_channel::<Arc<[i32]>>(10);
         let latency_micros = Arc::new(AtomicU64::new(0));
         let latency_clone = Arc::clone(&latency_micros);
 
@@ -73,11 +73,11 @@ impl CpalOutput {
     fn build_stream(
         device: &Device,
         config: &StreamConfig,
-        sample_rx: Receiver<Arc<[Sample]>>,
+        sample_rx: Receiver<Arc<[i32]>>,
         latency_micros: Arc<AtomicU64>,
     ) -> Result<Stream, Error> {
         let sample_rx = Arc::new(Mutex::new(sample_rx));
-        let mut current_buffer: Option<Arc<[Sample]>> = None;
+        let mut current_buffer: Option<Arc<[i32]>> = None;
         let mut buffer_pos = 0;
 
         let stream = device
@@ -106,7 +106,7 @@ impl CpalOutput {
                         if let Some(ref buf) = current_buffer {
                             if buffer_pos < buf.len() {
                                 let sample = buf[buffer_pos];
-                                *sample_out = sample.to_f32();
+                                *sample_out = sample.to_sample::<f32>();
                                 buffer_pos += 1;
                             } else {
                                 *sample_out = 0.0; // Silence
@@ -126,7 +126,7 @@ impl CpalOutput {
 }
 
 impl AudioOutput for CpalOutput {
-    fn write(&mut self, samples: &Arc<[Sample]>) -> Result<(), Error> {
+    fn write(&mut self, samples: &Arc<[i32]>) -> Result<(), Error> {
         self.sample_tx
             .send(Arc::clone(samples))
             .map_err(|_| Error::Output("Failed to send samples to audio thread".to_string()))

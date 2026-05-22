@@ -110,12 +110,11 @@ impl Conversion for i32 {
         // Build 24-bit signed integer in i32
         let val = (bytes[0] as i32) | ((bytes[1] as i32) << 8) | ((bytes[2] as i32) << 16);
         // Sign-extend from 24-bit to 32-bit
-        let extended = if val & 0x00800000 != 0 {
+        if val & 0x00800000 != 0 {
             val | 0xFF000000u32 as i32 // Negative: fill upper 8 bits with 1
         } else {
             val // Positive: upper 8 bits already 0
-        };
-        i32::from_sample(extended)
+        }
     }
 
     /// Convert from 24-bit big-endian bytes
@@ -124,66 +123,65 @@ impl Conversion for i32 {
         // Build 24-bit signed integer in i32 (big-endian order)
         let val = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
         // Sign-extend from 24-bit to 32-bit
-        let extended = if val & 0x00800000 != 0 {
+        if val & 0x00800000 != 0 {
             val | 0xFF000000u32 as i32 // Negative: fill upper 8 bits with 1
         } else {
             val // Positive: upper 8 bits already 0
-        };
-        i32::from_sample(extended)
+        }
     }
 }
 
-// #[test]
-// fn test_sample_from_i24_le() {
-//     let bytes = [0x00, 0x10, 0x00]; // 4096 in 24-bit little-endian
-//     let sample = Sample::from_i24_le(bytes);
-//     assert_eq!(sample.to_f32(), 4096.0 / 8_388_608.0);
-// }
+#[test]
+fn test_sample_from_i24_le() {
+    // 4096 in 24-bit little-endian
+    let sample = i32::from_i24_le([0x00, 0x10, 0x00]);
+    assert_eq!(sample, 4096);
+}
 
-// #[test]
-// fn test_sample_from_i24_le_negative() {
-//     // -1 in 24-bit LE: 0xFF 0xFF 0xFF
-//     let sample = Sample::from_i24_le([0xFF, 0xFF, 0xFF]);
-//     assert_eq!(sample, Sample(-1));
-// }
+#[test]
+fn test_sample_from_i24_le_negative() {
+    // -1 in 24-bit LE: 0xFF 0xFF 0xFF
+    let sample = i32::from_i24_le([0xFF, 0xFF, 0xFF]);
+    assert_eq!(sample, -1);
+}
 
-// #[test]
-// fn test_sample_from_i24_le_boundary_values() {
-//     // Max 24-bit: 0x7FFFFF = 8388607
-//     let max_sample = Sample::from_i24_le([0xFF, 0xFF, 0x7F]);
-//     assert_eq!(max_sample, Sample::MAX);
+#[test]
+fn test_sample_from_i24_le_boundary_values() {
+    // Max 24-bit: 0x7FFFFF = 8388607
+    let max_sample = i32::from_i24_le([0xFF, 0xFF, 0x7F]);
+    assert_eq!(max_sample, 8388607);
 
-//     // Min 24-bit: 0x800000 = -8388608
-//     let min_sample = Sample::from_i24_le([0x00, 0x00, 0x80]);
-//     assert_eq!(min_sample, Sample::MIN);
+    // Min 24-bit: 0x800000 = -8388608
+    let min_sample = i32::from_i24_le([0x00, 0x00, 0x80]);
+    assert_eq!(min_sample, -8388608);
 
-//     // Zero
-//     let zero = Sample::from_i24_le([0x00, 0x00, 0x00]);
-//     assert_eq!(zero, Sample::ZERO);
-// }
+    // Zero
+    let zero = i32::from_i24_le([0x00, 0x00, 0x00]);
+    assert_eq!(zero, 0);
+}
 
-// #[test]
-// fn test_sample_from_i24_be_roundtrip() {
-//     // 4096 in 24-bit BE: 0x00 0x10 0x00
-//     let sample = Sample::from_i24_be([0x00, 0x10, 0x00]);
-//     assert_eq!(sample, Sample(4096));
+#[test]
+fn test_sample_from_i24_be_roundtrip() {
+    // 4096 in 24-bit BE: 0x00 0x10 0x00
+    let sample = i32::from_i24_be([0x00, 0x10, 0x00]);
+    assert_eq!(sample, 4096);
 
-//     // -1 in 24-bit BE
-//     let neg = Sample::from_i24_be([0xFF, 0xFF, 0xFF]);
-//     assert_eq!(neg, Sample(-1));
-// }
+    // -1 in 24-bit BE
+    let neg = i32::from_i24_be([0xFF, 0xFF, 0xFF]);
+    assert_eq!(neg, -1);
+}
 
-// #[test]
-// fn test_sample_from_i24_be_boundary_values() {
-//     // Max 24-bit: 0x7FFFFF = 8388607
-//     let max_sample = Sample::from_i24_be([0x7F, 0xFF, 0xFF]);
-//     assert_eq!(max_sample, Sample::MAX);
+#[test]
+fn test_sample_from_i24_be_boundary_values() {
+    // Max 24-bit: 0x7FFFFF = 8388607
+    let max_sample = i32::from_i24_be([0x7F, 0xFF, 0xFF]);
+    assert_eq!(max_sample, 8388607);
 
-//     // Min 24-bit: 0x800000 = -8388608
-//     let min_sample = Sample::from_i24_be([0x80, 0x00, 0x00]);
-//     assert_eq!(min_sample, Sample::MIN);
+    // Min 24-bit: 0x800000 = -8388608
+    let min_sample = i32::from_i24_be([0x80, 0x00, 0x00]);
+    assert_eq!(min_sample, -8388608);
 
-//     // Zero
-//     let zero = Sample::from_i24_be([0x00, 0x00, 0x00]);
-//     assert_eq!(zero, Sample::ZERO);
-// }
+    // Zero
+    let zero = i32::from_i24_be([0x00, 0x00, 0x00]);
+    assert_eq!(zero, 0);
+}
