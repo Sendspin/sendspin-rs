@@ -142,7 +142,7 @@ impl Clock for DefaultClock {
                 );
             }
         }
-        (ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000).into()
+        ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000
     }
 
     #[cfg(not(target_os = "linux"))]
