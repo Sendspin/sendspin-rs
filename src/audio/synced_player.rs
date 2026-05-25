@@ -628,8 +628,11 @@ mod tests {
     // in gain.rs. Wiring tests require a real audio device (cpal Stream) and
     // cannot run in CI.
 
-    use super::PlaybackQueue;
+    use super::{PlaybackQueue, SyncedPlayer};
     use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+    use crate::error::Error;
+    use crate::sync::{ClockSync, DefaultClock};
+    use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -649,6 +652,36 @@ mod tests {
         AudioFormat {
             channels: 1,
             ..test_format()
+        }
+    }
+
+    #[test]
+    fn test_build_rejects_zero_channels() {
+        // `SyncedPlayer::build` short-circuits on channels==0 *before* any
+        // cpal device access, so this test works regardless of whether the
+        // runner has audio hardware. Asserting on the specific error message
+        // (not just `is_err()`) pins the check to the explicit guard — any
+        // later failure (missing device, cpal rejecting the config) would
+        // surface a different message.
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 0,
+            bit_depth: 24,
+            codec_header: None,
+        };
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
+        let result = SyncedPlayer::new(format, clock_sync, None, 100, false);
+        let err = match result {
+            Ok(_) => panic!("channels=0 should be rejected"),
+            Err(e) => e,
+        };
+        match err {
+            Error::Output(msg) => assert!(
+                msg.contains("channels must be > 0"),
+                "expected 'channels must be > 0' error, got: {msg}"
+            ),
+            other => panic!("expected Error::Output, got {other:?}"),
         }
     }
 
@@ -1087,6 +1120,87 @@ mod tests {
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
         assert_eq!(queue.queue[0].samples[0], Sample(333));
+    }
+
+    #[test]
+    fn test_push_keeps_adjacent_buffers_inserted_in_reverse_order() {
+        // When buffer B is pushed *after* buffer A and they abut at the
+        // boundary (B.ts == A.end), the existing dedup check keeps both
+        // because `b.timestamp < new_end` is false at the boundary. The
+        // symmetric case — pushing the *earlier* buffer second — must also
+        // keep both: when we push the earlier buffer A and retain() walks
+        // B, we see `B.ts == new_end` (A.end). The dedup has to treat the
+        // boundary as *not* overlapping, otherwise we'd evict a buffer that
+        // simply abuts — a common pattern when chunks arrive out-of-order.
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        // Two 5ms adjacent chunks: A at [0, 5000), B at [5000, 10000).
+        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
+        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
+
+        // Push the *later* buffer (B) first …
+        queue.push(AudioBuffer {
+            timestamp: 5_000,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format: format.clone(),
+        });
+        // … then push the *earlier* buffer (A). A.end == B.ts (boundary case).
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format,
+        });
+
+        assert_eq!(
+            queue.queue.len(),
+            2,
+            "adjacent buffers pushed in reverse order should both be kept"
+        );
+        // Should also be sorted: A first, then B.
+        assert_eq!(queue.queue[0].timestamp, 0);
+        assert_eq!(queue.queue[1].timestamp, 5_000);
+    }
+
+    #[test]
+    fn test_next_frame_returns_final_frame_when_skip_lands_at_last_frame() {
+        // When the cursor skip lands `self.index` at exactly
+        // `samples.len() - channels`, there is still one playable frame at
+        // the tail of the buffer. The "is this buffer exhausted?" check in
+        // the outer match is `self.index + channels > c.samples.len()` —
+        // strictly greater — so `index == samples.len() - channels` falls
+        // through to the frame-return path. A non-strict comparison here
+        // would silently drop the last frame of every buffer whose skip
+        // landed on the final-frame boundary.
+        //
+        // Setup: 48-frame stereo buffer at ts=0, cursor at 980 µs.
+        //   skip_us     = 980 - 0                          = 980
+        //   skip_frames = 980 * 48_000 / 1_000_000         = 47
+        //   self.index  = 47 * 2                           = 94
+        //   samples.len = 48 * 2                           = 96
+        //   94 + 2 == 96 — keep buffer, return last frame.
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        // Distinctive sample values so we can assert *which* frame was returned.
+        let samples: Vec<Sample> = (0..48 * 2).map(Sample).collect();
+
+        queue.initialized = true;
+        queue.cursor_us = 980;
+        queue.queue.push_back(AudioBuffer {
+            timestamp: 0,
+            play_at: Instant::now(),
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        let frame = queue
+            .next_frame(2, 48_000)
+            .expect("last frame should be returned, not discarded");
+        // Final stereo frame — indices 94 and 95 of the flat sample array.
+        assert_eq!(frame, &[Sample(94), Sample(95)]);
     }
 
     #[test]

@@ -116,6 +116,46 @@ fn test_sample_to_f32_typical_values() {
 }
 
 #[test]
+fn test_audio_format_duration_us_rounds_half_up() {
+    // 1 frame at 48 kHz is 20.833 µs — the implementation adds `rate / 2`
+    // before dividing by `rate` so that duration rounds to the nearest whole
+    // microsecond (21) instead of truncating to 20. This keeps duration_us
+    // consistent with the remainder-tracking cursor advance in synced_player.
+    let format = AudioFormat {
+        codec: Codec::Pcm,
+        sample_rate: 48_000,
+        channels: 1,
+        bit_depth: 24,
+        codec_header: None,
+    };
+    assert_eq!(
+        format.duration_us(1),
+        21,
+        "48 kHz / 1 frame should round to 21 µs"
+    );
+    // 1000 frames at 48 kHz is 20833.33 µs → rounds to 20833.
+    assert_eq!(format.duration_us(1000), 20_833);
+    // Exact divisions stay exact.
+    assert_eq!(format.duration_us(48_000), 1_000_000);
+}
+
+#[test]
+fn test_audio_format_duration_us_accounts_for_channels() {
+    // `num_samples` is the *total* interleaved sample count. Stereo halves
+    // the frame count, so duration should be half of what a mono format of
+    // the same rate reports.
+    let stereo = AudioFormat {
+        codec: Codec::Pcm,
+        sample_rate: 48_000,
+        channels: 2,
+        bit_depth: 24,
+        codec_header: None,
+    };
+    // 96 samples stereo = 48 frames at 48 kHz = 1000 µs exactly.
+    assert_eq!(stereo.duration_us(96), 1_000);
+}
+
+#[test]
 fn test_audio_format_equality() {
     let format1 = AudioFormat {
         codec: Codec::Pcm,
