@@ -43,6 +43,38 @@ fn test_supported_roles_with_artwork_v1_support() {
 }
 
 #[test]
+fn test_supported_roles_with_metadata_role() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .metadata()
+        .build();
+
+    assert_eq!(builder.supported_roles(), &["metadata@v1"]);
+    assert!(builder.player_v1_support().is_none());
+}
+
+#[test]
+fn test_supported_roles_with_metadata_and_artwork() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .metadata()
+        .artwork_v1_support(ArtworkV1Support {
+            channels: vec![ArtworkChannel {
+                source: ArtworkSource::Album,
+                format: ImageFormat::Jpeg,
+                media_width: 300,
+                media_height: 300,
+            }],
+        })
+        .build();
+
+    assert_eq!(builder.supported_roles(), &["artwork@v1", "metadata@v1"]);
+    assert!(builder.player_v1_support().is_none());
+}
+
+#[test]
 fn test_supported_roles_with_visualizer_v1_support() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test".to_string())
