@@ -458,11 +458,9 @@ impl ProtocolClient {
                         match msg {
                             Message::ServerHello(server_hello) => {
                                 log::info!(
-                                    "Connected to server: {} ({}) active_roles={:?} connection_reason={:?}",
+                                    "Connected to server: {} ({})",
                                     server_hello.name,
-                                    server_hello.server_id,
-                                    server_hello.active_roles,
-                                    server_hello.connection_reason
+                                    server_hello.server_id
                                 );
                                 break server_hello;
                             }
