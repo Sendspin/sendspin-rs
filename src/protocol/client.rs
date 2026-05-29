@@ -449,7 +449,7 @@ impl ProtocolClient {
             if let Some(result) = read_temp.next().await {
                 match result {
                     Ok(WsMessage::Text(text)) => {
-                        log::trace!("Received text message: {}", text);
+                        log::debug!("Received text message: {}", text);
                         let msg: Message = serde_json::from_str(&text).map_err(|e| {
                             log::error!("Failed to parse server message: {}", e);
                             Error::Protocol(e.to_string())
@@ -615,7 +615,7 @@ impl ProtocolClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
-                    log::trace!("Received binary frame ({} bytes)", data.len());
+                    log::debug!("Received binary frame ({} bytes)", data.len());
                     match BinaryFrame::from_bytes(&data) {
                         Ok(BinaryFrame::Audio(chunk)) => {
                             log::debug!(
@@ -667,9 +667,10 @@ impl ProtocolClient {
                     // Capture receive time before deserialization so
                     // t4 is as close to the true arrival time as possible.
                     let t4 = clock.now_micros();
-                    log::trace!("Received text message: {}", text);
+                    log::debug!("Received text message: {}", text);
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
+                            log::debug!("Parsed message: {:?}", msg);
                             // ServerTime is consumed here for clock sync
                             // and intentionally NOT forwarded to message_rx
                             // consumers — it's an internal protocol detail.
