@@ -4,6 +4,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Sample type for audio data.
+///
+/// Represents a single audio sample. The value is expected to be in the range [-1.0, 1.0]
+/// when normalized, but stored as i32 for compatibility with cpal's sample format.
+pub type Sample = i32;
+
 /// Audio codec type
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Codec {
@@ -64,7 +70,7 @@ pub struct AudioBuffer {
     /// [`SyncedPlayer`](crate::audio::SyncedPlayer) which computes timing from `timestamp`.
     pub play_at: Instant,
     /// Immutable, shareable sample data.
-    pub samples: Arc<[i32]>,
+    pub samples: Arc<[Sample]>,
     /// Audio format specification.
     pub format: AudioFormat,
 }
