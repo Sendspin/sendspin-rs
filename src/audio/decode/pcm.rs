@@ -81,14 +81,20 @@ impl Decoder for PcmDecoder {
             (24, PcmEndian::Little) => {
                 let samples: Vec<i32> = data
                     .chunks_exact(3)
-                    .map(|c| i32::from_i24_le([c[0], c[1], c[2]]))
+                    .map(|c| {
+                        let extended = i32::from_i24_le([c[0], c[1], c[2]]);
+                        i32::from_sample(cpal::I24::new_unchecked(extended))
+                    })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
             (24, PcmEndian::Big) => {
                 let samples: Vec<i32> = data
                     .chunks_exact(3)
-                    .map(|c| i32::from_i24_be([c[0], c[1], c[2]]))
+                    .map(|c| {
+                        let extended = i32::from_i24_be([c[0], c[1], c[2]]);
+                        i32::from_sample(cpal::I24::new_unchecked(extended))
+                    })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
             }
