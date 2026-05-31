@@ -54,7 +54,7 @@ fn test_buffer_pool_put_actually_returns_buffer() {
     let _ = pool.get();
 
     // Put a buffer with a distinctive (larger) capacity.
-    let oversized: Vec<Sample> = Vec::with_capacity(4096);
+    let oversized: Vec<i32> = Vec::with_capacity(4096);
     pool.put(oversized);
 
     // Get should return the oversized buffer we just put back, NOT a freshly
