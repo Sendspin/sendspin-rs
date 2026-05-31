@@ -512,6 +512,235 @@ async fn test_no_controller_when_role_not_declared() {
     );
 }
 
+/// Variant of [`start_test_server`] that drives the server side directly —
+/// exposes both the send half (for server-initiated messages) and the receive
+/// half (for client-sent messages).
+async fn start_test_server_with_sender() -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    tokio::sync::mpsc::UnboundedSender<WsMessage>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    let (client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+
+        // Drive handshake: consume client/hello, echo roles back.
+        let msg = ws.next().await.unwrap().unwrap();
+        let active_roles = if let WsMessage::Text(ref text) = msg {
+            match serde_json::from_str::<Message>(text).unwrap() {
+                Message::ClientHello(hello) => hello.supported_roles,
+                other => panic!("First message should be client/hello, got {:?}", other),
+            }
+        } else {
+            panic!("Expected text message for client/hello");
+        };
+        let server_hello = serde_json::to_string(&Message::ServerHello(
+            sendspin::protocol::messages::ServerHello {
+                server_id: "test-server".to_string(),
+                name: "Test Server".to_string(),
+                version: 1,
+                active_roles,
+                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+            },
+        ))
+        .unwrap();
+        ws.send(WsMessage::Text(server_hello)).await.unwrap();
+
+        // Fan in: forward client messages to `client_tx`, forward outgoing
+        // `server_send_rx` messages to the socket.
+        loop {
+            tokio::select! {
+                msg = ws.next() => {
+                    let Some(Ok(msg)) = msg else { break };
+                    let text = match msg {
+                        WsMessage::Text(text) => text,
+                        WsMessage::Close(_) => break,
+                        _ => continue,
+                    };
+                    if client_tx.send(text).is_err() { break }
+                }
+                outgoing = server_send_rx.recv() => {
+                    let Some(out) = outgoing else { break };
+                    if ws.send(out).await.is_err() { break }
+                }
+            }
+        }
+    });
+
+    (url, client_rx, server_send_tx, handle)
+}
+
+#[tokio::test]
+async fn test_clock_sync_getter_returns_shared_handle() {
+    // `clock_sync()` must return the *same* `Arc<Mutex<ClockSync>>` instance
+    // on every call — callers rely on shared state with the background time
+    // sync task. Two calls returning pointer-distinct handles would compile
+    // fine but silently break sync state sharing; `Arc::ptr_eq` pins this.
+    let (url, _rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let a = client.clock_sync();
+    let b = client.clock_sync();
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "clock_sync() must return the same shared handle on every call"
+    );
+}
+
+#[tokio::test]
+async fn test_message_router_forwards_binary_audio() {
+    // End-to-end: server sends a binary audio frame, it should land in
+    // `conn.audio`. Exercises the router's `WsMessage::Binary` arm, the
+    // audio-channel dispatch, and the `!audio_closed && send.is_err()`
+    // guard (which must still forward successfully when the channel is
+    // open). A regression anywhere along the path manifests as
+    // `conn.audio.recv()` timing out.
+    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 1024,
+            supported_commands: vec![],
+        })
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    // Audio chunk: type 4, 8-byte big-endian timestamp, then payload.
+    let audio_frame: Vec<u8> = vec![
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0xDE, 0xAD,
+    ];
+    server_tx.send(WsMessage::Binary(audio_frame)).unwrap();
+
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.audio.recv())
+        .await
+        .expect("timed out waiting for audio chunk")
+        .expect("audio channel closed");
+    assert_eq!(chunk.timestamp, 42);
+    assert_eq!(&*chunk.data, &[0xDE, 0xAD]);
+}
+
+#[tokio::test]
+async fn test_message_router_forwards_binary_artwork() {
+    // Mirror of the audio routing test for the artwork path (binary
+    // types 8-11). The artwork channel-dispatch and its
+    // `!artwork_closed && send.is_err()` guard are structurally distinct
+    // from the audio path — each channel has its own closed-flag and send
+    // wiring, so each needs its own end-to-end coverage.
+    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    // Artwork channel 2: type 0x0A, 8-byte big-endian timestamp, then payload.
+    let artwork_frame: Vec<u8> = vec![
+        0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xD8, 0xFF, 0xE0,
+    ];
+    server_tx.send(WsMessage::Binary(artwork_frame)).unwrap();
+
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.artwork.recv())
+        .await
+        .expect("timed out waiting for artwork chunk")
+        .expect("artwork channel closed");
+    assert_eq!(chunk.channel, 2);
+    assert_eq!(chunk.timestamp, 100);
+    assert_eq!(&*chunk.data, &[0xFF, 0xD8, 0xFF, 0xE0]);
+}
+
+#[tokio::test]
+async fn test_message_router_forwards_binary_visualizer() {
+    // Mirror of the audio routing test for the visualizer path (binary
+    // type 16 / 0x10). Like artwork, visualizer has its own
+    // channel-dispatch and `!visualizer_closed && send.is_err()` guard,
+    // independent of the audio and artwork paths.
+    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    // Visualizer: type 0x10, 8-byte big-endian timestamp, then FFT data.
+    let vis_frame: Vec<u8> = vec![
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x01, 0x02, 0x03,
+    ];
+    server_tx.send(WsMessage::Binary(vis_frame)).unwrap();
+
+    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.visualizer.recv())
+        .await
+        .expect("timed out waiting for visualizer chunk")
+        .expect("visualizer channel closed");
+    assert_eq!(chunk.timestamp, 200);
+    assert_eq!(&*chunk.data, &[0x01, 0x02, 0x03]);
+}
+
+#[tokio::test]
+async fn test_message_router_forwards_text_messages() {
+    // End-to-end: server sends a protocol text message, it should land in
+    // `conn.messages`. Exercises the router's `WsMessage::Text` arm, the
+    // JSON deserialization step, and the `!message_closed && send.is_err()`
+    // guard. A regression in any of those paths manifests as
+    // `conn.messages.recv()` timing out.
+    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    let server_state = serde_json::to_string(&Message::ServerState(
+        sendspin::protocol::messages::ServerState {
+            metadata: None,
+            controller: None,
+        },
+    ))
+    .unwrap();
+    server_tx.send(WsMessage::Text(server_state)).unwrap();
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), conn.messages.recv())
+        .await
+        .expect("timed out waiting for server message")
+        .expect("message channel closed");
+    match msg {
+        Message::ServerState(_) => {}
+        other => panic!("expected ServerState, got {other:?}"),
+    }
+}
+
 #[test]
 #[ignore] // Requires running server
 fn test_client_receives_stream_start() {

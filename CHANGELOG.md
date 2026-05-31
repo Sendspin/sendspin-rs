@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/Sendspin/sendspin-rs/compare/v0.2.0...v0.2.1) - 2026-05-25
+
+### Other
+
+- close coverage gaps flagged by cargo mutants ([#43](https://github.com/Sendspin/sendspin-rs/pull/43))
+
 ## [0.2.0](https://github.com/Sendspin/sendspin-rs/compare/v0.1.2...v0.2.0) - 2026-04-16
 
 ### Added
