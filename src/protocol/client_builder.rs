@@ -23,6 +23,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_player_state: Option<PlayerState>,
+    metadata: bool,
     controller: bool,
 }
 
@@ -33,6 +34,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         let has_explicit_role = raw.player_v1_support.is_some()
             || raw.artwork_v1_support.is_some()
             || raw.visualizer_v1_support.is_some()
+            || raw.metadata
             || raw.controller;
 
         // Default to player@v1 if no roles were explicitly configured
@@ -67,6 +69,9 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
         if raw.visualizer_v1_support.is_some() {
             supported_roles.push("visualizer@v1".to_string());
+        }
+        if raw.metadata {
+            supported_roles.push("metadata@v1".to_string());
         }
         if raw.controller {
             supported_roles.push("controller@v1".to_string());
@@ -109,6 +114,8 @@ pub struct ProtocolClientBuilderFields {
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     #[builder(default = false, setter(transform = || true))]
+    metadata: bool,
+    #[builder(default = false, setter(transform = || true))]
     controller: bool,
 }
 
@@ -124,6 +131,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
             initial_player_state: fields.initial_player_state,
+            metadata: fields.metadata,
             controller: fields.controller,
         };
         raw.into()
