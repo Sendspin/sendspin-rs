@@ -5,8 +5,6 @@
 pub mod decode;
 /// Lock-free volume/mute control
 pub mod gain;
-/// Audio output trait and implementations
-pub mod output;
 /// Buffer pool for reusing audio sample buffers
 pub mod pool;
 /// Sync correction planner for drop/insert cadence
@@ -17,7 +15,6 @@ pub mod synced_player;
 pub mod types;
 
 pub use gain::GainControl;
-pub use output::{AudioOutput, CpalOutput};
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
 pub use synced_player::{ProcessCallback, SyncedPlayer};
