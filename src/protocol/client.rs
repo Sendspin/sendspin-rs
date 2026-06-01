@@ -4,7 +4,7 @@
 use crate::error::Error;
 use crate::protocol::messages::{
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime, ControllerCommand,
-    ControllerCommandType, GoodbyeReason, Message, RepeatMode,
+    ControllerCommandType, GoodbyeReason, Message, RepeatMode, ServerHello,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -99,6 +99,12 @@ pub struct Connection {
     pub sender: WsSender,
     /// Controller handle, if the server granted the `controller@v1` role
     pub controller: Option<Controller>,
+    /// The `server/hello` received during handshake. Carries `server_id`,
+    /// `connection_reason`, and `active_roles` — required for the
+    /// multi-server arbitration policy described on [`ProtocolListener`].
+    ///
+    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    pub server_hello: ServerHello,
     /// Must be held alive; dropping aborts background tasks
     pub guard: ConnectionGuard,
 }
@@ -450,7 +456,7 @@ pub struct ProtocolClient {
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
-    has_controller: bool,
+    server_hello: ServerHello,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
@@ -606,11 +612,6 @@ impl ProtocolClient {
             }
         };
 
-        let has_controller = server_hello
-            .active_roles
-            .iter()
-            .any(|r| r == "controller@v1");
-
         let state_msg = Message::ClientState(initial_state);
         let state_json =
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
@@ -679,7 +680,7 @@ impl ProtocolClient {
             visualizer_rx,
             message_rx,
             clock_sync,
-            has_controller,
+            server_hello,
             guard: ConnectionGuard {
                 sender: WsSender { tx: out_tx },
                 router_handle: Some(router_handle),
@@ -811,19 +812,29 @@ impl ProtocolClient {
         Arc::clone(&self.clock_sync)
     }
 
+    /// The `server/hello` received during handshake. Carries `server_id`,
+    /// `connection_reason`, and `active_roles` — required for the
+    /// multi-server arbitration policy described on [`ProtocolListener`].
+    ///
+    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    pub fn server_hello(&self) -> &ServerHello {
+        &self.server_hello
+    }
+
     /// Split into separate receivers for concurrent processing.
     ///
     /// This allows using `tokio::select!` to process messages and binary
     /// data concurrently. Use the fields you need; ignore the rest.
     pub fn split(self) -> Connection {
         let sender = WsSender { tx: self.out_tx };
-        let controller = if self.has_controller {
-            Some(Controller {
+        let controller = self
+            .server_hello
+            .active_roles
+            .iter()
+            .any(|r| r == "controller@v1")
+            .then(|| Controller {
                 sender: sender.clone(),
-            })
-        } else {
-            None
-        };
+            });
         Connection {
             messages: self.message_rx,
             audio: self.audio_rx,
@@ -832,6 +843,7 @@ impl ProtocolClient {
             clock_sync: self.clock_sync,
             sender,
             controller,
+            server_hello: self.server_hello,
             guard: self.guard,
         }
     }

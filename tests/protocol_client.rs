@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientSyncState, ControllerCommandType, GoodbyeReason, Message,
-    PlayerState, PlayerV1Support, RepeatMode,
+    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, ControllerCommandType,
+    GoodbyeReason, Message, PlayerState, PlayerV1Support, RepeatMode,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -90,7 +90,13 @@ async fn test_connect_sends_initial_state() {
         })
         .build();
 
-    let _client = builder.connect(&url).await.unwrap();
+    let client = builder.connect(&url).await.unwrap();
+
+    // Regression guard: the server_hello fields needed for multi-server
+    // arbitration must survive `connect()` just as they do `accept()`.
+    let hello = client.server_hello();
+    assert_eq!(hello.server_id, "test-server");
+    assert_eq!(hello.connection_reason, ConnectionReason::Playback);
 
     // First message after handshake should be client/state
     let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -486,6 +492,14 @@ async fn test_no_controller_when_server_denies_role() {
     assert!(
         conn.controller.is_none(),
         "should not have controller when server denies the role"
+    );
+    // Post-split outbound coverage of server_hello, and the active_roles
+    // assertion in particular: the same vec drives both controller
+    // materialization (above) and the multi-server arbitration policy.
+    assert_eq!(conn.server_hello.server_id, "test-server");
+    assert_eq!(
+        conn.server_hello.active_roles,
+        vec!["player@v1".to_string()]
     );
 }
 

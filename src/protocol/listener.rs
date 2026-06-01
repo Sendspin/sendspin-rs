@@ -26,12 +26,26 @@ use tokio_native_tls::TlsAcceptor;
 /// [`ProtocolClientBuilder::connect`].
 ///
 /// [`Self::accept`] drives the full protocol handshake before returning, so
-/// it serves one inbound connection at a time — which fits the client role,
-/// where a player talks to a single server. It is not built to fan out many
-/// concurrent peers: a slow handshake blocks the next `accept()`. If you need
-/// that, or want to own the transport (custom TLS, HTTP routing, …), accept
-/// your own streams and drive [`ProtocolClientBuilder::accept`] on each,
-/// `tokio::spawn`-ing per peer.
+/// it serves one inbound connection at a time — a slow handshake blocks the
+/// next `accept()`. If you need concurrent handshakes, or want to own the
+/// transport (custom TLS, HTTP routing, …), accept your own streams and drive
+/// [`ProtocolClientBuilder::accept`] on each, `tokio::spawn`-ing per peer.
+///
+/// The Sendspin spec allows multiple servers to initiate connections to the
+/// same client. The keep-or-switch policy belongs to the application: read
+/// [`ProtocolClient::server_hello`] for `server_id` and `connection_reason`,
+/// compare against your persisted last-played server, and send
+/// [`GoodbyeReason::AnotherServer`] to the loser. This listener does not
+/// enforce a policy.
+///
+/// Practical notes:
+/// - Disconnect consumes the handle. Call [`ProtocolClient::disconnect`]
+///   pre-split, or `connection.guard.disconnect(...)` post-split.
+/// - [`Self::accept`] is serial. If the loser's goodbye is on the critical
+///   path, run it on a spawned task so the next inbound peer can handshake
+///   while the previous one is tearing down.
+///
+/// [`GoodbyeReason::AnotherServer`]: crate::protocol::messages::GoodbyeReason::AnotherServer
 pub struct ProtocolListener {
     tcp: TcpListener,
     template: ProtocolClientBuilder,

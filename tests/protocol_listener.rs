@@ -127,6 +127,14 @@ async fn test_listen_accepts_and_drives_handshake() {
         .expect("accept failed");
     assert!(peer_addr.ip().is_loopback(), "peer addr should be loopback");
 
+    // The application uses these fields for the multi-server keep-or-switch
+    // policy described on `ProtocolListener`; the listener must surface them
+    // verbatim from `server/hello`.
+    let hello = client.server_hello();
+    assert_eq!(hello.server_id, "test-server");
+    assert_eq!(hello.connection_reason, ConnectionReason::Playback);
+    assert_eq!(hello.active_roles, vec!["player@v1".to_string()]);
+
     let (supported_roles, mut rx, _peer_handle) = peer.await.expect("peer task panicked");
     assert_eq!(supported_roles, vec!["player@v1".to_string()]);
 
@@ -311,6 +319,19 @@ async fn test_listen_send_message_fails_after_disconnect() {
     let (_roles, _rx, _peer_handle) = peer.await.expect("peer task");
 
     let conn = client.split();
+    // `split()` must carry `server_hello` through to `Connection` — the
+    // post-split handle is what most apps actually hold onto, and every
+    // field it carries (server_id, connection_reason, active_roles) is on
+    // the documented arbitration path.
+    assert_eq!(conn.server_hello.server_id, "test-server");
+    assert_eq!(
+        conn.server_hello.connection_reason,
+        ConnectionReason::Playback
+    );
+    assert_eq!(
+        conn.server_hello.active_roles,
+        vec!["player@v1".to_string()]
+    );
     let sender = conn.sender;
     let guard = conn.guard;
     guard
