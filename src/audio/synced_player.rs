@@ -227,14 +227,16 @@ impl SyncedPlayer {
     /// The player starts at `volume` (0-100) and `muted` state. These are
     /// applied immediately — the first audio callback uses the correct gain
     /// with no ramp from a default value.
+    /// The `buffer_size` overrides cpal audio device default. If not set, the default buffer size is used.
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
         device: Option<Device>,
         volume: u8,
         muted: bool,
+        buffer_size: Option<u32>,
     ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, device, None, volume, muted)
+        Self::build(format, clock_sync, device, None, volume, muted, buffer_size)
     }
 
     /// Create a player with a process callback for post-gain audio processing.
@@ -260,7 +262,7 @@ impl SyncedPlayer {
     /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
     /// let player = SyncedPlayer::with_process_callback(
     ///     format, clock_sync, None,
-    ///     100, false,
+    ///     100, false, None,
     ///     Box::new(|data| { /* e.g. feed a VU meter or visualizer */ }),
     /// )?;
     /// # Ok(())
@@ -272,9 +274,18 @@ impl SyncedPlayer {
         device: Option<Device>,
         volume: u8,
         muted: bool,
+        buffer_size: Option<u32>,
         callback: ProcessCallback,
     ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, device, Some(callback), volume, muted)
+        Self::build(
+            format,
+            clock_sync,
+            device,
+            Some(callback),
+            volume,
+            muted,
+            buffer_size,
+        )
     }
 
     fn build(
@@ -284,6 +295,7 @@ impl SyncedPlayer {
         process_callback: Option<ProcessCallback>,
         volume: u8,
         muted: bool,
+        buffer_size: Option<u32>,
     ) -> Result<Self, Error> {
         if format.channels == 0 {
             return Err(Error::Output("channels must be > 0".to_string()));
@@ -299,7 +311,10 @@ impl SyncedPlayer {
         let config = StreamConfig {
             channels: format.channels as u16,
             sample_rate: cpal::SampleRate::from(format.sample_rate),
-            buffer_size: cpal::BufferSize::Default,
+            buffer_size: match buffer_size {
+                Some(frames) => cpal::BufferSize::Fixed(frames),
+                None => cpal::BufferSize::Default,
+            },
         };
 
         let queue = Arc::new(Mutex::new(PlaybackQueue::new()));

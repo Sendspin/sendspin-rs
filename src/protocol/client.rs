@@ -4,7 +4,7 @@
 use crate::error::Error;
 use crate::protocol::messages::{
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime, ControllerCommand,
-    ControllerCommandType, GoodbyeReason, Message, RepeatMode,
+    ControllerCommandType, GoodbyeReason, Message, RepeatMode, ServerHello,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -14,23 +14,66 @@ use futures_util::{
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
+/// `Goodbye` is one variant (not `Send` + `Close`) so the writer processes it
+/// atomically: once dequeued it flushes goodbye + close and exits, so nothing
+/// *enqueued after it* reaches the wire.
+enum WriteCommand {
+    Send {
+        msg: WsMessage,
+        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    },
+    Goodbye {
+        reason: GoodbyeReason,
+        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    },
+}
 
-/// Send a goodbye message and close the WebSocket, holding the lock
-/// across both operations to prevent other tasks from sending after goodbye.
-async fn send_goodbye_and_close(
-    tx: &tokio::sync::Mutex<WsSink>,
+async fn writer_task<S>(
+    mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
+    mut rx: UnboundedReceiver<WriteCommand>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            WriteCommand::Send { msg, ack } => {
+                let result = sink
+                    .send(msg)
+                    .await
+                    .map_err(|e| Error::WebSocket(e.to_string()));
+                let failed = result.is_err();
+                // Ignore SendError: the caller may have dropped its receiver.
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+            WriteCommand::Goodbye { reason, ack } => {
+                let _ = ack.send(perform_goodbye(&mut sink, reason).await);
+                break;
+            }
+        }
+    }
+    // On exit `rx` drops, dropping the ack sender of any still-queued command;
+    // callers awaiting those acks see the cancellation and treat it as a closed
+    // connection (see `WsSender::send_message`).
+}
+
+async fn perform_goodbye<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
     reason: GoodbyeReason,
-) -> Result<(), Error> {
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
     let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
-    let mut sink = tx.lock().await;
     sink.send(WsMessage::Text(json))
         .await
         .map_err(|e| Error::WebSocket(e.to_string()))?;
@@ -56,26 +99,57 @@ pub struct Connection {
     pub sender: WsSender,
     /// Controller handle, if the server granted the `controller@v1` role
     pub controller: Option<Controller>,
+    /// The `server/hello` received during handshake. Carries `server_id`,
+    /// `connection_reason`, and `active_roles` — required for the
+    /// multi-server arbitration policy described on [`ProtocolListener`].
+    ///
+    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    pub server_hello: ServerHello,
     /// Must be held alive; dropping aborts background tasks
     pub guard: ConnectionGuard,
 }
 
-/// WebSocket sender wrapper for sending messages
+/// Cheap to clone. `send_message` returns once the writer has reported the
+/// underlying `sink.send` result, so the `Result` reflects the wire-write
+/// outcome rather than queue insertion.
 #[derive(Debug, Clone)]
 pub struct WsSender {
-    tx: Arc<tokio::sync::Mutex<WsSink>>,
+    tx: UnboundedSender<WriteCommand>,
 }
 
 impl WsSender {
-    /// Send a message to the server
+    /// Send a message to the server.
     pub async fn send_message(&self, msg: Message) -> Result<(), Error> {
         let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending message: {}", json);
 
-        let mut tx = self.tx.lock().await;
-        tx.send(WsMessage::Text(json))
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriteCommand::Send {
+                msg: WsMessage::Text(json),
+                ack: ack_tx,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+
+        // A cancelled ack means the writer dropped the command unsent — the
+        // connection is gone either way.
+        ack_rx
             .await
-            .map_err(|e| Error::WebSocket(e.to_string()))
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+    }
+
+    fn send_goodbye(
+        &self,
+        reason: GoodbyeReason,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), Error>>, Error> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriteCommand::Goodbye {
+                reason,
+                ack: ack_tx,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        Ok(ack_rx)
     }
 }
 
@@ -376,38 +450,70 @@ impl BinaryFrame {
 
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
-    ws_tx: Arc<tokio::sync::Mutex<WsSink>>,
+    out_tx: UnboundedSender<WriteCommand>,
     audio_rx: UnboundedReceiver<AudioChunk>,
     artwork_rx: UnboundedReceiver<ArtworkChunk>,
     visualizer_rx: UnboundedReceiver<VisualizerChunk>,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
-    has_controller: bool,
+    server_hello: ServerHello,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
 
-/// Guard that aborts background tasks (message router, clock sync)
-/// when dropped. Hold onto this as long as the connection should
-/// remain active.
+/// Aborts background tasks on drop. Hold this alive for the lifetime of the
+/// connection.
 pub struct ConnectionGuard {
-    router_handle: tokio::task::JoinHandle<()>,
-    sync_handle: tokio::task::JoinHandle<()>,
+    sender: WsSender,
+    router_handle: Option<tokio::task::JoinHandle<()>>,
+    sync_handle: Option<tokio::task::JoinHandle<()>>,
+    writer_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionGuard {
-    /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
-    /// and aborts background tasks.
-    pub async fn disconnect(self, sender: &WsSender, reason: GoodbyeReason) -> Result<(), Error> {
-        send_goodbye_and_close(&sender.tx, reason).await
-        // dropping self aborts background tasks
+    /// Gracefully disconnect: enqueue `client/goodbye`, await the writer's
+    /// ack so the goodbye + close frames are known to have flushed (or
+    /// surface the wire error if they didn't), then reap the writer.
+    pub async fn disconnect(mut self, reason: GoodbyeReason) -> Result<(), Error> {
+        // Stop clock-sync first so it can't enqueue time samples behind the
+        // goodbye. The reader stays up until the goodbye/close has flushed
+        // (below) so the socket isn't half-closed while we're still writing.
+        if let Some(h) = self.sync_handle.take() {
+            h.abort();
+        }
+
+        let ack_rx = self.sender.send_goodbye(reason)?;
+        let goodbye_result = ack_rx
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+
+        // Reap the writer separately from awaiting its ack — the ack arrives
+        // just before the task returns, so this only joins the trailing
+        // teardown.
+        if let Some(h) = self.writer_handle.take() {
+            let _ = h.await;
+        }
+
+        // Goodbye + close are flushed; tear the reader down now.
+        if let Some(h) = self.router_handle.take() {
+            h.abort();
+        }
+
+        goodbye_result
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.router_handle.abort();
-        self.sync_handle.abort();
+        if let Some(h) = self.router_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.sync_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.writer_handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -422,86 +528,90 @@ impl ProtocolClient {
     where
         R: IntoClientRequest + Unpin,
     {
-        // Connect WebSocket
         let (ws_stream, _) = connect_async(request)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        let (mut write, read) = ws_stream.split();
+        Self::drive(ws_stream, hello, initial_state, clock).await
+    }
 
-        // Send client hello
+    /// Drive the protocol-client state machine over an already-handshaked
+    /// WebSocket stream. Shared between outbound `connect()` and inbound
+    /// acceptor paths.
+    pub(crate) async fn drive<S>(
+        ws_stream: WebSocketStream<S>,
+        hello: ClientHello,
+        initial_state: ClientState,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut write, mut read) = ws_stream.split();
+
+        // The handshake exchange (hello + state) sends directly on the sink
+        // rather than through the writer task, so handshake failures are
+        // returned synchronously instead of through an ack channel.
         let hello_msg = Message::ClientHello(hello);
         let hello_json =
             serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
-
         log::debug!("Sending client/hello: {}", hello_json);
-
         write
             .send(WsMessage::Text(hello_json))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
-        // Wait for server hello (handle Ping/Pong first)
-        let mut read_temp = read;
         log::debug!("Waiting for server/hello...");
-
         let server_hello = loop {
-            if let Some(result) = read_temp.next().await {
-                match result {
-                    Ok(WsMessage::Text(text)) => {
-                        log::debug!("Received text message: {}", text);
-                        let msg: Message = serde_json::from_str(&text).map_err(|e| {
-                            log::error!("Failed to parse server message: {}", e);
-                            Error::Protocol(e.to_string())
-                        })?;
-
-                        match msg {
-                            Message::ServerHello(server_hello) => {
-                                log::info!(
-                                    "Connected to server: {} ({})",
-                                    server_hello.name,
-                                    server_hello.server_id
-                                );
-                                break server_hello;
-                            }
-                            _ => {
-                                log::error!("Expected server/hello, got: {:?}", msg);
-                                return Err(Error::Protocol("Expected server/hello".to_string()));
-                            }
-                        }
-                    }
-                    Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                        log::debug!("Received Ping/Pong, continuing to wait for server/hello");
-                        continue;
-                    }
-                    Ok(WsMessage::Close(_)) => {
-                        log::error!("Server closed connection");
-                        return Err(Error::Connection("Server closed connection".to_string()));
-                    }
-                    Ok(other) => {
-                        log::warn!(
-                            "Unexpected message type while waiting for hello: {:?}",
-                            other
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        log::error!("WebSocket error: {}", e);
-                        return Err(Error::WebSocket(e.to_string()));
-                    }
-                }
-            } else {
+            let Some(result) = read.next().await else {
                 log::error!("Connection closed before receiving server/hello");
                 return Err(Error::Connection("No server hello received".to_string()));
+            };
+            match result {
+                Ok(WsMessage::Text(text)) => {
+                    log::debug!("Received text message: {}", text);
+                    let msg: Message = serde_json::from_str(&text).map_err(|e| {
+                        log::error!("Failed to parse server message: {}", e);
+                        Error::Protocol(e.to_string())
+                    })?;
+
+                    match msg {
+                        Message::ServerHello(server_hello) => {
+                            log::info!(
+                                "Connected to server: {} ({})",
+                                server_hello.name,
+                                server_hello.server_id
+                            );
+                            break server_hello;
+                        }
+                        _ => {
+                            log::error!("Expected server/hello, got: {:?}", msg);
+                            return Err(Error::Protocol("Expected server/hello".to_string()));
+                        }
+                    }
+                }
+                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
+                    log::debug!("Received Ping/Pong, continuing to wait for server/hello");
+                    continue;
+                }
+                Ok(WsMessage::Close(_)) => {
+                    log::error!("Server closed connection");
+                    return Err(Error::Connection("Server closed connection".to_string()));
+                }
+                Ok(other) => {
+                    log::warn!(
+                        "Unexpected message type while waiting for hello: {:?}",
+                        other
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    log::error!("WebSocket error: {}", e);
+                    return Err(Error::WebSocket(e.to_string()));
+                }
             }
         };
 
-        let has_controller = server_hello
-            .active_roles
-            .iter()
-            .any(|r| r == "controller@v1");
-
-        // Send initial client/state
         let state_msg = Message::ClientState(initial_state);
         let state_json =
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
@@ -511,69 +621,49 @@ impl ProtocolClient {
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
-        // Create channels for message routing
+        let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
         let (audio_tx, audio_rx) = unbounded_channel();
         let (artwork_tx, artwork_rx) = unbounded_channel();
         let (visualizer_tx, visualizer_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
-
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
-        let ws_tx = Arc::new(tokio::sync::Mutex::new(write));
 
-        // Spawn message router task
-        let clock_sync_clone = Arc::clone(&clock_sync);
+        let writer_handle = tokio::spawn(writer_task(write, out_rx));
+
+        let clock_sync_router = Arc::clone(&clock_sync);
         let clock_router = Arc::clone(&clock);
         let router_handle = tokio::spawn(async move {
             Self::message_router(
-                read_temp,
+                read,
                 audio_tx,
                 artwork_tx,
                 visualizer_tx,
                 message_tx,
-                clock_sync_clone,
+                clock_sync_router,
                 clock_router,
             )
             .await;
         });
 
-        // Spawn periodic time sync task. Sends two rapid samples
-        // at startup (10ms apart) so the Kalman filter reaches
-        // is_synchronized() within ~20ms instead of ~2s, then
-        // settles into a 1-second cadence for ongoing correction.
-        let ws_tx_sync = Arc::clone(&ws_tx);
+        // First two samples fire 10ms apart so the Kalman filter converges
+        // in ~20ms; the remainder run at 1Hz for ongoing drift correction.
+        let sync_sender = WsSender { tx: out_tx.clone() };
         let sync_handle = tokio::spawn(async move {
-            log::debug!("Clock sync task started");
             let mut sample_count: u32 = 0;
             'sync: loop {
-                // Send first, then sleep — the first sample fires at t=0
-                // instead of waiting for the initial delay.
-                let sent = 'send: {
-                    // Acquire the write lock in a block so it's always
-                    // released before sleeping, even on error paths.
-                    let mut tx = ws_tx_sync.lock().await;
-                    let t1 = clock.now_micros();
-                    let msg = Message::ClientTime(ClientTime {
-                        client_transmitted: t1,
-                    });
-                    let json = match serde_json::to_string(&msg) {
-                        Ok(j) => j,
-                        Err(e) => {
-                            log::warn!("Failed to serialize client/time: {}", e);
-                            break 'send false;
-                        }
-                    };
-                    if tx.send(WsMessage::Text(json)).await.is_err() {
-                        log::info!("Clock sync task exiting: connection closed");
+                let t1 = clock.now_micros();
+                let msg = Message::ClientTime(ClientTime {
+                    client_transmitted: t1,
+                });
+                match sync_sender.send_message(msg).await {
+                    Ok(()) => {
+                        sample_count = sample_count.saturating_add(1);
+                    }
+                    Err(e) => {
+                        log::info!("Clock sync task exiting: {}", e);
                         break 'sync;
                     }
-                    true
-                }; // tx dropped here — released before sleeping
-                if sent {
-                    sample_count = sample_count.saturating_add(1);
                 }
-                // First two successful sends use a 10ms interval so the
-                // Kalman filter converges quickly (~20ms), then switch
-                // to a 1-second cadence for ongoing drift correction.
                 let delay = if sample_count < 2 {
                     tokio::time::Duration::from_millis(10)
                 } else {
@@ -584,29 +674,33 @@ impl ProtocolClient {
         });
 
         Ok(Self {
-            ws_tx,
+            out_tx: out_tx.clone(),
             audio_rx,
             artwork_rx,
             visualizer_rx,
             message_rx,
             clock_sync,
-            has_controller,
+            server_hello,
             guard: ConnectionGuard {
-                router_handle,
-                sync_handle,
+                sender: WsSender { tx: out_tx },
+                router_handle: Some(router_handle),
+                sync_handle: Some(sync_handle),
+                writer_handle: Some(writer_handle),
             },
         })
     }
 
-    async fn message_router(
-        mut read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    async fn message_router<S>(
+        mut read: SplitStream<WebSocketStream<S>>,
         audio_tx: UnboundedSender<AudioChunk>,
         artwork_tx: UnboundedSender<ArtworkChunk>,
         visualizer_tx: UnboundedSender<VisualizerChunk>,
         message_tx: UnboundedSender<Message>,
         clock_sync: Arc<Mutex<ClockSync>>,
         clock: Arc<dyn Clock>,
-    ) {
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let mut audio_closed = false;
         let mut artwork_closed = false;
         let mut visualizer_closed = false;
@@ -693,9 +787,7 @@ impl ProtocolClient {
                         }
                     }
                 }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                    // Handled automatically by tokio-tungstenite
-                }
+                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
                 Ok(WsMessage::Close(_)) => {
                     log::info!("Server closed connection");
                     break;
@@ -712,8 +804,7 @@ impl ProtocolClient {
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
     /// and aborts background tasks.
     pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
-        let sender = WsSender { tx: self.ws_tx };
-        self.guard.disconnect(&sender, reason).await
+        self.guard.disconnect(reason).await
     }
 
     /// Get reference to clock sync
@@ -721,28 +812,38 @@ impl ProtocolClient {
         Arc::clone(&self.clock_sync)
     }
 
+    /// The `server/hello` received during handshake. Carries `server_id`,
+    /// `connection_reason`, and `active_roles` — required for the
+    /// multi-server arbitration policy described on [`ProtocolListener`].
+    ///
+    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    pub fn server_hello(&self) -> &ServerHello {
+        &self.server_hello
+    }
+
     /// Split into separate receivers for concurrent processing.
     ///
     /// This allows using `tokio::select!` to process messages and binary
     /// data concurrently. Use the fields you need; ignore the rest.
     pub fn split(self) -> Connection {
-        let controller = if self.has_controller {
-            Some(Controller {
-                sender: WsSender {
-                    tx: Arc::clone(&self.ws_tx),
-                },
-            })
-        } else {
-            None
-        };
+        let sender = WsSender { tx: self.out_tx };
+        let controller = self
+            .server_hello
+            .active_roles
+            .iter()
+            .any(|r| r == "controller@v1")
+            .then(|| Controller {
+                sender: sender.clone(),
+            });
         Connection {
             messages: self.message_rx,
             audio: self.audio_rx,
             artwork: self.artwork_rx,
             visualizer: self.visualizer_rx,
             clock_sync: self.clock_sync,
-            sender: WsSender { tx: self.ws_tx },
+            sender,
             controller,
+            server_hello: self.server_hello,
             guard: self.guard,
         }
     }

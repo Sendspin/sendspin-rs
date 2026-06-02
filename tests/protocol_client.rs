@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientSyncState, ControllerCommandType, GoodbyeReason, Message,
-    PlayerState, PlayerV1Support, RepeatMode,
+    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, ControllerCommandType,
+    GoodbyeReason, Message, PlayerState, PlayerV1Support, RepeatMode,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -90,7 +90,13 @@ async fn test_connect_sends_initial_state() {
         })
         .build();
 
-    let _client = builder.connect(&url).await.unwrap();
+    let client = builder.connect(&url).await.unwrap();
+
+    // Regression guard: the server_hello fields needed for multi-server
+    // arbitration must survive `connect()` just as they do `accept()`.
+    let hello = client.server_hello();
+    assert_eq!(hello.server_id, "test-server");
+    assert_eq!(hello.connection_reason, ConnectionReason::Playback);
 
     // First message after handshake should be client/state
     let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -226,16 +232,12 @@ async fn test_connection_disconnect_sends_goodbye_and_closes() {
         .await
         .unwrap();
     let conn = client.split();
-    let sender = conn.sender;
     let guard = conn.guard;
 
     // Let clock sync send at least one client/time
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    guard
-        .disconnect(&sender, GoodbyeReason::Shutdown)
-        .await
-        .unwrap();
+    guard.disconnect(GoodbyeReason::Shutdown).await.unwrap();
 
     // Drain remaining messages — should find goodbye then channel closes
     let mut found_goodbye = false;
@@ -491,6 +493,14 @@ async fn test_no_controller_when_server_denies_role() {
         conn.controller.is_none(),
         "should not have controller when server denies the role"
     );
+    // Post-split outbound coverage of server_hello, and the active_roles
+    // assertion in particular: the same vec drives both controller
+    // materialization (above) and the multi-server arbitration policy.
+    assert_eq!(conn.server_hello.server_id, "test-server");
+    assert_eq!(
+        conn.server_hello.active_roles,
+        vec!["player@v1".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -603,12 +613,7 @@ async fn test_clock_sync_getter_returns_shared_handle() {
 
 #[tokio::test]
 async fn test_message_router_forwards_binary_audio() {
-    // End-to-end: server sends a binary audio frame, it should land in
-    // `conn.audio`. Exercises the router's `WsMessage::Binary` arm, the
-    // audio-channel dispatch, and the `!audio_closed && send.is_err()`
-    // guard (which must still forward successfully when the channel is
-    // open). A regression anywhere along the path manifests as
-    // `conn.audio.recv()` timing out.
+    // End-to-end: a binary audio frame routes into `conn.audio`.
     let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -645,11 +650,8 @@ async fn test_message_router_forwards_binary_audio() {
 
 #[tokio::test]
 async fn test_message_router_forwards_binary_artwork() {
-    // Mirror of the audio routing test for the artwork path (binary
-    // types 8-11). The artwork channel-dispatch and its
-    // `!artwork_closed && send.is_err()` guard are structurally distinct
-    // from the audio path — each channel has its own closed-flag and send
-    // wiring, so each needs its own end-to-end coverage.
+    // Mirror of the audio test for the artwork path. Each binary channel has
+    // its own closed-flag and send wiring, so each needs separate coverage.
     let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -677,10 +679,7 @@ async fn test_message_router_forwards_binary_artwork() {
 
 #[tokio::test]
 async fn test_message_router_forwards_binary_visualizer() {
-    // Mirror of the audio routing test for the visualizer path (binary
-    // type 16 / 0x10). Like artwork, visualizer has its own
-    // channel-dispatch and `!visualizer_closed && send.is_err()` guard,
-    // independent of the audio and artwork paths.
+    // Mirror of the audio test for the visualizer path (binary type 16).
     let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -707,11 +706,7 @@ async fn test_message_router_forwards_binary_visualizer() {
 
 #[tokio::test]
 async fn test_message_router_forwards_text_messages() {
-    // End-to-end: server sends a protocol text message, it should land in
-    // `conn.messages`. Exercises the router's `WsMessage::Text` arm, the
-    // JSON deserialization step, and the `!message_closed && send.is_err()`
-    // guard. A regression in any of those paths manifests as
-    // `conn.messages.recv()` timing out.
+    // End-to-end: a server text message routes into `conn.messages`.
     let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -753,4 +748,151 @@ fn test_client_receives_stream_start() {
 fn test_client_handles_audio_chunks() {
     // Test that client can receive binary audio chunks
     // Will implement when we have full client
+}
+
+/// Contract: `send_message` returns `Err` once the writer task is gone.
+/// Without this, callers could see `Ok` for sends that never reached the wire.
+#[tokio::test]
+async fn test_send_message_fails_after_disconnect() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .controller()
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+    let controller = conn
+        .controller
+        .take()
+        .expect("controller granted by test server");
+    let guard = conn.guard;
+
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+
+    guard.disconnect(GoodbyeReason::Shutdown).await.unwrap();
+
+    let result = controller.play().await;
+    assert!(result.is_err(), "expected Err, got {:?}", result);
+}
+
+/// `disconnect` must not return until the writer has actually exited,
+/// across every clone of the sender handle.
+#[tokio::test]
+async fn test_disconnect_observes_writer_completion() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .controller()
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let mut conn = client.split();
+    let controller = conn
+        .controller
+        .take()
+        .expect("controller granted by test server");
+    let sender_clone = conn.sender.clone();
+    let guard = conn.guard;
+
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+
+    guard.disconnect(GoodbyeReason::Shutdown).await.unwrap();
+
+    assert!(controller.play().await.is_err());
+    assert!(sender_clone
+        .send_message(Message::ClientCommand(ClientCommand { controller: None }))
+        .await
+        .is_err());
+}
+
+/// When the peer sends a WS Close mid-stream, the router must terminate the
+/// message stream, and sends must eventually fail once the writer hits the
+/// dead socket. This is the primary real-world disconnect path.
+#[tokio::test]
+async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("ws://{}", addr);
+
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = accept_async(stream).await.unwrap();
+        let _ = ws.next().await; // client/hello
+        let hello = serde_json::to_string(&Message::ServerHello(
+            sendspin::protocol::messages::ServerHello {
+                server_id: "test-server".to_string(),
+                name: "Test Server".to_string(),
+                version: 1,
+                active_roles: vec!["player@v1".to_string()],
+                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+            },
+        ))
+        .unwrap();
+        ws.send(WsMessage::Text(hello)).await.unwrap();
+        let _ = ws.next().await; // initial client/state
+        ws.close(None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    });
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(2), conn.messages.recv())
+        .await
+        .expect("message stream did not terminate after peer close");
+    assert!(
+        terminal.is_none(),
+        "expected message channel to close (None) after peer WS close, got {terminal:?}"
+    );
+
+    // The first send may race ahead of the close registering locally; retry a
+    // bounded number of times until the writer observes the dead socket.
+    let mut last = Ok(());
+    for _ in 0..20 {
+        last = conn
+            .sender
+            .send_message(Message::ClientCommand(ClientCommand { controller: None }))
+            .await;
+        if last.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        last.is_err(),
+        "send eventually fails after peer close, got {last:?}"
+    );
+}
+
+/// A send racing a disconnect must resolve cleanly — never deadlock, never
+/// panic. disconnect succeeds (peer is alive, goodbye flushes); the racing
+/// send either lands before the goodbye (Ok) or is rejected because the
+/// writer already exited (Err). Both are correct.
+#[tokio::test]
+async fn test_concurrent_send_during_disconnect_is_clean() {
+    let (mut rx, controller, conn, _handle) = connect_with_controller().await;
+    let guard = conn.guard;
+
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+
+    let (send_res, disc_res) =
+        tokio::join!(controller.play(), guard.disconnect(GoodbyeReason::Shutdown),);
+
+    disc_res.expect("disconnect should succeed against a live peer");
+    // send_res is intentionally not asserted: Ok (landed before goodbye) and
+    // Err (writer already exited) are both correct. The contract under test is
+    // that join! returned at all — neither future deadlocked.
+    let _ = send_res;
 }
