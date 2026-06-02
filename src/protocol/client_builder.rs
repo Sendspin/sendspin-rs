@@ -1,6 +1,7 @@
 // ABOUTME: Builder exposed for public usage of the library
 
 use crate::error::Error;
+use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
     PlayerState, PlayerV1Support, VisualizerV1Support,
@@ -8,7 +9,10 @@ use crate::protocol::messages::{
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::WebSocketStream;
 use typed_builder::TypedBuilder;
 
 /// Intermediate builder struct before finalization
@@ -191,6 +195,35 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
+        let (hello, initial_state, clock) = self.into_parts();
+        ProtocolClient::connect(request, hello, initial_state, clock).await
+    }
+
+    /// Adopt an already-handshaked WebSocket stream and drive the protocol
+    /// from `client/hello` onwards.
+    ///
+    /// Use this when you're terminating TLS, routing by HTTP path, or
+    /// otherwise need to own the WebSocket layer yourself. For the common
+    /// "bind a TCP socket and accept inbound peers" case, use
+    /// [`Self::listen`].
+    pub async fn accept<S>(self, ws_stream: WebSocketStream<S>) -> Result<ProtocolClient, Error>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (hello, initial_state, clock) = self.into_parts();
+        ProtocolClient::drive(ws_stream, hello, initial_state, clock).await
+    }
+
+    /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
+    /// inbound WebSocket peers. The builder is cloned per accepted peer.
+    pub async fn listen<A: ToSocketAddrs>(self, addr: A) -> Result<ProtocolListener, Error> {
+        let tcp = TcpListener::bind(addr)
+            .await
+            .map_err(|e| Error::Connection(format!("TCP bind failed: {e}")))?;
+        Ok(ProtocolListener::new(tcp, self))
+    }
+
+    fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>) {
         let hello = ClientHello {
             client_id: self.client_id,
             name: self.name,
@@ -211,6 +244,6 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        ProtocolClient::connect(request, hello, initial_state, self.clock).await
+        (hello, initial_state, self.clock)
     }
 }

@@ -5,10 +5,13 @@
 pub mod client;
 /// Builder for easy construction of the client
 pub mod client_builder;
+/// Inbound WebSocket acceptor for server-initiated connections
+pub mod listener;
 /// Protocol message type definitions and serialization
 pub mod messages;
 
 pub use client::Connection;
 pub use client::Controller;
 pub use client::WsSender;
+pub use listener::ProtocolListener;
 pub use messages::Message;

@@ -36,7 +36,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .controller
         .expect("server should grant controller role");
     let mut message_rx = conn.messages;
-    let sender = conn.sender;
     let guard = conn.guard;
 
     println!("Commands: play, pause, stop, next, prev, vol <0-100>, mute, unmute,");
@@ -92,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    guard.disconnect(&sender, GoodbyeReason::Shutdown).await?;
+    guard.disconnect(GoodbyeReason::Shutdown).await?;
 
     Ok(())
 }
