@@ -379,6 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     device.as_ref().cloned(),
                                     100,
                                     false,
+                                    None,
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
