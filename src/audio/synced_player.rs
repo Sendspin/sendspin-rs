@@ -687,7 +687,7 @@ mod tests {
             codec_header: None,
         };
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
-        let result = SyncedPlayer::new(format, clock_sync, None, 100, false);
+        let result = SyncedPlayer::new(format, clock_sync, None, 100, false, None);
         let err = match result {
             Ok(_) => panic!("channels=0 should be rejected"),
             Err(e) => e,
