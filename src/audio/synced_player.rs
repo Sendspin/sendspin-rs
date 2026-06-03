@@ -671,10 +671,10 @@ impl SyncedPlayer {
             SampleFormat::U16 => output_stream!(u16),
             SampleFormat::U32 => output_stream!(u32),
             SampleFormat::U64 => output_stream!(u64),
-            _ => panic!(
+            _ => Err(Error::Output(format!(
                 "Unsupported sample format: {:?}",
                 device_config.sample_format()
-            ),
+            ))),
         };
 
         Ok(stream?)
