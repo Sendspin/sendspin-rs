@@ -1,4 +1,5 @@
-use sendspin::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+use cpal::Sample;
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec};
 use sendspin::scheduler::AudioScheduler;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +22,7 @@ fn test_scheduler_schedule_and_ready() {
         codec_header: None,
     };
 
-    let samples = vec![Sample::ZERO; 960];
+    let samples = vec![i32::EQUILIBRIUM; 960];
     let buffer = AudioBuffer {
         timestamp: 0,
         play_at: Instant::now() + Duration::from_millis(10),
@@ -55,7 +56,7 @@ fn test_scheduler_clear() {
 
     // Schedule multiple buffers
     for i in 0..3 {
-        let samples = vec![Sample::ZERO; 960];
+        let samples = vec![i32::EQUILIBRIUM; 960];
         let buffer = AudioBuffer {
             timestamp: i * 1000,
             play_at: Instant::now() + Duration::from_millis(10),
@@ -85,7 +86,7 @@ fn test_scheduler_latency_compensation() {
         codec_header: None,
     };
 
-    let samples = vec![Sample::ZERO; 960];
+    let samples = vec![i32::EQUILIBRIUM; 960];
     let buffer = AudioBuffer {
         timestamp: 0,
         play_at: Instant::now() + Duration::from_millis(50),

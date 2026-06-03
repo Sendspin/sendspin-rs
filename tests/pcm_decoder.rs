@@ -1,5 +1,5 @@
+use cpal::Sample;
 use sendspin::audio::decode::{Decoder, PcmDecoder};
-use sendspin::audio::Sample;
 
 #[test]
 fn test_decode_pcm_16bit() {
@@ -16,10 +16,10 @@ fn test_decode_pcm_16bit() {
     let samples = decoder.decode(&data).unwrap();
 
     assert_eq!(samples.len(), 4);
-    assert_eq!(samples[0].to_i16(), 1024);
-    assert_eq!(samples[1].to_i16(), 2048);
-    assert_eq!(samples[2].to_i16(), -1);
-    assert_eq!(samples[3].to_i16(), 0);
+    assert_eq!(samples[0].to_sample::<i16>(), 1024);
+    assert_eq!(samples[1].to_sample::<i16>(), 2048);
+    assert_eq!(samples[2].to_sample::<i16>(), -1);
+    assert_eq!(samples[3].to_sample::<i16>(), 0);
 }
 
 #[test]
@@ -35,8 +35,9 @@ fn test_decode_pcm_24bit() {
     let samples = decoder.decode(&data).unwrap();
 
     assert_eq!(samples.len(), 2);
-    assert_eq!(samples[0], Sample(4096));
-    assert_eq!(samples[1], Sample(-1));
+    // Values are scaled to full i32 range (left-shifted 8 bits from 24-bit).
+    assert_eq!(samples[0], 4096 << 8);
+    assert_eq!(samples[1], -1_i32 << 8);
 }
 
 #[test]
@@ -75,7 +76,7 @@ fn test_decode_pcm_16bit_single_sample_max() {
     let data = vec![0xFF, 0x7F]; // i16::MAX = 32767
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].to_i16(), i16::MAX);
+    assert_eq!(samples[0].to_sample::<i16>(), i16::MAX);
 }
 
 #[test]
@@ -84,7 +85,7 @@ fn test_decode_pcm_16bit_single_sample_min() {
     let data = vec![0x00, 0x80]; // i16::MIN = -32768 in LE
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0].to_i16(), i16::MIN);
+    assert_eq!(samples[0].to_sample::<i16>(), i16::MIN);
 }
 
 #[test]
@@ -93,7 +94,7 @@ fn test_decode_pcm_24bit_single_sample_max() {
     let data = vec![0xFF, 0xFF, 0x7F];
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample::MAX);
+    assert_eq!(samples[0], 8_388_607_i32 << 8);
 }
 
 #[test]
@@ -102,7 +103,7 @@ fn test_decode_pcm_24bit_single_sample_min() {
     let data = vec![0x00, 0x00, 0x80]; // -8388608 in 24-bit LE
     let samples = decoder.decode(&data).unwrap();
     assert_eq!(samples.len(), 1);
-    assert_eq!(samples[0], Sample::MIN);
+    assert_eq!(samples[0], i32::MIN);
 }
 
 #[test]
