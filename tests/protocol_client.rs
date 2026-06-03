@@ -1,7 +1,9 @@
 use futures_util::{SinkExt, StreamExt};
+use sendspin::error::Error;
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, ControllerCommandType,
-    GoodbyeReason, Message, PlayerState, PlayerV1Support, RepeatMode,
+    ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
+    ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message,
+    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamRequestFormat,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -63,6 +65,22 @@ async fn start_test_server() -> (
     });
 
     (url, rx, handle)
+}
+
+async fn recv_stream_request_format(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> StreamRequestFormat {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for stream/request-format")
+            .expect("channel closed");
+        match serde_json::from_str::<Message>(&msg_text).unwrap() {
+            Message::StreamRequestFormat(request) => break request,
+            Message::ClientTime(_) => continue,
+            other => panic!("expected StreamRequestFormat, got {:?}", other),
+        }
+    }
 }
 
 #[tokio::test]
@@ -170,6 +188,116 @@ async fn test_disconnect_sends_goodbye() {
         }
     }
     assert!(found_goodbye, "never received client/goodbye");
+}
+
+#[tokio::test]
+async fn test_sender_emits_stream_request_format() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    // Discard the initial client/state emitted immediately after handshake.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+
+    conn.sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await
+        .unwrap();
+
+    let request = recv_stream_request_format(&mut rx).await;
+
+    let player = request.player.expect("expected player format request");
+    assert_eq!(player.codec.as_deref(), Some("pcm"));
+    assert_eq!(player.channels, Some(2));
+    assert_eq!(player.sample_rate, Some(48_000));
+    assert_eq!(player.bit_depth, Some(16));
+    assert!(request.artwork.is_none());
+}
+
+#[tokio::test]
+async fn test_sender_emits_artwork_stream_request_format() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    // Discard the initial client/state emitted immediately after handshake.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+
+    conn.sender
+        .request_artwork_format(ArtworkFormatRequest {
+            channel: 1,
+            source: Some(ArtworkSource::Artist),
+            format: Some(ImageFormat::Png),
+            media_width: Some(400),
+            media_height: Some(300),
+        })
+        .await
+        .unwrap();
+
+    let request = recv_stream_request_format(&mut rx).await;
+
+    assert!(request.player.is_none());
+    let artwork = request.artwork.expect("expected artwork format request");
+    assert_eq!(artwork.channel, 1);
+    assert_eq!(artwork.source, Some(ArtworkSource::Artist));
+    assert_eq!(artwork.format, Some(ImageFormat::Png));
+    assert_eq!(artwork.media_width, Some(400));
+    assert_eq!(artwork.media_height, Some(300));
+}
+
+#[tokio::test]
+async fn test_sender_rejects_empty_stream_request_format() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    // Discard the initial client/state emitted immediately after handshake.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+
+    let result = conn.sender.request_stream_format(None, None).await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("requires player or artwork request"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
 }
 
 #[tokio::test]

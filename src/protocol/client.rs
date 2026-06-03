@@ -3,8 +3,9 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime, ControllerCommand,
-    ControllerCommandType, GoodbyeReason, Message, RepeatMode, ServerHello,
+    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime,
+    ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
+    RepeatMode, ServerHello, StreamRequestFormat,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -136,6 +137,45 @@ impl WsSender {
         ack_rx
             .await
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+    }
+
+    /// Request a change to the active stream format.
+    ///
+    /// Sendspin servers may use this advisory message to switch codecs,
+    /// sample rates, artwork dimensions, or other stream properties in
+    /// response to changing network, CPU, or display conditions. Fields left
+    /// as `None` are unconstrained by the client.
+    ///
+    /// This low-level sender does not enforce negotiated roles; callers should
+    /// only use it for connections where the server granted `player@v1` and/or
+    /// `artwork@v1`. Use [`Connection::server_hello`] when you need to inspect
+    /// the negotiated roles before sending.
+    pub async fn request_stream_format(
+        &self,
+        player: Option<PlayerFormatRequest>,
+        artwork: Option<ArtworkFormatRequest>,
+    ) -> Result<(), Error> {
+        if player.is_none() && artwork.is_none() {
+            return Err(Error::Protocol(
+                "stream/request-format requires player or artwork request".to_string(),
+            ));
+        }
+
+        self.send_message(Message::StreamRequestFormat(StreamRequestFormat {
+            player,
+            artwork,
+        }))
+        .await
+    }
+
+    /// Request a change to the active player/audio stream format.
+    pub async fn request_player_format(&self, player: PlayerFormatRequest) -> Result<(), Error> {
+        self.request_stream_format(Some(player), None).await
+    }
+
+    /// Request a change to an active artwork stream format.
+    pub async fn request_artwork_format(&self, artwork: ArtworkFormatRequest) -> Result<(), Error> {
+        self.request_stream_format(None, Some(artwork)).await
     }
 
     fn send_goodbye(

@@ -4,7 +4,7 @@
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
-use sendspin::protocol::messages::{Message, PlayerState};
+use sendspin::protocol::messages::{Message, PlayerFormatRequest, PlayerState};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -181,7 +181,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut message_rx = conn.messages;
     let mut audio_rx = conn.audio;
     let clock_sync = conn.clock_sync;
+    let sender = conn.sender;
     let _guard = conn.guard;
+
+    // Demonstrate `stream/request-format`: ask the server to re-encode the
+    // stream (here, lighter 16-bit PCM this example can still decode).
+    if env_bool("SS_REQUEST_FORMAT") {
+        sender
+            .request_player_format(PlayerFormatRequest {
+                codec: Some("pcm".to_string()),
+                channels: Some(2),
+                sample_rate: Some(48_000),
+                bit_depth: Some(16),
+            })
+            .await?;
+        println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
+    }
 
     println!("Waiting for stream to start...");
 
