@@ -669,7 +669,7 @@ impl SyncedPlayer {
                 .map_err(|e| Error::Output(e.to_string()))?,
             device_config,
         );
-        let stream = match device_config.sample_format() {
+        match device_config.sample_format() {
             SampleFormat::F32 => output_stream!(f32),
             SampleFormat::F64 => output_stream!(f64),
             SampleFormat::I8 => output_stream!(i8),
@@ -685,9 +685,7 @@ impl SyncedPlayer {
                 "Unsupported sample format: {:?}",
                 device_config.sample_format()
             ))),
-        };
-
-        Ok(stream?)
+        }
     }
 }
 
