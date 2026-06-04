@@ -3,7 +3,8 @@ use sendspin::error::Error;
 use sendspin::protocol::messages::{
     ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
     ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message,
-    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamRequestFormat,
+    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamArtworkChannelConfig,
+    StreamArtworkConfig, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -65,6 +66,74 @@ async fn start_test_server() -> (
     });
 
     (url, rx, handle)
+}
+
+/// Serialize a protocol message into a WebSocket text frame.
+fn text_message(msg: &Message) -> WsMessage {
+    WsMessage::Text(serde_json::to_string(msg).unwrap())
+}
+
+/// A server→client `stream/start` that starts a player stream.
+fn player_stream_start() -> WsMessage {
+    text_message(&Message::StreamStart(StreamStart {
+        player: Some(StreamPlayerConfig {
+            codec: "pcm".to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        }),
+        artwork: None,
+        visualizer: None,
+    }))
+}
+
+/// A server→client `stream/start` that starts an artwork stream.
+fn artwork_stream_start() -> WsMessage {
+    text_message(&Message::StreamStart(StreamStart {
+        player: None,
+        artwork: Some(StreamArtworkConfig {
+            channels: vec![StreamArtworkChannelConfig {
+                source: ArtworkSource::Artist,
+                format: ImageFormat::Png,
+                width: 640,
+                height: 640,
+            }],
+        }),
+        visualizer: None,
+    }))
+}
+
+/// A server→client `stream/end` for the given roles (all streams if `None`).
+fn stream_end(roles: Option<Vec<String>>) -> WsMessage {
+    text_message(&Message::StreamEnd(StreamEnd { roles }))
+}
+
+/// Discard the `client/state` the client emits immediately after handshake.
+async fn discard_initial_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+}
+
+/// Drain forwarded protocol messages until one matches `want`. The router
+/// settles stream state *before* forwarding `stream/start` / `stream/end`, so
+/// observing the awaited message here guarantees the request-format gate has
+/// settled too.
+async fn await_message(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+    want: impl Fn(&Message) -> bool,
+) {
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), messages.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("messages channel closed");
+        if want(&msg) {
+            return;
+        }
+    }
 }
 
 async fn recv_stream_request_format(
@@ -192,7 +261,7 @@ async fn test_disconnect_sends_goodbye() {
 
 #[tokio::test]
 async fn test_sender_emits_stream_request_format() {
-    let (url, mut rx, _handle) = start_test_server().await;
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
 
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -201,13 +270,12 @@ async fn test_sender_emits_stream_request_format() {
         .connect(&url)
         .await
         .unwrap();
-    let conn = client.split();
+    let mut conn = client.split();
 
-    // Discard the initial client/state emitted immediately after handshake.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("timed out waiting for initial state")
-        .expect("channel closed");
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
 
     conn.sender
         .request_player_format(PlayerFormatRequest {
@@ -231,7 +299,7 @@ async fn test_sender_emits_stream_request_format() {
 
 #[tokio::test]
 async fn test_sender_emits_artwork_stream_request_format() {
-    let (url, mut rx, _handle) = start_test_server().await;
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
 
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -240,13 +308,12 @@ async fn test_sender_emits_artwork_stream_request_format() {
         .connect(&url)
         .await
         .unwrap();
-    let conn = client.split();
+    let mut conn = client.split();
 
-    // Discard the initial client/state emitted immediately after handshake.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-        .await
-        .expect("timed out waiting for initial state")
-        .expect("channel closed");
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(artwork_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
 
     conn.sender
         .request_artwork_format(ArtworkFormatRequest {
@@ -294,6 +361,122 @@ async fn test_sender_rejects_empty_stream_request_format() {
     match result {
         Err(Error::Protocol(msg)) => assert!(
             msg.contains("requires player or artwork request"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_request_format_before_stream_start() {
+    // No stream/start: the server never starts a stream, so the gate stays shut.
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    let result = conn
+        .sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active player stream"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_player_request_after_stream_end() {
+    // The player stream starts then ends, so the gate closes again.
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    server_tx.send(stream_end(None)).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamEnd(_))).await;
+
+    let result = conn
+        .sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active player stream"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_artwork_request_without_artwork_stream() {
+    // Only a player stream is active; an artwork request has nothing to
+    // renegotiate and must be rejected for its own role.
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    let result = conn
+        .sender
+        .request_artwork_format(ArtworkFormatRequest {
+            channel: 1,
+            source: Some(ArtworkSource::Artist),
+            format: Some(ImageFormat::Png),
+            media_width: Some(400),
+            media_height: Some(300),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active artwork stream"),
             "unexpected protocol error: {msg}"
         ),
         other => panic!("expected protocol error, got {:?}", other),

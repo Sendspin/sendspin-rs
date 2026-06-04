@@ -184,20 +184,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sender = conn.sender;
     let _guard = conn.guard;
 
-    // Demonstrate `stream/request-format`: ask the server to re-encode the
-    // stream (here, lighter 16-bit PCM this example can still decode).
-    if env_bool("SS_REQUEST_FORMAT") {
-        sender
-            .request_player_format(PlayerFormatRequest {
-                codec: Some("pcm".to_string()),
-                channels: Some(2),
-                sample_rate: Some(48_000),
-                bit_depth: Some(16),
-            })
-            .await?;
-        println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
-    }
-
     println!("Waiting for stream to start...");
 
     // Configuration from environment variables
@@ -216,6 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_started = false; // Track if we've started playback
     let mut first_chunk_logged = false; // Track if we've logged the first chunk
     let mut synced_player: Option<SyncedPlayer> = None;
+    let mut format_requested = false; // One-shot guard for the request-format demo
 
     loop {
         // Process messages and audio chunks concurrently
@@ -223,6 +210,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = message_rx.recv() => {
                 match msg {
                     Message::StreamStart(stream_start) => {
+                        // Demonstrate `stream/request-format`: now that the player
+                        // stream is live, ask the server to re-encode it (here,
+                        // lighter 16-bit PCM this example can still decode).
+                        // One-shot, so the server's responding stream/start
+                        // doesn't re-trigger it.
+                        if env_bool("SS_REQUEST_FORMAT")
+                            && !format_requested
+                            && stream_start.player.is_some()
+                        {
+                            format_requested = true;
+                            sender
+                                .request_player_format(PlayerFormatRequest {
+                                    codec: Some("pcm".to_string()),
+                                    channels: Some(2),
+                                    sample_rate: Some(48_000),
+                                    bit_depth: Some(16),
+                                })
+                                .await?;
+                            println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
+                        }
+
                         if let Some(ref player_config) = stream_start.player {
                             println!(
                                 "Stream starting: codec='{}' {}Hz {}ch {}bit",

@@ -5,7 +5,7 @@ use crate::error::Error;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime,
     ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
-    RepeatMode, ServerHello, StreamRequestFormat,
+    RepeatMode, ServerHello, StreamEnd, StreamRequestFormat, StreamStart,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -14,6 +14,7 @@ use futures_util::{
     SinkExt, StreamExt,
 };
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -110,12 +111,67 @@ pub struct Connection {
     pub guard: ConnectionGuard,
 }
 
+/// Bare role names as they appear in `stream/end` role lists — distinct from
+/// the versioned `player@v1` names used during role negotiation.
+const ROLE_PLAYER: &str = "player";
+const ROLE_ARTWORK: &str = "artwork";
+
+/// Which role streams are currently active, updated by the message router from
+/// `stream/start` and `stream/end`. Only `player` and `artwork` are tracked —
+/// the only roles `stream/request-format` can target.
+#[derive(Debug, Default)]
+struct StreamState {
+    player_active: AtomicBool,
+    artwork_active: AtomicBool,
+}
+
+impl StreamState {
+    /// A `stream/start` for one role must not disturb another's stream, so
+    /// absent roles are left untouched rather than cleared.
+    fn note_stream_start(&self, start: &StreamStart) {
+        if start.player.is_some() {
+            self.player_active.store(true, Ordering::Release);
+        }
+        if start.artwork.is_some() {
+            self.artwork_active.store(true, Ordering::Release);
+        }
+    }
+
+    /// `stream/end` with no roles ends every stream; otherwise only those listed.
+    fn note_stream_end(&self, end: &StreamEnd) {
+        if role_ended(end, ROLE_PLAYER) {
+            self.player_active.store(false, Ordering::Release);
+        }
+        if role_ended(end, ROLE_ARTWORK) {
+            self.artwork_active.store(false, Ordering::Release);
+        }
+    }
+
+    fn is_player_active(&self) -> bool {
+        self.player_active.load(Ordering::Acquire)
+    }
+
+    fn is_artwork_active(&self) -> bool {
+        self.artwork_active.load(Ordering::Acquire)
+    }
+}
+
+fn role_ended(end: &StreamEnd, role: &str) -> bool {
+    end.roles
+        .as_ref()
+        .is_none_or(|roles| roles.iter().any(|r| r == role))
+}
+
 /// Cheap to clone. `send_message` returns once the writer has reported the
 /// underlying `sink.send` result, so the `Result` reflects the wire-write
 /// outcome rather than queue insertion.
 #[derive(Debug, Clone)]
 pub struct WsSender {
     tx: UnboundedSender<WriteCommand>,
+    /// The router updates this *before* forwarding the triggering `stream/start`
+    /// / `stream/end`, so a consumer that reacts to those messages already
+    /// observes the settled state.
+    stream_state: Arc<StreamState>,
 }
 
 impl WsSender {
@@ -150,6 +206,10 @@ impl WsSender {
     /// only use it for connections where the server granted `player@v1` and/or
     /// `artwork@v1`. Use [`Connection::server_hello`] when you need to inspect
     /// the negotiated roles before sending.
+    ///
+    /// A requested component is rejected unless that role's stream is currently
+    /// active (between its `stream/start` and `stream/end`): there is nothing to
+    /// renegotiate for a role the server is not streaming.
     pub async fn request_stream_format(
         &self,
         player: Option<PlayerFormatRequest>,
@@ -158,6 +218,18 @@ impl WsSender {
         if player.is_none() && artwork.is_none() {
             return Err(Error::Protocol(
                 "stream/request-format requires player or artwork request".to_string(),
+            ));
+        }
+
+        if player.is_some() && !self.stream_state.is_player_active() {
+            return Err(Error::Protocol(
+                "stream/request-format requires an active player stream".to_string(),
+            ));
+        }
+
+        if artwork.is_some() && !self.stream_state.is_artwork_active() {
+            return Err(Error::Protocol(
+                "stream/request-format requires an active artwork stream".to_string(),
             ));
         }
 
@@ -497,6 +569,7 @@ pub struct ProtocolClient {
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
     server_hello: ServerHello,
+    stream_state: Arc<StreamState>,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
@@ -667,11 +740,13 @@ impl ProtocolClient {
         let (visualizer_tx, visualizer_rx) = unbounded_channel();
         let (message_tx, message_rx) = unbounded_channel();
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
+        let stream_state = Arc::new(StreamState::default());
 
         let writer_handle = tokio::spawn(writer_task(write, out_rx));
 
         let clock_sync_router = Arc::clone(&clock_sync);
         let clock_router = Arc::clone(&clock);
+        let stream_state_router = Arc::clone(&stream_state);
         let router_handle = tokio::spawn(async move {
             Self::message_router(
                 read,
@@ -681,13 +756,17 @@ impl ProtocolClient {
                 message_tx,
                 clock_sync_router,
                 clock_router,
+                stream_state_router,
             )
             .await;
         });
 
         // First two samples fire 10ms apart so the Kalman filter converges
         // in ~20ms; the remainder run at 1Hz for ongoing drift correction.
-        let sync_sender = WsSender { tx: out_tx.clone() };
+        let sync_sender = WsSender {
+            tx: out_tx.clone(),
+            stream_state: Arc::clone(&stream_state),
+        };
         let sync_handle = tokio::spawn(async move {
             let mut sample_count: u32 = 0;
             'sync: loop {
@@ -721,8 +800,12 @@ impl ProtocolClient {
             message_rx,
             clock_sync,
             server_hello,
+            stream_state: Arc::clone(&stream_state),
             guard: ConnectionGuard {
-                sender: WsSender { tx: out_tx },
+                sender: WsSender {
+                    tx: out_tx,
+                    stream_state,
+                },
                 router_handle: Some(router_handle),
                 sync_handle: Some(sync_handle),
                 writer_handle: Some(writer_handle),
@@ -730,6 +813,7 @@ impl ProtocolClient {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // internal plumbing: per-channel senders + shared state
     async fn message_router<S>(
         mut read: SplitStream<WebSocketStream<S>>,
         audio_tx: UnboundedSender<AudioChunk>,
@@ -738,6 +822,7 @@ impl ProtocolClient {
         message_tx: UnboundedSender<Message>,
         clock_sync: Arc<Mutex<ClockSync>>,
         clock: Arc<dyn Clock>,
+        stream_state: Arc<StreamState>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -815,11 +900,23 @@ impl ProtocolClient {
                                     st.server_transmitted,
                                     t4,
                                 );
-                            } else if !message_closed && message_tx.send(msg).is_err() {
-                                log::error!(
-                                    "Message receiver dropped — messages will be discarded"
-                                );
-                                message_closed = true;
+                            } else {
+                                // Settle the request-format gate before
+                                // forwarding, so a consumer reacting to this
+                                // stream/start or stream/end sees current state.
+                                match &msg {
+                                    Message::StreamStart(start) => {
+                                        stream_state.note_stream_start(start)
+                                    }
+                                    Message::StreamEnd(end) => stream_state.note_stream_end(end),
+                                    _ => {}
+                                }
+                                if !message_closed && message_tx.send(msg).is_err() {
+                                    log::error!(
+                                        "Message receiver dropped — messages will be discarded"
+                                    );
+                                    message_closed = true;
+                                }
                             }
                         }
                         Err(e) => {
@@ -866,7 +963,10 @@ impl ProtocolClient {
     /// This allows using `tokio::select!` to process messages and binary
     /// data concurrently. Use the fields you need; ignore the rest.
     pub fn split(self) -> Connection {
-        let sender = WsSender { tx: self.out_tx };
+        let sender = WsSender {
+            tx: self.out_tx,
+            stream_state: self.stream_state,
+        };
         let controller = self
             .server_hello
             .active_roles
