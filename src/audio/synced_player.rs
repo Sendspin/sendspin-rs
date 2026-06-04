@@ -433,11 +433,16 @@ impl SyncedPlayer {
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
         let mut f32_buffer = Vec::<f32>::new();
+        let device_config = device
+            .default_output_config()
+            .map_err(|e| Error::Output(e.to_string()))?;
+        let mut stream_config = device_config.config();
+        stream_config.buffer_size = config.buffer_size;
 
         macro_rules! output_stream {
             ($sample:ty) => {
                 device.build_output_stream(
-                    config,
+                    &stream_config,
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
                     let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
                         if let Some(ref mut cb) = cb_config.process_callback {
@@ -656,16 +661,13 @@ impl SyncedPlayer {
             };
         }
 
-        let device_config = device
-            .default_output_config()
-            .map_err(|e| Error::Output(e.to_string()))?;
         log::debug!(
-            "Using output device: {}, default config: {:?}",
+            "Using output device: {}, config: {:?}",
             device
                 .id()
                 .map(|id| format!("{:?}", id))
-                .unwrap_or("Unknown Device".to_string()),
-            device_config
+                .map_err(|e| Error::Output(e.to_string()))?,
+            device_config,
         );
         let stream = match device_config.sample_format() {
             SampleFormat::F32 => output_stream!(f32),
