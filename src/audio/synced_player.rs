@@ -641,6 +641,10 @@ impl SyncedPlayer {
                         gain_ramp.apply(&mut f32_buffer, channels, target);
 
                         process_output(data, &mut f32_buffer);
+                        if log::log_enabled!(log::Level::Trace) {
+                            log::trace!("RingBuffer ({} frames): {:?}", f32_buffer.len(), f32_buffer);
+
+                        }
                     },
                     move |err| {
                         eprintln!("Audio stream error: {}", err);
