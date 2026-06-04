@@ -138,12 +138,44 @@ fn test_timestamp_boundary_zero_values() {
 fn test_clock_drift_correction() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    sync.update(1_000_000, 1_005_100, 1_005_100, 1_000_200);
-    sync.update(2_000_000, 2_005_200, 2_005_200, 2_000_200);
+    // Low-RTT samples keep drift covariance low enough for the SNR gate to
+    // permit drift correction in both conversion directions.
+    sync.update(1_000_000, 1_005_100, 1_005_100, 1_000_000);
+    sync.update(2_000_000, 2_005_200, 2_005_200, 2_000_000);
 
-    let server_time = sync.client_to_server_micros(3_000_200);
+    let server_time = sync.client_to_server_micros(3_000_000);
     // Kalman filter may introduce small rounding errors
-    assert_within(server_time, 3_005_400, 10);
+    assert_within(server_time, 3_005_300, 10);
+}
+
+#[test]
+fn test_conversions_use_offset_only_when_drift_snr_is_low() {
+    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
+
+    // First sample: offset = +100µs with tight uncertainty.
+    sync.update(1_000, 1_100, 1_100, 1_000);
+    // Second sample: offset = +120µs, but a 1ms RTT gives the drift estimate
+    // high covariance. Its SNR is below 2σ, so both conversion directions
+    // should ignore drift and use only the current offset.
+    sync.update(1_000, 1_620, 1_620, 2_000);
+
+    assert!(sync.is_synchronized());
+    assert_eq!(sync.server_to_client_micros(3_120), Some(3_000));
+    assert_eq!(sync.client_to_server_micros(3_000), Some(3_120));
+}
+
+#[test]
+fn test_conversions_apply_drift_when_snr_is_high() {
+    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
+
+    // The same +100µs → +120µs drift as the low-SNR test, but with low-RTT
+    // samples. The covariance is small enough for the 2σ SNR gate to pass.
+    sync.update(1_000, 1_100, 1_100, 1_000);
+    sync.update(2_000, 2_120, 2_120, 2_000);
+
+    assert!(sync.is_synchronized());
+    assert_eq!(sync.server_to_client_micros(3_120), Some(2_980));
+    assert_eq!(sync.client_to_server_micros(3_000), Some(3_140));
 }
 
 #[test]
