@@ -12,6 +12,7 @@ struct TimeElement {
     last_update: i64,
     offset: f64,
     drift: f64,
+    use_drift: bool,
 }
 
 #[derive(Debug)]
@@ -46,6 +47,7 @@ impl TimeFilter {
                 last_update: 0,
                 offset: 0.0,
                 drift: 0.0,
+                use_drift: false,
             },
         }
     }
@@ -70,6 +72,7 @@ impl TimeFilter {
                 last_update: self.last_update,
                 offset: self.offset,
                 drift: self.drift,
+                use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
             };
             return;
         }
@@ -85,6 +88,7 @@ impl TimeFilter {
                 last_update: self.last_update,
                 offset: self.offset,
                 drift: self.drift,
+                use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
             };
             return;
         }
@@ -133,6 +137,7 @@ impl TimeFilter {
             last_update: self.last_update,
             offset: self.offset,
             drift: self.drift,
+            use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
         };
     }
 
@@ -142,30 +147,55 @@ impl TimeFilter {
     /// diverged filter, not a quality gate.
     const MAX_DRIFT: f64 = 0.2;
 
-    fn compute_server_time(&self, client_time: i64) -> Option<i64> {
+    /// Minimum drift signal-to-noise ratio before applying drift to
+    /// conversions. `drift_covariance` is variance, so compare squared
+    /// drift against k² × covariance to avoid taking a square root.
+    const DRIFT_SNR_SIGMA: f64 = 2.0;
+
+    fn drift_is_plausible(&self) -> bool {
         // Accept only drift <= threshold; reject NaN/incomparable values.
-        if !matches!(
+        matches!(
             self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
             Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        )
+    }
+
+    fn drift_has_sufficient_snr(drift: f64, drift_covariance: f64) -> bool {
+        if !matches!(
+            drift_covariance.partial_cmp(&0.0),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
         ) {
+            return false;
+        }
+
+        let threshold = Self::DRIFT_SNR_SIGMA * Self::DRIFT_SNR_SIGMA * drift_covariance;
+        drift * drift >= threshold
+    }
+
+    fn effective_drift(&self) -> Option<f64> {
+        if !self.drift_is_plausible() {
             return None;
         }
+
+        Some(if self.current.use_drift {
+            self.current.drift
+        } else {
+            0.0
+        })
+    }
+
+    fn compute_server_time(&self, client_time: i64) -> Option<i64> {
+        let effective_drift = self.effective_drift()?;
         let dt = (client_time - self.current.last_update) as f64;
-        let offset = self.current.offset + self.current.drift * dt;
+        let offset = self.current.offset + effective_drift * dt;
         Some(client_time + offset.round() as i64)
     }
 
     fn compute_client_time(&self, server_time: i64) -> Option<i64> {
-        // Accept only drift <= threshold; reject NaN/incomparable values.
-        if !matches!(
-            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-        ) {
-            return None;
-        }
+        let effective_drift = self.effective_drift()?;
         let numerator = server_time as f64 - self.current.offset
-            + self.current.drift * self.current.last_update as f64;
-        Some((numerator / (1.0 + self.current.drift)).round() as i64)
+            + effective_drift * self.current.last_update as f64;
+        Some((numerator / (1.0 + effective_drift)).round() as i64)
     }
 
     fn is_synchronized(&self) -> bool {
