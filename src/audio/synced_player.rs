@@ -432,13 +432,23 @@ impl SyncedPlayer {
         let mut last_generation = 0u64;
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
+        let mut f32_buffer = Vec::<f32>::new();
 
         macro_rules! output_stream {
             ($sample:ty) => {
                 device.build_output_stream(
                     config,
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
-                    let mut f32_buffer = vec![];
+                    let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
+                        if let Some(ref mut cb) = cb_config.process_callback {
+                            cb(buffer);
+                        }
+
+                        for (dst, &sample) in data.iter_mut().zip(buffer.iter()) {
+                            *dst = <$sample>::from_sample(sample);
+                        }
+                    };
+
                     // Read all queue state in a single lock to avoid
                     // a TOCTOU window between generation and cursor reads.
                     // After clear(), force_reanchor is true but cursor_us
@@ -488,10 +498,11 @@ impl SyncedPlayer {
                                 let target = cb_config.gain_control.gain();
                                 let frames = data.len() / channels;
                                 gain_ramp.advance(frames, target);
-                                if let Some(ref mut cb) = cb_config.process_callback {
-                                    let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
-                                    cb(&mut f32_data);
+                                f32_buffer.resize(data.len(), 0.0);
+                                for sample in &mut f32_buffer {
+                                    *sample = 0.0;
                                 }
+                                process_output(data, &mut f32_buffer);
                                 return;
                             }
                             started = true;
@@ -559,11 +570,11 @@ impl SyncedPlayer {
                             let target = cb_config.gain_control.gain();
                             let frames = data.len() / channels;
                             gain_ramp.advance(frames, target);
-                            if let Some(ref mut cb) = cb_config.process_callback {
-                                let mut f32_data: Vec<f32> = data.iter().map(|s| f32::from_sample(*s)).collect();
-
-                                cb(&mut f32_data);
+                            f32_buffer.resize(data.len(), 0.0);
+                            for sample in &mut f32_buffer {
+                                *sample = 0.0;
                             }
+                            process_output(data, &mut f32_buffer);
                             return;
                         }
 
@@ -629,14 +640,7 @@ impl SyncedPlayer {
                         let target = cb_config.gain_control.gain();
                         gain_ramp.apply(&mut f32_buffer, channels, target);
 
-                        if let Some(ref mut cb) = cb_config.process_callback {
-                            cb(&mut f32_buffer);
-                        }
-
-                        for (i, &f) in f32_buffer.iter().enumerate() {
-                            data[i] = <$sample>::from_sample(f);
-                        }
-                        log::trace!("RingBuffer ({} frames): {:?}", f32_buffer.len(), f32_buffer);
+                        process_output(data, &mut f32_buffer);
                     },
                     move |err| {
                         eprintln!("Audio stream error: {}", err);
