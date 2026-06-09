@@ -352,7 +352,7 @@ impl SyncedPlayer {
     /// Enqueue a decoded buffer for playback.
     ///
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
-    /// drift-corrected playback. The `play_at` field is ignored.
+    /// drift-corrected playback.
     pub fn enqueue(&self, buffer: AudioBuffer) {
         self.queue.lock().push(buffer);
     }
@@ -650,7 +650,6 @@ mod tests {
     use cpal::Sample;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::time::Instant;
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {
@@ -708,7 +707,6 @@ mod tests {
         let samples = vec![i32::EQUILIBRIUM; 96];
         queue.push(AudioBuffer {
             timestamp: 1234,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -733,13 +731,11 @@ mod tests {
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(stale_samples.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 200_000,
-            play_at: Instant::now(),
             samples: Arc::from(fresh_samples.into_boxed_slice()),
             format,
         });
@@ -768,7 +764,6 @@ mod tests {
             let samples = vec![ts as i32; 48]; // 1ms of mono
             queue.push(AudioBuffer {
                 timestamp: ts,
-                play_at: Instant::now(),
                 samples: Arc::from(samples.into_boxed_slice()),
                 format: format.clone(),
             });
@@ -811,7 +806,6 @@ mod tests {
         let start_ts = 1_000_000i64; // 1 second
         queue.push(AudioBuffer {
             timestamp: start_ts,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -841,7 +835,6 @@ mod tests {
         let start_ts = 1_000_000i64;
         queue.push(AudioBuffer {
             timestamp: start_ts,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format: format.clone(),
         });
@@ -869,7 +862,6 @@ mod tests {
         let fresh_samples: Vec<i32> = (0..480 * 2).map(|_| 999).collect();
         queue.push(AudioBuffer {
             timestamp: cursor_after_drain, // starts right where we left off
-            play_at: Instant::now(),
             samples: Arc::from(fresh_samples.into_boxed_slice()),
             format,
         });
@@ -891,7 +883,6 @@ mod tests {
         let samples = vec![i32::EQUILIBRIUM; 96];
         queue.push(AudioBuffer {
             timestamp: 500_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -910,7 +901,6 @@ mod tests {
         // First buffer at 500ms — initializes cursor
         queue.push(AudioBuffer {
             timestamp: 500_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.clone().into_boxed_slice()),
             format: format.clone(),
         });
@@ -924,7 +914,6 @@ mod tests {
         // Push an earlier buffer — cursor must NOT regress
         queue.push(AudioBuffer {
             timestamp: 200_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -960,7 +949,6 @@ mod tests {
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(buf_a.into_boxed_slice()),
             format: format.clone(),
         });
@@ -976,7 +964,6 @@ mod tests {
         // at 50000 and the skip logic activates naturally.
         queue.push(AudioBuffer {
             timestamp: 25_000,
-            play_at: Instant::now(),
             samples: Arc::from(buf_b.into_boxed_slice()),
             format,
         });
@@ -1007,13 +994,11 @@ mod tests {
         // Two consecutive, non-overlapping buffers.
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 50_000, // starts exactly where A ends
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
@@ -1042,7 +1027,6 @@ mod tests {
         let samples_a: Vec<i32> = (0..480 * 2).map(|_| 111).collect();
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
@@ -1052,7 +1036,6 @@ mod tests {
         let samples_b: Vec<i32> = (0..480 * 2).map(|_| 222).collect();
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
@@ -1074,13 +1057,11 @@ mod tests {
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
@@ -1103,13 +1084,11 @@ mod tests {
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 12_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format: format.clone(),
         });
@@ -1122,7 +1101,6 @@ mod tests {
         let samples_c: Vec<i32> = (0..960 * 2).map(|_| 333).collect();
         queue.push(AudioBuffer {
             timestamp: 9_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_c.into_boxed_slice()),
             format,
         });
@@ -1152,14 +1130,12 @@ mod tests {
         // Push the *later* buffer (B) first …
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format: format.clone(),
         });
         // … then push the *earlier* buffer (A). A.end == B.ts (boundary case).
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format,
         });
@@ -1201,7 +1177,6 @@ mod tests {
         queue.cursor_us = 980;
         queue.queue.push_back(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -1233,13 +1208,11 @@ mod tests {
         queue.cursor_us = 50_000;
         queue.queue.push_back(AudioBuffer {
             timestamp: 49_000,
-            play_at: Instant::now(),
             samples: Arc::from(short_samples.into_boxed_slice()),
             format: format.clone(),
         });
         queue.queue.push_back(AudioBuffer {
             timestamp: 50_000,
-            play_at: Instant::now(),
             samples: Arc::from(ahead_samples.into_boxed_slice()),
             format,
         });

@@ -7,7 +7,7 @@ use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
 use sendspin::protocol::messages::{Message, PlayerState};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -394,7 +394,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(ref player) = synced_player {
                                 let buffer = AudioBuffer {
                                     timestamp: chunk.timestamp,
-                                    play_at: Instant::now(),
                                     samples,
                                     format: fmt.clone(),
                                 };
