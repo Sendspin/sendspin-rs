@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- [**breaking**] Remove unused `AudioScheduler` and the `AudioBuffer::play_at` field — superseded by `SyncedPlayer`, which converts server timestamps to local play time live in the output callback rather than baking in a schedule that goes stale when the clock estimate moves
+
 ## [0.2.1](https://github.com/Sendspin/sendspin-rs/compare/v0.2.0...v0.2.1) - 2026-05-25
 
 ### Other

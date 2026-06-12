@@ -2,7 +2,6 @@
 // ABOUTME: AudioFormat, AudioBuffer for zero-copy audio data
 
 use std::sync::Arc;
-use std::time::Instant;
 
 /// Sample type for audio data.
 ///
@@ -53,22 +52,14 @@ impl AudioFormat {
     }
 }
 
-/// Audio buffer with timestamp (zero-copy via Arc).
+/// Audio buffer with a server-loop timestamp (zero-copy via Arc).
 ///
-/// Note: [`SyncedPlayer`](crate::audio::SyncedPlayer) uses only `timestamp` for
-/// scheduling and ignores `play_at`. The `play_at` field is used by
-/// [`AudioScheduler`](crate::scheduler::AudioScheduler) for pre-computed local
-/// playback times.
+/// Scheduling keys on `timestamp`; [`SyncedPlayer`](crate::audio::SyncedPlayer)
+/// converts it to a local playback instant live in the output callback, applying
+/// the current clock-sync estimate at play time rather than baking it in here.
 pub struct AudioBuffer {
     /// Server loop timestamp in microseconds.
-    ///
-    /// Used by [`SyncedPlayer`](crate::audio::SyncedPlayer) for drift-corrected scheduling.
     pub timestamp: i64,
-    /// Computed local playback time.
-    ///
-    /// Used by [`AudioScheduler`](crate::scheduler::AudioScheduler). Ignored by
-    /// [`SyncedPlayer`](crate::audio::SyncedPlayer) which computes timing from `timestamp`.
-    pub play_at: Instant,
     /// Immutable, shareable sample data.
     pub samples: Arc<[Sample]>,
     /// Audio format specification.
