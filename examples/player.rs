@@ -5,7 +5,7 @@ use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
 use sendspin::protocol::messages::{
-    Message, PlayerCommand, PlayerCommandType, PlayerState, PlayerStateCommand,
+    Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand,
 };
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
@@ -183,6 +183,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut message_rx = conn.messages;
     let mut audio_rx = conn.audio;
     let clock_sync = conn.clock_sync;
+    let sender = conn.sender;
     let _guard = conn.guard;
 
     println!("Waiting for stream to start...");
@@ -203,7 +204,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_started = false; // Track if we've started playback
     let mut first_chunk_logged = false; // Track if we've logged the first chunk
     let mut synced_player: Option<SyncedPlayer> = None;
-    // Retained so a command arriving before the player exists still applies.
+    let mut format_requested = false; // One-shot guard for the request-format demo
+                                      // Retained so a command arriving before the player exists still applies.
     let mut static_delay_ms: u16 = 0;
 
     loop {
@@ -212,6 +214,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = message_rx.recv() => {
                 match msg {
                     Message::StreamStart(stream_start) => {
+                        // Demonstrate `stream/request-format`: now that the player
+                        // stream is live, ask the server to re-encode it (here,
+                        // lighter 16-bit PCM this example can still decode).
+                        // One-shot, so the server's responding stream/start
+                        // doesn't re-trigger it.
+                        if env_bool("SS_REQUEST_FORMAT")
+                            && !format_requested
+                            && stream_start.player.is_some()
+                        {
+                            format_requested = true;
+                            sender
+                                .request_player_format(PlayerFormatRequest {
+                                    codec: Some("pcm".to_string()),
+                                    channels: Some(2),
+                                    sample_rate: Some(48_000),
+                                    bit_depth: Some(16),
+                                })
+                                .await?;
+                            println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
+                        }
+
                         if let Some(ref player_config) = stream_start.player {
                             println!(
                                 "Stream starting: codec='{}' {}Hz {}ch {}bit",
