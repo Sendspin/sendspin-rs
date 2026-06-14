@@ -27,13 +27,13 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-// Pending-transition slot encoding. A single slot (rather than two independent
-// flags) guarantees the protocol side always observes the *current* desired
-// state: a newer transition overwrites an undelivered older one, so we can never
-// emit a stale `synchronized` after a fresh underrun.
+// Pending-transition bit encoding. `Error` is always drained before
+// `Synchronized`, so a complete underrun/recovery cycle is reported even when it
+// happens before the protocol task wakes. A fresh underrun clears any undelivered
+// `Synchronized`, preventing stale recovery reports after playback is gated again.
 const PENDING_NONE: u8 = 0;
-const PENDING_ERROR: u8 = 1;
-const PENDING_SYNCHRONIZED: u8 = 2;
+const PENDING_ERROR: u8 = 1 << 0;
+const PENDING_SYNCHRONIZED: u8 = 1 << 1;
 
 /// Playback synchronization state transitions emitted by the recovery
 /// coordinator.
@@ -48,8 +48,8 @@ pub enum PlaybackRecoveryState {
 #[derive(Debug)]
 struct PlaybackRecoveryInner {
     recovering: AtomicBool,
-    /// Latest undelivered protocol transition (`PENDING_*`). Single slot so a
-    /// newer transition replaces an older undelivered one.
+    /// Undelivered protocol transitions (`PENDING_*` bits). Error is drained
+    /// before synchronized; a new error clears stale synchronized.
     pending: AtomicU8,
     recovery_buffer_us: AtomicI64,
     /// Wakes the protocol monitor task when `pending` changes.
@@ -57,8 +57,14 @@ struct PlaybackRecoveryInner {
 }
 
 impl PlaybackRecoveryInner {
-    fn set_pending(&self, state: u8) {
-        self.pending.store(state, Ordering::Release);
+    fn queue_error(&self) {
+        self.pending.store(PENDING_ERROR, Ordering::Release);
+        self.transition.notify_one();
+    }
+
+    fn queue_synchronized(&self) {
+        self.pending
+            .fetch_or(PENDING_SYNCHRONIZED, Ordering::AcqRel);
         self.transition.notify_one();
     }
 }
@@ -117,11 +123,13 @@ impl PlaybackRecoveryCoordinator {
     /// Mark that playback underrun occurred.
     ///
     /// This immediately gates playback and queues an `Error` transition for
-    /// protocol reporting, replacing any undelivered `Synchronized`. Repeated
-    /// underruns while already recovering keep playback gated.
+    /// protocol reporting, replacing any undelivered `Synchronized`. A subsequent
+    /// recovery queues `Synchronized` behind the undelivered `Error`, so short
+    /// underrun/recovery cycles are still fully reported. Repeated underruns
+    /// while already recovering keep playback gated.
     pub fn report_underrun(&self) {
         self.inner.recovering.store(true, Ordering::Release);
-        self.inner.set_pending(PENDING_ERROR);
+        self.inner.queue_error();
     }
 
     /// Whether audio output should remain muted while buffering after underrun.
@@ -147,7 +155,7 @@ impl PlaybackRecoveryCoordinator {
 
         if recovered {
             self.inner.recovering.store(false, Ordering::Release);
-            self.inner.set_pending(PENDING_SYNCHRONIZED);
+            self.inner.queue_synchronized();
             return true;
         }
 
@@ -181,12 +189,29 @@ impl PlaybackRecoveryMonitor {
         self.inner.transition.notified().await;
     }
 
-    /// Return and clear the pending state transition for protocol reporting.
+    /// Return and clear the next pending state transition for protocol reporting.
     pub fn take_pending_transition(&self) -> Option<PlaybackRecoveryState> {
-        match self.inner.pending.swap(PENDING_NONE, Ordering::AcqRel) {
-            PENDING_ERROR => Some(PlaybackRecoveryState::Error),
-            PENDING_SYNCHRONIZED => Some(PlaybackRecoveryState::Synchronized),
-            _ => None,
+        loop {
+            let pending = self.inner.pending.load(Ordering::Acquire);
+            let (state, new_pending) = if pending & PENDING_ERROR != 0 {
+                (PlaybackRecoveryState::Error, pending & !PENDING_ERROR)
+            } else if pending & PENDING_SYNCHRONIZED != 0 {
+                (
+                    PlaybackRecoveryState::Synchronized,
+                    pending & !PENDING_SYNCHRONIZED,
+                )
+            } else {
+                return None;
+            };
+
+            if self
+                .inner
+                .pending
+                .compare_exchange(pending, new_pending, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(state);
+            }
         }
     }
 }
@@ -230,6 +255,26 @@ mod tests {
         // At or above threshold: immediate release
         assert!(recovery.observe_buffered_duration(Some(500_000)));
         assert!(!recovery.is_recovering());
+        assert_eq!(
+            monitor.take_pending_transition(),
+            Some(PlaybackRecoveryState::Synchronized)
+        );
+        assert_eq!(monitor.take_pending_transition(), None);
+    }
+
+    #[test]
+    fn fast_recovery_reports_error_before_synchronized() {
+        let recovery = PlaybackRecoveryCoordinator::new(500);
+        let monitor = recovery.monitor();
+
+        recovery.report_underrun();
+        assert!(recovery.observe_buffered_duration(Some(500_000)));
+
+        assert_eq!(
+            monitor.take_pending_transition(),
+            Some(PlaybackRecoveryState::Error),
+            "a short underrun must still report error before recovery"
+        );
         assert_eq!(
             monitor.take_pending_transition(),
             Some(PlaybackRecoveryState::Synchronized)
