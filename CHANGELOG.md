@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/Sendspin/sendspin-rs/compare/v0.2.1...v0.3.0) - 2026-06-14
+
+### Added
+
+- emit stream/request-format messages ([#56](https://github.com/Sendspin/sendspin-rs/pull/56)) ([#63](https://github.com/Sendspin/sendspin-rs/pull/63))
+- apply static_delay_ms in the SyncedPlayer playback path ([#65](https://github.com/Sendspin/sendspin-rs/pull/65))
+- gate Kalman drift behind SNR check before conversion ([#64](https://github.com/Sendspin/sendspin-rs/pull/64))
+- [**breaking**] add option to overwrite the default buffer size ([#48](https://github.com/Sendspin/sendspin-rs/pull/48))
+- [**breaking**] add inbound WebSocket listener for server-initiated connections ([#57](https://github.com/Sendspin/sendspin-rs/pull/57))
+- add metadata role support ([#58](https://github.com/Sendspin/sendspin-rs/pull/58))
+
+### Fixed
+
+- [**breaking**] use cpal sample instead of custom implementation ([#47](https://github.com/Sendspin/sendspin-rs/pull/47))
+- pr#48 left synced_player uncompilable ([#61](https://github.com/Sendspin/sendspin-rs/pull/61))
+- [**breaking**] remove unused output code ([#46](https://github.com/Sendspin/sendspin-rs/pull/46))
+
+### Other
+
+- [**breaking**] remove vestigial AudioScheduler and AudioBuffer::play_at ([#67](https://github.com/Sendspin/sendspin-rs/pull/67))
+- add server-initiated metadata example ([#60](https://github.com/Sendspin/sendspin-rs/pull/60))
+
 ### Removed
 
 - [**breaking**] Remove unused `AudioScheduler` and the `AudioBuffer::play_at` field — superseded by `SyncedPlayer`, which converts server timestamps to local play time live in the output callback rather than baking in a schedule that goes stale when the clock estimate moves
