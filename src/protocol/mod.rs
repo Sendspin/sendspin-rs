@@ -10,8 +10,6 @@ pub mod listener;
 /// Protocol message type definitions and serialization
 pub mod messages;
 
-pub use client::Connection;
-pub use client::Controller;
-pub use client::WsSender;
+pub use client::{Connection, ConnectionGuard, Controller, WsSender};
 pub use listener::ProtocolListener;
 pub use messages::Message;

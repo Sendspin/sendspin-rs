@@ -110,6 +110,8 @@ async fn test_listen_accepts_and_drives_handshake() {
             volume: Some(60),
             muted: Some(false),
             static_delay_ms: Some(10),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         })
         .build();

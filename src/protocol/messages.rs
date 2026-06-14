@@ -266,6 +266,12 @@ pub struct PlayerState {
     /// Static delay in milliseconds (0-5000) to compensate for external speaker/amplifier latency
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub static_delay_ms: Option<u16>,
+    /// Minimum startup lead time in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub required_lead_time_ms: Option<u32>,
+    /// Requested minimum ongoing buffer duration in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub min_buffer_ms: Option<u32>,
     /// Supported player state commands
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supported_commands: Option<Vec<PlayerStateCommand>>,
@@ -280,7 +286,7 @@ pub enum PlayerStateCommand {
 }
 
 /// Client synchronization state (top-level in client/state)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSyncState {
     /// Client is operational and synchronized with server timestamps

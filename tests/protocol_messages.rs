@@ -85,6 +85,8 @@ fn test_client_state_serialization() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         }),
     };
@@ -929,6 +931,8 @@ fn test_player_state_supported_commands_roundtrip() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         }),
     };

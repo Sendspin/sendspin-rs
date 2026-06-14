@@ -6,7 +6,7 @@ use sendspin::protocol::messages::{
     PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamArtworkChannelConfig,
     StreamArtworkConfig, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{PlaybackRecoveryCoordinator, ProtocolClientBuilder};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -152,6 +152,56 @@ async fn recv_stream_request_format(
     }
 }
 
+async fn next_client_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> sendspin::protocol::messages::ClientState {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+
+        let parsed: Message = serde_json::from_str(&msg_text).unwrap();
+        if let Message::ClientState(state) = parsed {
+            return state;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_playback_recovery_monitor_sends_state_transitions() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    // Drain the initial client/state sent immediately after the handshake.
+    let initial = next_client_state(&mut rx).await;
+    assert_eq!(initial.state, Some(ClientSyncState::Synchronized));
+
+    let recovery = PlaybackRecoveryCoordinator::new(500);
+    conn.guard.monitor_playback_recovery(recovery.monitor());
+
+    recovery.report_underrun();
+    let error = next_client_state(&mut rx).await;
+    assert_eq!(error.state, Some(ClientSyncState::Error));
+    assert!(error.player.is_none());
+
+    // Below threshold: still recovering
+    assert!(!recovery.observe_buffered_duration(Some(499_999)));
+    // At threshold: releases immediately
+    assert!(recovery.observe_buffered_duration(Some(500_000)));
+    let synchronized = next_client_state(&mut rx).await;
+    assert_eq!(synchronized.state, Some(ClientSyncState::Synchronized));
+    assert!(synchronized.player.is_none());
+}
+
 #[tokio::test]
 async fn test_connect_sends_initial_state() {
     let (url, mut rx, _handle) = start_test_server().await;
@@ -173,6 +223,8 @@ async fn test_connect_sends_initial_state() {
             volume: Some(75),
             muted: Some(false),
             static_delay_ms: Some(100),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         })
         .build();
