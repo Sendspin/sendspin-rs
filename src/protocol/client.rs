@@ -3,9 +3,10 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{
-    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime,
-    ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
-    RepeatMode, ServerHello, StreamEnd, StreamRequestFormat, StreamStart,
+    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
+    ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
+    PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat,
+    StreamStart,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -193,6 +194,37 @@ impl WsSender {
         ack_rx
             .await
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+    }
+
+    /// Send a top-level client synchronization state update.
+    pub async fn send_sync_state(&self, state: ClientSyncState) -> Result<(), Error> {
+        self.send_message(Message::ClientState(ClientState {
+            state: Some(state),
+            player: None,
+        }))
+        .await
+    }
+
+    /// Tell the server this client is temporarily owned by another audio source.
+    ///
+    /// Release any Sendspin-owned output first so the external source can open
+    /// the device without racing this client's audio stream.
+    pub async fn enter_external_source(&self) -> Result<(), Error> {
+        self.send_sync_state(ClientSyncState::ExternalSource).await
+    }
+
+    /// Tell the server this client is ready for synchronized playback again.
+    ///
+    /// Include player state when volume, mute, or static delay may have changed
+    /// while the external source owned the device. Hardware/OS mixer changes
+    /// must be read through platform APIs; this library only tracks its own
+    /// software [`GainControl`](crate::audio::GainControl).
+    pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
+        self.send_message(Message::ClientState(ClientState {
+            state: Some(ClientSyncState::Synchronized),
+            player,
+        }))
+        .await
     }
 
     /// Request a change to the active stream format.
@@ -630,6 +662,18 @@ impl Drop for ConnectionGuard {
     }
 }
 
+impl Connection {
+    /// See [`WsSender::enter_external_source`].
+    pub async fn enter_external_source(&self) -> Result<(), Error> {
+        self.sender.enter_external_source().await
+    }
+
+    /// See [`WsSender::exit_external_source`].
+    pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
+        self.sender.exit_external_source(player).await
+    }
+}
+
 impl ProtocolClient {
     /// Connect to Sendspin server
     pub(crate) async fn connect<R>(
@@ -942,6 +986,26 @@ impl ProtocolClient {
     /// and aborts background tasks.
     pub async fn disconnect(self, reason: GoodbyeReason) -> Result<(), Error> {
         self.guard.disconnect(reason).await
+    }
+
+    /// See [`WsSender::enter_external_source`].
+    pub async fn enter_external_source(&self) -> Result<(), Error> {
+        WsSender {
+            tx: self.out_tx.clone(),
+            stream_state: Arc::clone(&self.stream_state),
+        }
+        .enter_external_source()
+        .await
+    }
+
+    /// See [`WsSender::exit_external_source`].
+    pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
+        WsSender {
+            tx: self.out_tx.clone(),
+            stream_state: Arc::clone(&self.stream_state),
+        }
+        .exit_external_source(player)
+        .await
     }
 
     /// Get reference to clock sync

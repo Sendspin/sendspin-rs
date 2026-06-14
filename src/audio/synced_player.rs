@@ -385,6 +385,19 @@ impl SyncedPlayer {
         self.queue.lock().clear();
     }
 
+    /// Release the underlying audio output device.
+    ///
+    /// Consuming the player drops its active `cpal::Stream`, allowing another
+    /// local source to open the same device. Use this before advertising
+    /// `state: "external_source"`.
+    ///
+    /// The returned [`GainControl`] preserves Sendspin's software volume/mute
+    /// state across the handoff. It does not reflect hardware or OS mixer
+    /// changes made by the external source.
+    pub fn release_audio_device(self) -> GainControl {
+        self.gain
+    }
+
     /// Return the configured audio format.
     pub fn format(&self) -> &AudioFormat {
         &self.format
