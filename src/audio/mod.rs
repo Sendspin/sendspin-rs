@@ -17,5 +17,5 @@ pub mod types;
 pub use gain::GainControl;
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
-pub use synced_player::{ProcessCallback, SyncedPlayer};
+pub use synced_player::{ProcessCallback, SyncedPlayer, SyncedPlayerConfig};
 pub use types::{AudioBuffer, AudioFormat, Codec};

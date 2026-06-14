@@ -2,10 +2,11 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
+use crate::playback::{PlaybackRecoveryMonitor, PlaybackRecoveryState};
 use crate::protocol::messages::{
-    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientTime,
-    ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
-    RepeatMode, ServerHello, StreamEnd, StreamRequestFormat, StreamStart,
+    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
+    ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
+    PlayerFormatRequest, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat, StreamStart,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -160,6 +161,34 @@ fn role_ended(end: &StreamEnd, role: &str) -> bool {
     end.roles
         .as_ref()
         .is_none_or(|roles| roles.iter().any(|r| r == role))
+}
+
+async fn playback_recovery_monitor_task(monitor: PlaybackRecoveryMonitor, sender: WsSender) {
+    loop {
+        // Event-driven: the coordinator notifies us when a transition is
+        // queued, so there are no idle wakeups and the `error` report lands
+        // with minimal latency. A wakeup delivered before we await is retained,
+        // so transitions are never lost between iterations.
+        monitor.notified().await;
+
+        while let Some(transition) = monitor.take_pending_transition() {
+            let state = match transition {
+                PlaybackRecoveryState::Error => ClientSyncState::Error,
+                PlaybackRecoveryState::Synchronized => ClientSyncState::Synchronized,
+            };
+            let msg = Message::ClientState(ClientState {
+                state: Some(state),
+                player: None,
+            });
+
+            log::debug!("Underrun monitor: state -> {:?}", state);
+
+            if sender.send_message(msg).await.is_err() {
+                log::info!("Underrun monitor exiting: connection closed");
+                return;
+            }
+        }
+    }
 }
 
 /// Cheap to clone. `send_message` returns once the writer has reported the
@@ -581,9 +610,27 @@ pub struct ConnectionGuard {
     router_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     writer_handle: Option<tokio::task::JoinHandle<()>>,
+    underrun_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionGuard {
+    /// Send `client/state` error/synchronized transitions for playback underruns.
+    ///
+    /// Pass the monitor obtained from
+    /// [`SyncedPlayer::recovery_monitor`](crate::audio::SyncedPlayer::recovery_monitor).
+    /// Without this call, underruns are still detected and playback is gated,
+    /// but no state transitions reach the server.
+    ///
+    /// Calling again replaces the existing monitor for this connection.
+    pub fn monitor_playback_recovery(&mut self, monitor: PlaybackRecoveryMonitor) {
+        if let Some(h) = self.underrun_handle.take() {
+            h.abort();
+        }
+        let sender = self.sender.clone();
+        let handle = tokio::spawn(playback_recovery_monitor_task(monitor, sender));
+        self.underrun_handle = Some(handle);
+    }
+
     /// Gracefully disconnect: enqueue `client/goodbye`, await the writer's
     /// ack so the goodbye + close frames are known to have flushed (or
     /// surface the wire error if they didn't), then reap the writer.
@@ -592,6 +639,9 @@ impl ConnectionGuard {
         // goodbye. The reader stays up until the goodbye/close has flushed
         // (below) so the socket isn't half-closed while we're still writing.
         if let Some(h) = self.sync_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.underrun_handle.take() {
             h.abort();
         }
 
@@ -625,6 +675,9 @@ impl Drop for ConnectionGuard {
             h.abort();
         }
         if let Some(h) = self.writer_handle.take() {
+            h.abort();
+        }
+        if let Some(h) = self.underrun_handle.take() {
             h.abort();
         }
     }
@@ -809,6 +862,7 @@ impl ProtocolClient {
                 router_handle: Some(router_handle),
                 sync_handle: Some(sync_handle),
                 writer_handle: Some(writer_handle),
+                underrun_handle: None,
             },
         })
     }
