@@ -1,4 +1,5 @@
-use sendspin::audio::{BufferPool, Sample};
+use cpal::Sample;
+use sendspin::audio::BufferPool;
 
 #[test]
 fn test_buffer_pool_creation() {
@@ -15,7 +16,7 @@ fn test_buffer_pool_get_and_return() {
     assert_eq!(buf.capacity(), 1024);
 
     // Modify it
-    buf.extend_from_slice(&vec![Sample::ZERO; 100]);
+    buf.extend_from_slice(&vec![i32::EQUILIBRIUM; 100]);
     assert_eq!(buf.len(), 100);
 
     // Return it
@@ -53,7 +54,7 @@ fn test_buffer_pool_put_actually_returns_buffer() {
     let _ = pool.get();
 
     // Put a buffer with a distinctive (larger) capacity.
-    let oversized: Vec<Sample> = Vec::with_capacity(4096);
+    let oversized: Vec<i32> = Vec::with_capacity(4096);
     pool.put(oversized);
 
     // Get should return the oversized buffer we just put back, NOT a freshly

@@ -3,13 +3,15 @@
 
 use crate::audio::gain::{GainControl, GainRamp};
 use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
-use crate::audio::{AudioBuffer, AudioFormat, Sample};
+use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Sample;
 use cpal::{Device, Stream, StreamConfig};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +37,22 @@ use std::time::{Duration, Instant};
 /// downstream usage at the cost of one vtable indirect call per audio callback
 /// (~1 ns vs the ~200 us callback budget).
 pub type ProcessCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
+
+/// Maximum static delay in milliseconds. The Sendspin protocol defines
+/// `static_delay_ms` over 0–5000; larger values are clamped to this.
+pub const MAX_STATIC_DELAY_MS: u16 = 5000;
+
+/// Convert a protocol `static_delay_ms` value to microseconds, clamping to
+/// [`MAX_STATIC_DELAY_MS`]. Out-of-range values are clamped rather than
+/// rejected so a sloppy server can't disable playback timing entirely.
+const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
+    let clamped = if delay_ms > MAX_STATIC_DELAY_MS {
+        MAX_STATIC_DELAY_MS
+    } else {
+        delay_ms
+    };
+    clamped as u64 * 1_000
+}
 
 struct PlaybackQueue {
     queue: VecDeque<AudioBuffer>,
@@ -115,7 +133,7 @@ impl PlaybackQueue {
         }
     }
 
-    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[Sample]> {
+    fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[i32]> {
         let needs_buffer = match self.current {
             None => true,
             Some(ref c) => self.index + channels > c.samples.len(),
@@ -208,6 +226,7 @@ impl PlaybackQueue {
 struct CallbackConfig {
     gain_control: GainControl,
     process_callback: Option<ProcessCallback>,
+    static_delay_us: Arc<AtomicU64>,
 }
 
 /// Synced audio output with drift correction.
@@ -218,6 +237,8 @@ pub struct SyncedPlayer {
     /// Last error from the audio stream callback, if any.
     last_error: Arc<Mutex<Option<String>>>,
     gain: GainControl,
+    /// Shared with the audio callback. See [`SyncedPlayer::set_static_delay`].
+    static_delay_us: Arc<AtomicU64>,
 }
 
 impl SyncedPlayer {
@@ -321,10 +342,12 @@ impl SyncedPlayer {
         let format_clone = format.clone();
         let last_error = Arc::new(Mutex::new(None));
         let gain = GainControl::new(volume, muted);
+        let static_delay_us = Arc::new(AtomicU64::new(0));
 
         let cb_config = CallbackConfig {
             gain_control: gain.clone(),
             process_callback,
+            static_delay_us: Arc::clone(&static_delay_us),
         };
         let error_clone = Arc::clone(&last_error);
 
@@ -345,13 +368,14 @@ impl SyncedPlayer {
             queue,
             last_error,
             gain,
+            static_delay_us,
         })
     }
 
     /// Enqueue a decoded buffer for playback.
     ///
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
-    /// drift-corrected playback. The `play_at` field is ignored.
+    /// drift-corrected playback.
     pub fn enqueue(&self, buffer: AudioBuffer) {
         self.queue.lock().push(buffer);
     }
@@ -411,6 +435,22 @@ impl SyncedPlayer {
         self.gain.set_mute(muted);
     }
 
+    /// Set the static playback delay in milliseconds (0–[`MAX_STATIC_DELAY_MS`]).
+    ///
+    /// Compensates for external speaker/amplifier latency: the server pre-sends
+    /// audio by this amount, so the player shifts each sample's emission earlier
+    /// by the same delay to keep alignment correct. Values above the maximum are
+    /// clamped. Takes effect on the next audio callback.
+    pub fn set_static_delay(&self, delay_ms: u16) {
+        self.static_delay_us
+            .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+    }
+
+    /// Current static delay in milliseconds.
+    pub fn static_delay_ms(&self) -> u16 {
+        (self.static_delay_us.load(Ordering::Relaxed) / 1_000) as u16
+    }
+
     fn build_stream(
         device: &Device,
         config: &StreamConfig,
@@ -423,7 +463,7 @@ impl SyncedPlayer {
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
-        let mut last_frame = vec![Sample::ZERO; channels];
+        let mut last_frame = vec![i32::EQUILIBRIUM; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
         let mut drop_counter = 0u32;
@@ -460,7 +500,7 @@ impl SyncedPlayer {
                         insert_counter = 0;
                         drop_counter = 0;
                         for sample in last_frame.iter_mut() {
-                            *sample = Sample::ZERO;
+                            *sample = i32::EQUILIBRIUM;
                         }
                     }
 
@@ -476,7 +516,15 @@ impl SyncedPlayer {
                     // the audio thread. force_reanchor is sticky in the
                     // queue, so it will be retried on the next callback.
                     if let (Some(cursor_us), Some(sync)) = (cursor_us, clock_sync.try_lock()) {
-                        if let Some(expected_instant) = sync.server_to_local_instant(cursor_us) {
+                        // Emit each sample `delay` earlier so downstream
+                        // (amp/speaker) latency lands it on time. The reanchor
+                        // below adds the same delay in the local→server
+                        // direction; the two signs must stay in step or the
+                        // planner chases a phantom error every callback.
+                        let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
+                        if let Some(expected_instant) =
+                            sync.server_to_local_instant_with_latency(cursor_us, delay_us)
+                        {
                             let early_window = Duration::from_millis(1);
                             if !started && playback_instant + early_window < expected_instant {
                                 for sample in data.iter_mut() {
@@ -527,7 +575,11 @@ impl SyncedPlayer {
                             }
 
                             if schedule.reanchor || force_reanchor {
-                                let client_micros = sync.instant_to_client_micros(playback_instant);
+                                // Mirror of the start-gate subtraction: audio
+                                // emitted now is heard `delay_us` later, so
+                                // anchor the cursor to that hear-instant.
+                                let client_micros = sync.instant_to_client_micros(playback_instant)
+                                    + delay_us as i64;
                                 if let Some(server_time) =
                                     sync.client_to_server_micros(client_micros)
                                 {
@@ -576,12 +628,12 @@ impl SyncedPlayer {
                                     if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                         last_frame.copy_from_slice(frame);
                                         for sample in frame {
-                                            data[out_index] = sample.to_f32();
+                                            data[out_index] = sample.to_sample::<f32>();
                                             out_index += 1;
                                         }
                                     } else {
                                         for sample in &last_frame {
-                                            data[out_index] = sample.to_f32();
+                                            data[out_index] = sample.to_sample::<f32>();
                                             out_index += 1;
                                         }
                                     }
@@ -594,7 +646,7 @@ impl SyncedPlayer {
                                 if insert_counter == 0 {
                                     insert_counter = schedule.insert_every_n_frames;
                                     for sample in &last_frame {
-                                        data[out_index] = sample.to_f32();
+                                        data[out_index] = sample.to_sample::<f32>();
                                         out_index += 1;
                                     }
                                     continue;
@@ -604,7 +656,7 @@ impl SyncedPlayer {
                             if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                 last_frame.copy_from_slice(frame);
                                 for sample in frame {
-                                    data[out_index] = sample.to_f32();
+                                    data[out_index] = sample.to_sample::<f32>();
                                     out_index += 1;
                                 }
                             } else {
@@ -635,7 +687,6 @@ impl SyncedPlayer {
         Ok(stream)
     }
 }
-
 #[cfg(test)]
 mod tests {
     // Note: SyncedPlayer's convenience methods (volume, is_muted, set_volume,
@@ -643,13 +694,13 @@ mod tests {
     // in gain.rs. Wiring tests require a real audio device (cpal Stream) and
     // cannot run in CI.
 
-    use super::{PlaybackQueue, SyncedPlayer};
-    use crate::audio::{AudioBuffer, AudioFormat, Codec, Sample};
+    use super::{static_delay_ms_to_us, PlaybackQueue, SyncedPlayer, MAX_STATIC_DELAY_MS};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec};
     use crate::error::Error;
     use crate::sync::{ClockSync, DefaultClock};
+    use cpal::Sample;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::time::Instant;
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {
@@ -701,13 +752,33 @@ mod tests {
     }
 
     #[test]
+    fn test_static_delay_ms_to_us_converts_and_clamps() {
+        // Nominal values convert milliseconds to microseconds.
+        assert_eq!(static_delay_ms_to_us(0), 0);
+        assert_eq!(static_delay_ms_to_us(100), 100_000);
+        assert_eq!(
+            static_delay_ms_to_us(MAX_STATIC_DELAY_MS),
+            MAX_STATIC_DELAY_MS as u64 * 1_000
+        );
+
+        // Out-of-range values clamp to the maximum rather than overflow or wrap.
+        assert_eq!(
+            static_delay_ms_to_us(MAX_STATIC_DELAY_MS + 1),
+            MAX_STATIC_DELAY_MS as u64 * 1_000
+        );
+        assert_eq!(
+            static_delay_ms_to_us(u16::MAX),
+            MAX_STATIC_DELAY_MS as u64 * 1_000
+        );
+    }
+
+    #[test]
     fn test_queue_clear_bumps_generation() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![i32::EQUILIBRIUM; 96];
         queue.push(AudioBuffer {
             timestamp: 1234,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -727,18 +798,16 @@ mod tests {
         // Use distinct sample values so we can verify which buffer was returned.
         // 4800 stereo frames at 48kHz = 100ms per buffer.
         // With cursor at 150ms, the first buffer (ts=0, ends at 100ms) is stale.
-        let stale_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(111)).collect();
-        let fresh_samples: Vec<Sample> = (0..4800 * 2).map(|_| Sample(222)).collect();
+        let stale_samples: Vec<i32> = (0..4800 * 2).map(|_| 111).collect();
+        let fresh_samples: Vec<i32> = (0..4800 * 2).map(|_| 222).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(stale_samples.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 200_000,
-            play_at: Instant::now(),
             samples: Arc::from(fresh_samples.into_boxed_slice()),
             format,
         });
@@ -747,14 +816,14 @@ mod tests {
         queue.initialized = true;
 
         // Copy the frame data so we can release the mutable borrow on queue.
-        let frame_data: Vec<Sample> = queue
+        let frame_data: Vec<i32> = queue
             .next_frame(2, 48_000)
             .expect("expected a frame")
             .to_vec();
         assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
         // Verify we got the fresh buffer's data, not the stale one
-        assert_eq!(frame_data[0], Sample(222));
-        assert_eq!(frame_data[1], Sample(222));
+        assert_eq!(frame_data[0], 222);
+        assert_eq!(frame_data[1], 222);
     }
 
     #[test]
@@ -764,10 +833,9 @@ mod tests {
 
         // Push out of order: 300, 100, 200
         for ts in [300_000i64, 100_000, 200_000] {
-            let samples = vec![Sample(ts as i32); 48]; // 1ms of mono
+            let samples = vec![ts as i32; 48]; // 1ms of mono
             queue.push(AudioBuffer {
                 timestamp: ts,
-                play_at: Instant::now(),
                 samples: Arc::from(samples.into_boxed_slice()),
                 format: format.clone(),
             });
@@ -806,11 +874,10 @@ mod tests {
 
         // 480 stereo frames = 10ms at 48kHz
         let num_frames = 480;
-        let samples = vec![Sample::ZERO; num_frames * 2];
+        let samples = vec![i32::EQUILIBRIUM; num_frames * 2];
         let start_ts = 1_000_000i64; // 1 second
         queue.push(AudioBuffer {
             timestamp: start_ts,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -836,11 +903,10 @@ mod tests {
         let format = test_format();
 
         // Push one buffer to initialize the cursor
-        let samples = vec![Sample::ZERO; 480 * 2]; // 10ms stereo
+        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
         let start_ts = 1_000_000i64;
         queue.push(AudioBuffer {
             timestamp: start_ts,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format: format.clone(),
         });
@@ -865,10 +931,9 @@ mod tests {
 
         // Push a new buffer after the underrun. It should NOT be
         // dropped as stale — the cursor hasn't raced ahead.
-        let fresh_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(999)).collect();
+        let fresh_samples: Vec<i32> = (0..480 * 2).map(|_| 999).collect();
         queue.push(AudioBuffer {
             timestamp: cursor_after_drain, // starts right where we left off
-            play_at: Instant::now(),
             samples: Arc::from(fresh_samples.into_boxed_slice()),
             format,
         });
@@ -876,11 +941,7 @@ mod tests {
         let frame = queue
             .next_frame(2, 48_000)
             .expect("buffer should not be dropped as stale");
-        assert_eq!(
-            frame[0],
-            Sample(999),
-            "should get the fresh buffer, not stale data"
-        );
+        assert_eq!(frame[0], 999, "should get the fresh buffer, not stale data");
     }
 
     #[test]
@@ -891,10 +952,9 @@ mod tests {
         assert!(!queue.initialized);
         assert_eq!(queue.cursor_us, 0);
 
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![i32::EQUILIBRIUM; 96];
         queue.push(AudioBuffer {
             timestamp: 500_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -908,12 +968,11 @@ mod tests {
     fn test_push_does_not_regress_cursor_after_init() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
-        let samples = vec![Sample::ZERO; 96];
+        let samples = vec![i32::EQUILIBRIUM; 96];
 
         // First buffer at 500ms — initializes cursor
         queue.push(AudioBuffer {
             timestamp: 500_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.clone().into_boxed_slice()),
             format: format.clone(),
         });
@@ -927,7 +986,6 @@ mod tests {
         // Push an earlier buffer — cursor must NOT regress
         queue.push(AudioBuffer {
             timestamp: 200_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -949,21 +1007,20 @@ mod tests {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
 
-        let buf_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
-        let buf_b: Vec<Sample> = (0..2400 * 2)
+        let buf_a: Vec<i32> = (0..2400 * 2).map(|_| 111).collect();
+        let buf_b: Vec<i32> = (0..2400 * 2)
             .map(|i| {
                 // First half (1200 frames) = 222, second half = 333
                 if i < 2400 {
-                    Sample(222)
+                    222
                 } else {
-                    Sample(333)
+                    333
                 }
             })
             .collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(buf_a.into_boxed_slice()),
             format: format.clone(),
         });
@@ -979,7 +1036,6 @@ mod tests {
         // at 50000 and the skip logic activates naturally.
         queue.push(AudioBuffer {
             timestamp: 25_000,
-            play_at: Instant::now(),
             samples: Arc::from(buf_b.into_boxed_slice()),
             format,
         });
@@ -990,8 +1046,7 @@ mod tests {
             .next_frame(2, 48_000)
             .expect("should get a frame from buffer B");
         assert_eq!(
-            frame[0],
-            Sample(333),
+            frame[0], 333,
             "expected skip into second half of buffer B (past the overlap), \
              got first half — backward-timestamped audio was replayed"
         );
@@ -1005,19 +1060,17 @@ mod tests {
         let format = test_format();
 
         // 2400 frames = 50ms per buffer. Adjacent, non-overlapping.
-        let samples_a: Vec<Sample> = (0..2400 * 2).map(|_| Sample(111)).collect();
-        let samples_b: Vec<Sample> = (0..2400 * 2).map(|_| Sample(222)).collect();
+        let samples_a: Vec<i32> = (0..2400 * 2).map(|_| 111).collect();
+        let samples_b: Vec<i32> = (0..2400 * 2).map(|_| 222).collect();
 
         // Two consecutive, non-overlapping buffers.
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 50_000, // starts exactly where A ends
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
@@ -1032,8 +1085,7 @@ mod tests {
             .next_frame(2, 48_000)
             .expect("should get first frame of buffer B");
         assert_eq!(
-            frame[0],
-            Sample(222),
+            frame[0], 222,
             "buffer B should play from the start (no skip needed)"
         );
     }
@@ -1044,27 +1096,25 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 (480 stereo frames)
-        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        let samples_a: Vec<i32> = (0..480 * 2).map(|_| 111).collect();
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         assert_eq!(queue.queue.len(), 1);
 
         // Buffer B: 10ms at ts=5000 (5ms) — overlaps A's range [0, 10000)
-        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let samples_b: Vec<i32> = (0..480 * 2).map(|_| 222).collect();
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
 
         // Should replace A, not add a second entry
         assert_eq!(queue.queue.len(), 1);
-        assert_eq!(queue.queue[0].samples[0], Sample(222));
+        assert_eq!(queue.queue[0].samples[0], 222);
     }
 
     #[test]
@@ -1074,18 +1124,16 @@ mod tests {
 
         // Two adjacent 5ms chunks (240 stereo frames each).
         // Chunk A: [0, 5000), Chunk B: [5000, 10000) — no overlap.
-        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
-        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
+        let samples_a: Vec<i32> = (0..240 * 2).map(|_| 111).collect();
+        let samples_b: Vec<i32> = (0..240 * 2).map(|_| 222).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format,
         });
@@ -1102,19 +1150,17 @@ mod tests {
         let format = test_format();
 
         // Buffer A: 10ms at ts=0 — range [0, 10000)
-        let samples_a: Vec<Sample> = (0..480 * 2).map(|_| Sample(111)).collect();
+        let samples_a: Vec<i32> = (0..480 * 2).map(|_| 111).collect();
         // Buffer B: 10ms at ts=12000 — range [12000, 22000). No overlap with A.
-        let samples_b: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let samples_b: Vec<i32> = (0..480 * 2).map(|_| 222).collect();
 
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format: format.clone(),
         });
         queue.push(AudioBuffer {
             timestamp: 12_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format: format.clone(),
         });
@@ -1124,17 +1170,16 @@ mod tests {
         // Overlaps both A (9000 < 10000 && 0 < 29000) and B (9000 < 22000 && 12000 < 29000).
         // Both stale buffers should be removed — the server will send fresh
         // data for any gaps. Keeping either would cause duplicate audio.
-        let samples_c: Vec<Sample> = (0..960 * 2).map(|_| Sample(333)).collect();
+        let samples_c: Vec<i32> = (0..960 * 2).map(|_| 333).collect();
         queue.push(AudioBuffer {
             timestamp: 9_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_c.into_boxed_slice()),
             format,
         });
 
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
-        assert_eq!(queue.queue[0].samples[0], Sample(333));
+        assert_eq!(queue.queue[0].samples[0], 333);
     }
 
     #[test]
@@ -1151,20 +1196,18 @@ mod tests {
         let format = test_format();
 
         // Two 5ms adjacent chunks: A at [0, 5000), B at [5000, 10000).
-        let samples_a: Vec<Sample> = (0..240 * 2).map(|_| Sample(111)).collect();
-        let samples_b: Vec<Sample> = (0..240 * 2).map(|_| Sample(222)).collect();
+        let samples_a: Vec<i32> = (0..240 * 2).map(|_| 111).collect();
+        let samples_b: Vec<i32> = (0..240 * 2).map(|_| 222).collect();
 
         // Push the *later* buffer (B) first …
         queue.push(AudioBuffer {
             timestamp: 5_000,
-            play_at: Instant::now(),
             samples: Arc::from(samples_b.into_boxed_slice()),
             format: format.clone(),
         });
         // … then push the *earlier* buffer (A). A.end == B.ts (boundary case).
         queue.push(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples_a.into_boxed_slice()),
             format,
         });
@@ -1200,13 +1243,12 @@ mod tests {
         let format = test_format();
 
         // Distinctive sample values so we can assert *which* frame was returned.
-        let samples: Vec<Sample> = (0..48 * 2).map(Sample).collect();
+        let samples: Vec<i32> = (0..48 * 2).map(|_| 111).collect();
 
         queue.initialized = true;
         queue.cursor_us = 980;
         queue.queue.push_back(AudioBuffer {
             timestamp: 0,
-            play_at: Instant::now(),
             samples: Arc::from(samples.into_boxed_slice()),
             format,
         });
@@ -1215,7 +1257,7 @@ mod tests {
             .next_frame(2, 48_000)
             .expect("last frame should be returned, not discarded");
         // Final stereo frame — indices 94 and 95 of the flat sample array.
-        assert_eq!(frame, &[Sample(94), Sample(95)]);
+        assert_eq!(frame, &[111, 111]);
     }
 
     #[test]
@@ -1230,21 +1272,19 @@ mod tests {
         // so it ends at 50000 which is NOT < cursor (50000), surviving
         // the stale-drop. But the skip logic sees ts=49000 < cursor=50000
         // and tries to skip 1ms (48 frames) — exactly the buffer length.
-        let short_samples: Vec<Sample> = (0..48 * 2).map(|_| Sample(111)).collect();
+        let short_samples: Vec<i32> = (0..48 * 2).map(|_| 111).collect();
         // Buffer that starts at cursor: 10ms at ts=50000
-        let ahead_samples: Vec<Sample> = (0..480 * 2).map(|_| Sample(222)).collect();
+        let ahead_samples: Vec<i32> = (0..480 * 2).map(|_| 222).collect();
 
         queue.initialized = true;
         queue.cursor_us = 50_000;
         queue.queue.push_back(AudioBuffer {
             timestamp: 49_000,
-            play_at: Instant::now(),
             samples: Arc::from(short_samples.into_boxed_slice()),
             format: format.clone(),
         });
         queue.queue.push_back(AudioBuffer {
             timestamp: 50_000,
-            play_at: Instant::now(),
             samples: Arc::from(ahead_samples.into_boxed_slice()),
             format,
         });
@@ -1255,10 +1295,6 @@ mod tests {
         let frame = queue
             .next_frame(2, 48_000)
             .expect("should return a frame from the next buffer, not panic");
-        assert_eq!(
-            frame[0],
-            Sample(222),
-            "expected frame from the ahead buffer"
-        );
+        assert_eq!(frame[0], 222, "expected frame from the ahead buffer");
     }
 }
