@@ -26,6 +26,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     metadata: bool,
     controller: bool,
@@ -92,6 +93,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             clock: Arc::new(DefaultClock::new()),
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
+            initial_sync_state: raw.initial_sync_state,
             initial_player_state: raw.initial_player_state,
         }
     }
@@ -115,6 +117,9 @@ pub struct ProtocolClientBuilderFields {
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
+    /// Initial top-level synchronization state sent in the first `client/state`.
+    #[builder(default = ClientSyncState::Synchronized)]
+    initial_sync_state: ClientSyncState,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     #[builder(default = false, setter(transform = || true))]
@@ -134,6 +139,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
+            initial_sync_state: fields.initial_sync_state,
             initial_player_state: fields.initial_player_state,
             metadata: fields.metadata,
             controller: fields.controller,
@@ -154,6 +160,7 @@ pub struct ProtocolClientBuilder {
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
+    initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     clock: Arc<dyn Clock>,
 }
@@ -240,7 +247,7 @@ impl ProtocolClientBuilder {
         };
 
         let initial_state = ClientState {
-            state: Some(ClientSyncState::Synchronized),
+            state: Some(self.initial_sync_state),
             player: self.initial_player_state,
         };
 

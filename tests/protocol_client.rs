@@ -232,6 +232,69 @@ async fn test_connect_without_player_state_sends_state_without_player() {
 }
 
 #[tokio::test]
+async fn test_connect_can_send_initial_external_source_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .initial_sync_state(ClientSyncState::ExternalSource)
+        .build();
+
+    let _client = builder.connect(&url).await.unwrap();
+
+    let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for message")
+        .expect("channel closed");
+
+    let parsed: Message = serde_json::from_str(&first_msg).unwrap();
+    match parsed {
+        Message::ClientState(cs) => {
+            assert_eq!(cs.state, Some(ClientSyncState::ExternalSource));
+            assert!(cs.player.is_none(), "expected no player state");
+        }
+        other => panic!("expected ClientState, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_connect_initial_external_source_preserves_player_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .initial_sync_state(ClientSyncState::ExternalSource)
+        .initial_player_state(PlayerState {
+            volume: Some(23),
+            muted: Some(true),
+            static_delay_ms: Some(250),
+            supported_commands: None,
+        })
+        .build();
+
+    let _client = builder.connect(&url).await.unwrap();
+
+    let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for message")
+        .expect("channel closed");
+
+    let parsed: Message = serde_json::from_str(&first_msg).unwrap();
+    match parsed {
+        Message::ClientState(cs) => {
+            assert_eq!(cs.state, Some(ClientSyncState::ExternalSource));
+            let player = cs.player.expect("expected player state");
+            assert_eq!(player.volume, Some(23));
+            assert_eq!(player.muted, Some(true));
+            assert_eq!(player.static_delay_ms, Some(250));
+        }
+        other => panic!("expected ClientState, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_disconnect_sends_goodbye() {
     let (url, mut rx, _handle) = start_test_server().await;
 
@@ -632,6 +695,93 @@ async fn next_client_command(
             return cmd;
         }
     }
+}
+
+async fn next_client_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> sendspin::protocol::messages::ClientState {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+
+        let parsed: Message = serde_json::from_str(&msg_text).unwrap();
+        if let Message::ClientState(state) = parsed {
+            return state;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_enter_external_source_sends_external_source_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let initial = next_client_state(&mut rx).await;
+    assert_eq!(initial.state, Some(ClientSyncState::Synchronized));
+
+    client.enter_external_source().await.unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::ExternalSource));
+    assert!(state.player.is_none());
+}
+
+#[tokio::test]
+async fn test_exit_external_source_sends_synchronized_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let initial = next_client_state(&mut rx).await;
+    assert_eq!(initial.state, Some(ClientSyncState::Synchronized));
+
+    client.exit_external_source(None).await.unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+    assert!(state.player.is_none());
+}
+
+#[tokio::test]
+async fn test_exit_external_source_sends_full_player_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let _initial = next_client_state(&mut rx).await;
+
+    client
+        .exit_external_source(Some(PlayerState {
+            volume: Some(42),
+            muted: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+    let player = state.player.expect("player state should be present");
+    assert_eq!(player.volume, Some(42));
+    assert_eq!(player.muted, Some(true));
 }
 
 // Macro to generate tests for simple controller commands (no parameters).
