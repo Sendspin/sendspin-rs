@@ -21,6 +21,7 @@ fn test_client_hello_serialization() {
             product_name: Some("Sendspin-RS Player".to_string()),
             manufacturer: Some("Sendspin".to_string()),
             software_version: Some("0.1.0".to_string()),
+            mac_address: None,
         }),
         player_v1_support: Some(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
