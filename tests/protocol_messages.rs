@@ -85,6 +85,8 @@ fn test_client_state_serialization() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         }),
     };
@@ -99,16 +101,16 @@ fn test_client_state_serialization() {
 }
 
 #[test]
-fn test_client_sync_state_error() {
+fn test_client_sync_state_not_synchronized() {
     let state = ClientState {
-        state: Some(ClientSyncState::Error),
+        state: Some(ClientSyncState::NotSynchronized),
         player: None,
     };
 
     let message = Message::ClientState(state);
     let json = serde_json::to_string(&message).unwrap();
 
-    assert!(json.contains("\"state\":\"error\""));
+    assert!(json.contains("\"state\":\"not_synchronized\""));
 }
 
 #[test]
@@ -929,6 +931,8 @@ fn test_player_state_supported_commands_roundtrip() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         }),
     };

@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
-use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
     Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand,
 };
@@ -164,6 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     println!("Connecting to {}...", args.server);
+    let required_lead_time_ms = 500;
+    let min_buffer_ms = 500;
+
     let test = ProtocolClientBuilder::builder()
         .client_id(client_id)
         .name(args.name.clone())
@@ -171,6 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(required_lead_time_ms),
+            min_buffer_ms: Some(min_buffer_ms),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         })
         .build();
@@ -414,13 +419,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if synced_player.is_none() {
+                                let player_config = SyncedPlayerConfig {
+                                    device: device.as_ref().cloned(),
+                                    volume: 100,
+                                    muted: false,
+                                    buffer_size: None,
+                                    required_lead_time_ms,
+                                    min_buffer_ms,
+                                };
                                 match SyncedPlayer::new(
                                     fmt.clone(),
                                     Arc::clone(&clock_sync),
-                                    device.as_ref().cloned(),
-                                    100,
-                                    false,
-                                    None,
+                                    player_config,
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
