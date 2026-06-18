@@ -12,15 +12,12 @@
 
 /// Audio types and processing
 pub mod audio;
-/// Playback recovery monitoring shared by audio and protocol layers
-pub mod playback;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
 /// Clock synchronization utilities
 pub mod sync;
 
 pub use audio::GainControl;
-pub use playback::PlaybackRecoveryCoordinator;
 pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
 pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;

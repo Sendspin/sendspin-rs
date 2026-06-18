@@ -5,7 +5,6 @@ use crate::audio::gain::{GainControl, GainRamp};
 use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
 use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
-use crate::playback::PlaybackRecoveryCoordinator;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
@@ -44,10 +43,6 @@ pub type ProcessCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 pub const MAX_STATIC_DELAY_MS: u16 = 5000;
 
 /// Configuration for [`SyncedPlayer`] construction.
-///
-/// Recovery timing is required up front so the audio callback and protocol
-/// monitor share one correctly configured recovery coordinator from the first
-/// underrun.
 pub struct SyncedPlayerConfig {
     /// Audio output device. Uses the platform default output device when `None`.
     pub device: Option<Device>,
@@ -57,23 +52,23 @@ pub struct SyncedPlayerConfig {
     pub muted: bool,
     /// Optional fixed cpal buffer size in frames.
     pub buffer_size: Option<u32>,
-    /// Minimum startup lead time in milliseconds.
-    pub required_lead_time_ms: u32,
-    /// Minimum ongoing buffer duration in milliseconds.
-    pub min_buffer_ms: u32,
 }
 
 impl SyncedPlayerConfig {
-    /// Create a config with explicit recovery timing and common playback defaults.
-    pub fn new(required_lead_time_ms: u32, min_buffer_ms: u32) -> Self {
+    /// Create a config with common playback defaults.
+    pub fn new() -> Self {
         Self {
             device: None,
             volume: 100,
             muted: false,
             buffer_size: None,
-            required_lead_time_ms,
-            min_buffer_ms,
         }
+    }
+}
+
+impl Default for SyncedPlayerConfig {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -255,62 +250,6 @@ impl PlaybackQueue {
         self.cursor_remainder %= sample_rate as i64;
         self.cursor_us += advance;
     }
-
-    fn continuous_buffered_duration_from(&self, server_now_us: i64) -> i64 {
-        let cursor = server_now_us.max(self.cursor_us);
-        let mut duration_start: Option<i64> = None;
-        let mut contiguous_end = cursor;
-
-        let mut observe = |buffer: &AudioBuffer| {
-            let buffer_end = buffer.timestamp + buffer.duration_us();
-            if buffer_end <= cursor {
-                return;
-            }
-
-            match duration_start {
-                None => {
-                    // If the first schedulable buffer starts in the future,
-                    // count audio duration from that start, not the silence
-                    // before it. If it overlaps the cursor, count only the
-                    // remaining portion.
-                    duration_start = Some(buffer.timestamp.max(cursor));
-                    contiguous_end = buffer_end;
-                }
-                Some(_) => {
-                    // Once a run has started, only adjacent/overlapping buffers
-                    // extend it. A gap means later audio is not continuously
-                    // buffered from the recovery point.
-                    if buffer.timestamp <= contiguous_end {
-                        contiguous_end = contiguous_end.max(buffer_end);
-                    }
-                }
-            }
-        };
-
-        if let Some(current) = self.current.as_ref() {
-            observe(current);
-        }
-        for buffer in &self.queue {
-            observe(buffer);
-        }
-
-        duration_start
-            .map(|start| contiguous_end.saturating_sub(start))
-            .unwrap_or(0)
-    }
-}
-
-fn buffered_duration_us(
-    queue: &Mutex<PlaybackQueue>,
-    clock_sync: &Mutex<ClockSync>,
-) -> Option<i64> {
-    // Audio callbacks must not block on clock-sync updates. If the lock is
-    // contended, keep recovery gated for this callback and try again next time.
-    let sync = clock_sync.try_lock()?;
-    let server_now = sync.client_to_server_micros(sync.clock().now_micros())?;
-    drop(sync);
-    let buffered_duration = queue.lock().continuous_buffered_duration_from(server_now);
-    Some(buffered_duration)
 }
 
 /// Bundles gain and post-processing parameters for the data callback.
@@ -322,7 +261,6 @@ struct CallbackConfig {
 
 struct CallbackOutputs {
     error: Arc<Mutex<Option<String>>>,
-    recovery: PlaybackRecoveryCoordinator,
 }
 
 /// Synced audio output with drift correction.
@@ -335,8 +273,6 @@ pub struct SyncedPlayer {
     gain: GainControl,
     /// Shared with the audio callback. See [`SyncedPlayer::set_static_delay`].
     static_delay_us: Arc<AtomicU64>,
-    /// Coordinates underrun recovery between audio and protocol layers.
-    recovery: PlaybackRecoveryCoordinator,
 }
 
 impl SyncedPlayer {
@@ -378,7 +314,7 @@ impl SyncedPlayer {
     /// let player = SyncedPlayer::with_process_callback(
     ///     format,
     ///     clock_sync,
-    ///     SyncedPlayerConfig::new(500, 500),
+    ///     SyncedPlayerConfig::new(),
     ///     Box::new(|data| { /* e.g. feed a VU meter or visualizer */ }),
     /// )?;
     /// # Ok(())
@@ -425,10 +361,6 @@ impl SyncedPlayer {
         let last_error = Arc::new(Mutex::new(None));
         let gain = GainControl::new(config.volume, config.muted);
         let static_delay_us = Arc::new(AtomicU64::new(0));
-        let recovery = PlaybackRecoveryCoordinator::from_player_timing(
-            config.required_lead_time_ms,
-            config.min_buffer_ms,
-        );
 
         let cb_config = CallbackConfig {
             gain_control: gain.clone(),
@@ -437,7 +369,6 @@ impl SyncedPlayer {
         };
         let callback_outputs = CallbackOutputs {
             error: Arc::clone(&last_error),
-            recovery: recovery.clone(),
         };
 
         let stream = Self::build_stream(
@@ -458,7 +389,6 @@ impl SyncedPlayer {
             last_error,
             gain,
             static_delay_us,
-            recovery,
         })
     }
 
@@ -503,22 +433,6 @@ impl SyncedPlayer {
     /// Check if the audio stream has an error without clearing it.
     pub fn has_error(&self) -> bool {
         self.last_error.lock().is_some()
-    }
-
-    /// Update the player's timing parameters mid-session.
-    ///
-    /// Adjusts the underrun-recovery buffer threshold to
-    /// `max(required_lead_time_ms, min_buffer_ms)`. Takes effect immediately —
-    /// the audio callback sees the new threshold on its next call.
-    ///
-    /// Per the Sendspin spec, clients may update these values at any time
-    /// (e.g., after empirically measuring lead time post-warmup, or on
-    /// link-type change). Applications should debounce and only call this after
-    /// a sustained shift in conditions, then send the updated values to the
-    /// server via `client/state`.
-    pub fn set_player_timing(&self, required_lead_time_ms: u32, min_buffer_ms: u32) {
-        self.recovery
-            .set_player_timing(required_lead_time_ms, min_buffer_ms);
     }
 
     /// Get a reference to the volume/mute control.
@@ -579,7 +493,7 @@ impl SyncedPlayer {
         mut cb_config: CallbackConfig,
         outputs: CallbackOutputs,
     ) -> Result<Stream, Error> {
-        let CallbackOutputs { error, recovery } = outputs;
+        let CallbackOutputs { error } = outputs;
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
@@ -732,28 +646,10 @@ impl SyncedPlayer {
                         return;
                     }
 
-                    if recovery.is_recovering() {
-                        let buffered = buffered_duration_us(&queue, &clock_sync);
-                        recovery.observe_buffered_duration(buffered);
-                        if recovery.is_recovering() {
-                            for sample in data.iter_mut() {
-                                *sample = 0.0;
-                            }
-                            let target = cb_config.gain_control.gain();
-                            let frames = data.len() / channels;
-                            gain_ramp.advance(frames, target);
-                            if let Some(ref mut cb) = cb_config.process_callback {
-                                cb(data);
-                            }
-                            return;
-                        }
-                    }
-
                     {
                         let mut queue = queue.lock();
                         let frames = data.len() / channels;
                         let mut out_index = 0;
-                        let mut had_underrun = false;
 
                         for _ in 0..frames {
                             if schedule.drop_every_n_frames > 0 {
@@ -770,7 +666,6 @@ impl SyncedPlayer {
                                             out_index += 1;
                                         }
                                     } else {
-                                        had_underrun = true;
                                         for _ in 0..channels {
                                             data[out_index] = 0.0;
                                             out_index += 1;
@@ -799,16 +694,11 @@ impl SyncedPlayer {
                                     out_index += 1;
                                 }
                             } else {
-                                had_underrun = true;
                                 for _ in 0..channels {
                                     data[out_index] = 0.0;
                                     out_index += 1;
                                 }
                             }
-                        }
-
-                        if had_underrun {
-                            recovery.report_underrun();
                         }
                     } // queue lock dropped before user callback
 
@@ -883,7 +773,7 @@ mod tests {
             codec_header: None,
         };
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
-        let result = SyncedPlayer::new(format, clock_sync, SyncedPlayerConfig::new(500, 500));
+        let result = SyncedPlayer::new(format, clock_sync, SyncedPlayerConfig::new());
         let err = match result {
             Ok(_) => panic!("channels=0 should be rejected"),
             Err(e) => e,
@@ -1326,50 +1216,6 @@ mod tests {
         assert_eq!(queue.queue.len(), 1);
         assert_eq!(queue.queue[0].timestamp, 9_000);
         assert_eq!(queue.queue[0].samples[0], 333);
-    }
-
-    #[test]
-    fn test_continuous_buffered_duration_counts_future_audio_duration() {
-        let mut queue = PlaybackQueue::new();
-        let format = test_format();
-        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
-
-        queue.push(AudioBuffer {
-            timestamp: 1_100_000,
-            samples: Arc::from(samples.into_boxed_slice()),
-            format,
-        });
-
-        assert_eq!(
-            queue.continuous_buffered_duration_from(1_000_000),
-            10_000,
-            "future silence before the first buffer is not buffered audio"
-        );
-    }
-
-    #[test]
-    fn test_continuous_buffered_duration_stops_at_gap() {
-        let mut queue = PlaybackQueue::new();
-        let format = test_format();
-        let first = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
-        let second = vec![i32::EQUILIBRIUM; 480 * 2];
-
-        queue.push(AudioBuffer {
-            timestamp: 1_000_000,
-            samples: Arc::from(first.into_boxed_slice()),
-            format: format.clone(),
-        });
-        queue.push(AudioBuffer {
-            timestamp: 1_020_000,
-            samples: Arc::from(second.into_boxed_slice()),
-            format,
-        });
-
-        assert_eq!(
-            queue.continuous_buffered_duration_from(1_000_000),
-            10_000,
-            "a gap after the first buffer should stop continuous recovery lead"
-        );
     }
 
     #[test]

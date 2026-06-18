@@ -286,11 +286,6 @@ pub enum PlayerStateCommand {
 }
 
 /// Client synchronization state (top-level in client/state)
-///
-/// This enum reports clock-synchronization status, not transient playback
-/// hiccups: a buffer underrun no longer changes state. A client reports
-/// `not_synchronized` on connect and transitions to `synchronized` once clock
-/// sync with the server is established.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSyncState {

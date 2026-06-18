@@ -424,8 +424,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     volume: 100,
                                     muted: false,
                                     buffer_size: None,
-                                    required_lead_time_ms,
-                                    min_buffer_ms,
                                 };
                                 match SyncedPlayer::new(
                                     fmt.clone(),
