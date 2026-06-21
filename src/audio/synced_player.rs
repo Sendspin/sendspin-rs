@@ -439,7 +439,7 @@ impl SyncedPlayer {
         let mut stream_config = device_config.config();
         stream_config.buffer_size = config.buffer_size;
         stream_config.channels = format.channels.into();
-        stream_config.sample_rate = format.sample_rate.into();
+        stream_config.sample_rate = format.sample_rate;
 
         macro_rules! output_stream {
             ($sample:ty) => {
