@@ -438,6 +438,8 @@ impl SyncedPlayer {
             .map_err(|e| Error::Output(e.to_string()))?;
         let mut stream_config = device_config.config();
         stream_config.buffer_size = config.buffer_size;
+        stream_config.channels = format.channels.into();
+        stream_config.sample_rate = format.sample_rate.into();
 
         macro_rules! output_stream {
             ($sample:ty) => {
