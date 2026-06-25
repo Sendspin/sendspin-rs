@@ -115,6 +115,9 @@ pub struct DeviceInfo {
     /// Software version string
     #[serde(skip_serializing_if = "Option::is_none")]
     pub software_version: Option<String>,
+    /// MAC address of the network interface the connection is opened on, in lowercase colon-separated form (e.g., `aa:bb:cc:dd:ee:ff`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<String>,
 }
 
 /// Player@v1 capabilities

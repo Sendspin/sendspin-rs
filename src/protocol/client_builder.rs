@@ -23,6 +23,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     product_name: Option<String>,
     manufacturer: Option<String>,
     software_version: Option<String>,
+    mac_address: Option<String>,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
@@ -88,6 +89,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             product_name: raw.product_name,
             manufacturer: raw.manufacturer,
             software_version: raw.software_version,
+            mac_address: raw.mac_address,
             supported_roles,
             player_v1_support,
             clock: Arc::new(DefaultClock::new()),
@@ -111,6 +113,8 @@ pub struct ProtocolClientBuilderFields {
     manufacturer: Option<String>,
     #[builder(default = None)]
     software_version: Option<String>,
+    #[builder(default = None)]
+    mac_address: Option<String>,
     #[builder(default = None, setter(transform = |x: PlayerV1Support| Some(x)))]
     player_v1_support: Option<PlayerV1Support>,
     #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
@@ -136,6 +140,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             product_name: fields.product_name,
             manufacturer: fields.manufacturer,
             software_version: fields.software_version,
+            mac_address: fields.mac_address,
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
@@ -156,6 +161,7 @@ pub struct ProtocolClientBuilder {
     product_name: Option<String>,
     manufacturer: Option<String>,
     software_version: Option<String>,
+    mac_address: Option<String>,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
@@ -240,6 +246,7 @@ impl ProtocolClientBuilder {
                 product_name: self.product_name,
                 manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),
                 software_version: self.software_version,
+                mac_address: self.mac_address,
             }),
             player_v1_support: self.player_v1_support,
             artwork_v1_support: self.artwork_v1_support,
