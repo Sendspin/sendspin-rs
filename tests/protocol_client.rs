@@ -173,6 +173,8 @@ async fn test_connect_sends_initial_state() {
             volume: Some(75),
             muted: Some(false),
             static_delay_ms: Some(100),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         })
         .build();
@@ -270,6 +272,8 @@ async fn test_connect_initial_external_source_preserves_player_state() {
             volume: Some(23),
             muted: Some(true),
             static_delay_ms: Some(250),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         })
         .build();

@@ -42,6 +42,36 @@ pub type ProcessCallback = Box<dyn FnMut(&mut [f32]) + Send + 'static>;
 /// `static_delay_ms` over 0–5000; larger values are clamped to this.
 pub const MAX_STATIC_DELAY_MS: u16 = 5000;
 
+/// Configuration for [`SyncedPlayer`] construction.
+pub struct SyncedPlayerConfig {
+    /// Audio output device. Uses the platform default output device when `None`.
+    pub device: Option<Device>,
+    /// Initial playback volume, 0-100.
+    pub volume: u8,
+    /// Initial mute state.
+    pub muted: bool,
+    /// Optional fixed cpal buffer size in frames.
+    pub buffer_size: Option<u32>,
+}
+
+impl SyncedPlayerConfig {
+    /// Create a config with common playback defaults.
+    pub fn new() -> Self {
+        Self {
+            device: None,
+            volume: 100,
+            muted: false,
+            buffer_size: None,
+        }
+    }
+}
+
+impl Default for SyncedPlayerConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Convert a protocol `static_delay_ms` value to microseconds, clamping to
 /// [`MAX_STATIC_DELAY_MS`]. Out-of-range values are clamped rather than
 /// rejected so a sloppy server can't disable playback timing entirely.
@@ -229,6 +259,10 @@ struct CallbackConfig {
     static_delay_us: Arc<AtomicU64>,
 }
 
+struct CallbackOutputs {
+    error: Arc<Mutex<Option<String>>>,
+}
+
 /// Synced audio output with drift correction.
 pub struct SyncedPlayer {
     format: AudioFormat,
@@ -251,12 +285,9 @@ impl SyncedPlayer {
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
-        device: Option<Device>,
-        volume: u8,
-        muted: bool,
-        buffer_size: Option<u32>,
+        config: SyncedPlayerConfig,
     ) -> Result<Self, Error> {
-        Self::build(format, clock_sync, device, None, volume, muted, buffer_size)
+        Self::build(format, clock_sync, config, None)
     }
 
     /// Create a player with a process callback for post-gain audio processing.
@@ -268,7 +299,7 @@ impl SyncedPlayer {
     /// ```no_run
     /// # use std::sync::Arc;
     /// # use parking_lot::Mutex;
-    /// # use sendspin::audio::{AudioFormat, Codec, SyncedPlayer};
+    /// # use sendspin::audio::{AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
     /// # use sendspin::sync::ClockSync;
     /// # use sendspin::DefaultClock;
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -281,8 +312,9 @@ impl SyncedPlayer {
     /// };
     /// let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
     /// let player = SyncedPlayer::with_process_callback(
-    ///     format, clock_sync, None,
-    ///     100, false, None,
+    ///     format,
+    ///     clock_sync,
+    ///     SyncedPlayerConfig::new(),
     ///     Box::new(|data| { /* e.g. feed a VU meter or visualizer */ }),
     /// )?;
     /// # Ok(())
@@ -291,47 +323,33 @@ impl SyncedPlayer {
     pub fn with_process_callback(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
-        device: Option<Device>,
-        volume: u8,
-        muted: bool,
-        buffer_size: Option<u32>,
+        config: SyncedPlayerConfig,
         callback: ProcessCallback,
     ) -> Result<Self, Error> {
-        Self::build(
-            format,
-            clock_sync,
-            device,
-            Some(callback),
-            volume,
-            muted,
-            buffer_size,
-        )
+        Self::build(format, clock_sync, config, Some(callback))
     }
 
     fn build(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
-        device: Option<Device>,
+        config: SyncedPlayerConfig,
         process_callback: Option<ProcessCallback>,
-        volume: u8,
-        muted: bool,
-        buffer_size: Option<u32>,
     ) -> Result<Self, Error> {
         if format.channels == 0 {
             return Err(Error::Output("channels must be > 0".to_string()));
         }
         let host = cpal::default_host();
-        let device = match device {
+        let device = match config.device {
             Some(device) => device,
             None => host
                 .default_output_device()
                 .ok_or_else(|| Error::Output("No output device available".to_string()))?,
         };
 
-        let config = StreamConfig {
+        let stream_config = StreamConfig {
             channels: format.channels as u16,
             sample_rate: cpal::SampleRate::from(format.sample_rate),
-            buffer_size: match buffer_size {
+            buffer_size: match config.buffer_size {
                 Some(frames) => cpal::BufferSize::Fixed(frames),
                 None => cpal::BufferSize::Default,
             },
@@ -341,7 +359,7 @@ impl SyncedPlayer {
         let queue_clone = Arc::clone(&queue);
         let format_clone = format.clone();
         let last_error = Arc::new(Mutex::new(None));
-        let gain = GainControl::new(volume, muted);
+        let gain = GainControl::new(config.volume, config.muted);
         let static_delay_us = Arc::new(AtomicU64::new(0));
 
         let cb_config = CallbackConfig {
@@ -349,16 +367,18 @@ impl SyncedPlayer {
             process_callback,
             static_delay_us: Arc::clone(&static_delay_us),
         };
-        let error_clone = Arc::clone(&last_error);
+        let callback_outputs = CallbackOutputs {
+            error: Arc::clone(&last_error),
+        };
 
         let stream = Self::build_stream(
             &device,
-            &config,
+            &stream_config,
             queue_clone,
-            clock_sync,
+            Arc::clone(&clock_sync),
             format_clone,
             cb_config,
-            error_clone,
+            callback_outputs,
         )?;
         stream.play().map_err(|e| Error::Output(e.to_string()))?;
 
@@ -471,8 +491,9 @@ impl SyncedPlayer {
         clock_sync: Arc<Mutex<ClockSync>>,
         format: AudioFormat,
         mut cb_config: CallbackConfig,
-        error_sink: Arc<Mutex<Option<String>>>,
+        outputs: CallbackOutputs,
     ) -> Result<Stream, Error> {
+        let CallbackOutputs { error } = outputs;
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
@@ -645,8 +666,8 @@ impl SyncedPlayer {
                                             out_index += 1;
                                         }
                                     } else {
-                                        for sample in &last_frame {
-                                            data[out_index] = sample.to_sample::<f32>();
+                                        for _ in 0..channels {
+                                            data[out_index] = 0.0;
                                             out_index += 1;
                                         }
                                     }
@@ -690,8 +711,8 @@ impl SyncedPlayer {
                     }
                 },
                 move |err| {
-                    eprintln!("Audio stream error: {}", err);
-                    *error_sink.lock() = Some(err.to_string());
+                    log::error!("Audio stream error: {}", err);
+                    *error.lock() = Some(err.to_string());
                 },
                 None,
             )
@@ -707,7 +728,9 @@ mod tests {
     // in gain.rs. Wiring tests require a real audio device (cpal Stream) and
     // cannot run in CI.
 
-    use super::{static_delay_ms_to_us, PlaybackQueue, SyncedPlayer, MAX_STATIC_DELAY_MS};
+    use super::{
+        static_delay_ms_to_us, PlaybackQueue, SyncedPlayer, SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+    };
     use crate::audio::{AudioBuffer, AudioFormat, Codec};
     use crate::error::Error;
     use crate::sync::{ClockSync, DefaultClock};
@@ -750,7 +773,7 @@ mod tests {
             codec_header: None,
         };
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::new(DefaultClock::new()))));
-        let result = SyncedPlayer::new(format, clock_sync, None, 100, false, None);
+        let result = SyncedPlayer::new(format, clock_sync, SyncedPlayerConfig::new());
         let err = match result {
             Ok(_) => panic!("channels=0 should be rejected"),
             Err(e) => e,

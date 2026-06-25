@@ -18,7 +18,7 @@ pub mod protocol;
 pub mod sync;
 
 pub use audio::GainControl;
-pub use protocol::client::{Connection, Controller, ProtocolClient, WsSender};
+pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
 pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;
 pub use protocol::messages::ServerHello;

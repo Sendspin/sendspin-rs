@@ -58,6 +58,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .initial_player_state(PlayerState {
             volume: Some(80),
             muted: Some(false),
+            static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             ..Default::default()
         })
         .build()
