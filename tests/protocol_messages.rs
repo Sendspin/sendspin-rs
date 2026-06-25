@@ -2,8 +2,9 @@ use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
     ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
-    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerState, PlayerStateCommand,
-    PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
+    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest, PlayerState,
+    PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
+    StreamRequestFormat,
 };
 
 // =============================================================================
@@ -84,6 +85,8 @@ fn test_client_state_serialization() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         }),
     };
@@ -98,16 +101,16 @@ fn test_client_state_serialization() {
 }
 
 #[test]
-fn test_client_sync_state_error() {
+fn test_client_sync_state_not_synchronized() {
     let state = ClientState {
-        state: Some(ClientSyncState::Error),
+        state: Some(ClientSyncState::NotSynchronized),
         player: None,
     };
 
     let message = Message::ClientState(state);
     let json = serde_json::to_string(&message).unwrap();
 
-    assert!(json.contains("\"state\":\"error\""));
+    assert!(json.contains("\"state\":\"not_synchronized\""));
 }
 
 #[test]
@@ -355,6 +358,59 @@ fn test_stream_clear_deserialization() {
         }
         _ => panic!("Expected StreamClear"),
     }
+}
+
+#[test]
+fn test_stream_request_format_serialization() {
+    let request = StreamRequestFormat {
+        player: Some(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48000),
+            bit_depth: Some(16),
+        }),
+        artwork: Some(ArtworkFormatRequest {
+            channel: 0,
+            source: Some(ArtworkSource::Album),
+            format: Some(ImageFormat::Jpeg),
+            media_width: Some(600),
+            media_height: Some(600),
+        }),
+    };
+
+    let message = Message::StreamRequestFormat(request);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"type\":\"stream/request-format\""));
+    assert!(json.contains("\"codec\":\"pcm\""));
+    assert!(json.contains("\"channels\":2"));
+    assert!(json.contains("\"sample_rate\":48000"));
+    assert!(json.contains("\"bit_depth\":16"));
+    assert!(json.contains("\"source\":\"album\""));
+    assert!(json.contains("\"format\":\"jpeg\""));
+}
+
+#[test]
+fn test_stream_request_format_omits_unspecified_fields() {
+    let request = StreamRequestFormat {
+        player: Some(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: None,
+            sample_rate: None,
+            bit_depth: None,
+        }),
+        artwork: None,
+    };
+
+    let json = serde_json::to_string(&Message::StreamRequestFormat(request)).unwrap();
+
+    assert!(json.contains("\"type\":\"stream/request-format\""));
+    assert!(json.contains("\"player\""));
+    assert!(json.contains("\"codec\":\"pcm\""));
+    assert!(!json.contains("\"artwork\""));
+    assert!(!json.contains("\"channels\""));
+    assert!(!json.contains("\"sample_rate\""));
+    assert!(!json.contains("\"bit_depth\""));
 }
 
 // =============================================================================
@@ -875,6 +931,8 @@ fn test_player_state_supported_commands_roundtrip() {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         }),
     };

@@ -14,17 +14,14 @@
 pub mod audio;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
-/// Audio scheduler for timed playback
-pub mod scheduler;
 /// Clock synchronization utilities
 pub mod sync;
 
 pub use audio::GainControl;
-pub use protocol::client::{Connection, Controller, ProtocolClient, WsSender};
+pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
 pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;
 pub use protocol::messages::ServerHello;
-pub use scheduler::AudioScheduler;
 pub use sync::raw_clock::{Clock, DefaultClock};
 
 /// Result type for sendspin operations

@@ -3,11 +3,13 @@
 
 use clap::Parser;
 use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
-use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer};
-use sendspin::protocol::messages::{Message, PlayerState};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
+use sendspin::protocol::messages::{
+    Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand,
+};
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -162,6 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     println!("Connecting to {}...", args.server);
+    let required_lead_time_ms = 500;
+    let min_buffer_ms = 500;
+
     let test = ProtocolClientBuilder::builder()
         .client_id(client_id)
         .name(args.name.clone())
@@ -169,7 +174,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             volume: Some(100),
             muted: Some(false),
             static_delay_ms: Some(0),
-            supported_commands: None,
+            required_lead_time_ms: Some(required_lead_time_ms),
+            min_buffer_ms: Some(min_buffer_ms),
+            supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         })
         .build();
 
@@ -181,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut message_rx = conn.messages;
     let mut audio_rx = conn.audio;
     let clock_sync = conn.clock_sync;
+    let sender = conn.sender;
     let _guard = conn.guard;
 
     println!("Waiting for stream to start...");
@@ -201,6 +209,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_started = false; // Track if we've started playback
     let mut first_chunk_logged = false; // Track if we've logged the first chunk
     let mut synced_player: Option<SyncedPlayer> = None;
+    let mut format_requested = false; // One-shot guard for the request-format demo
+                                      // Retained so a command arriving before the player exists still applies.
+    let mut static_delay_ms: u16 = 0;
 
     loop {
         // Process messages and audio chunks concurrently
@@ -208,6 +219,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(msg) = message_rx.recv() => {
                 match msg {
                     Message::StreamStart(stream_start) => {
+                        // Demonstrate `stream/request-format`: now that the player
+                        // stream is live, ask the server to re-encode it (here,
+                        // lighter 16-bit PCM this example can still decode).
+                        // One-shot, so the server's responding stream/start
+                        // doesn't re-trigger it.
+                        if env_bool("SS_REQUEST_FORMAT")
+                            && !format_requested
+                            && stream_start.player.is_some()
+                        {
+                            format_requested = true;
+                            sender
+                                .request_player_format(PlayerFormatRequest {
+                                    codec: Some("pcm".to_string()),
+                                    channels: Some(2),
+                                    sample_rate: Some(48_000),
+                                    bit_depth: Some(16),
+                                })
+                                .await?;
+                            println!("Requested 16-bit PCM stereo @ 48kHz via stream/request-format");
+                        }
+
                         if let Some(ref player_config) = stream_start.player {
                             println!(
                                 "Stream starting: codec='{}' {}Hz {}ch {}bit",
@@ -291,6 +323,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         playback_started = false;
                         first_chunk_logged = false;
                     }
+                    Message::ServerCommand(command) => {
+                        if let Some(PlayerCommand {
+                            command: PlayerCommandType::SetStaticDelay,
+                            static_delay_ms: Some(delay_ms),
+                            ..
+                        }) = command.player
+                        {
+                            static_delay_ms = delay_ms;
+                            if let Some(ref player) = synced_player {
+                                player.set_static_delay(delay_ms);
+                            }
+                            println!("Static delay set to {delay_ms} ms");
+                        }
+                    }
                     _ => {
                         println!("Received message: {:?}", msg);
                     }
@@ -373,16 +419,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
 
                             if synced_player.is_none() {
+                                let player_config = SyncedPlayerConfig {
+                                    device: device.as_ref().cloned(),
+                                    volume: 100,
+                                    muted: false,
+                                    buffer_size: None,
+                                };
                                 match SyncedPlayer::new(
                                     fmt.clone(),
                                     Arc::clone(&clock_sync),
-                                    device.as_ref().cloned(),
-                                    100,
-                                    false,
-                                    None,
+                                    player_config,
                                 ) {
                                     Ok(player) => {
                                         println!("Synced audio output initialized");
+                                        player.set_static_delay(static_delay_ms);
                                         synced_player = Some(player);
                                     }
                                     Err(e) => {
@@ -394,7 +444,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(ref player) = synced_player {
                                 let buffer = AudioBuffer {
                                     timestamp: chunk.timestamp,
-                                    play_at: Instant::now(),
                                     samples,
                                     format: fmt.clone(),
                                 };

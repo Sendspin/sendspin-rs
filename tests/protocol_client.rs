@@ -1,7 +1,10 @@
 use futures_util::{SinkExt, StreamExt};
+use sendspin::error::Error;
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, ControllerCommandType,
-    GoodbyeReason, Message, PlayerState, PlayerV1Support, RepeatMode,
+    ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
+    ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message,
+    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamArtworkChannelConfig,
+    StreamArtworkConfig, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -65,6 +68,90 @@ async fn start_test_server() -> (
     (url, rx, handle)
 }
 
+/// Serialize a protocol message into a WebSocket text frame.
+fn text_message(msg: &Message) -> WsMessage {
+    WsMessage::Text(serde_json::to_string(msg).unwrap())
+}
+
+/// A server→client `stream/start` that starts a player stream.
+fn player_stream_start() -> WsMessage {
+    text_message(&Message::StreamStart(StreamStart {
+        player: Some(StreamPlayerConfig {
+            codec: "pcm".to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 24,
+            codec_header: None,
+        }),
+        artwork: None,
+        visualizer: None,
+    }))
+}
+
+/// A server→client `stream/start` that starts an artwork stream.
+fn artwork_stream_start() -> WsMessage {
+    text_message(&Message::StreamStart(StreamStart {
+        player: None,
+        artwork: Some(StreamArtworkConfig {
+            channels: vec![StreamArtworkChannelConfig {
+                source: ArtworkSource::Artist,
+                format: ImageFormat::Png,
+                width: 640,
+                height: 640,
+            }],
+        }),
+        visualizer: None,
+    }))
+}
+
+/// A server→client `stream/end` for the given roles (all streams if `None`).
+fn stream_end(roles: Option<Vec<String>>) -> WsMessage {
+    text_message(&Message::StreamEnd(StreamEnd { roles }))
+}
+
+/// Discard the `client/state` the client emits immediately after handshake.
+async fn discard_initial_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+}
+
+/// Drain forwarded protocol messages until one matches `want`. The router
+/// settles stream state *before* forwarding `stream/start` / `stream/end`, so
+/// observing the awaited message here guarantees the request-format gate has
+/// settled too.
+async fn await_message(
+    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
+    want: impl Fn(&Message) -> bool,
+) {
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), messages.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("messages channel closed");
+        if want(&msg) {
+            return;
+        }
+    }
+}
+
+async fn recv_stream_request_format(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> StreamRequestFormat {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for stream/request-format")
+            .expect("channel closed");
+        match serde_json::from_str::<Message>(&msg_text).unwrap() {
+            Message::StreamRequestFormat(request) => break request,
+            Message::ClientTime(_) => continue,
+            other => panic!("expected StreamRequestFormat, got {:?}", other),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_connect_sends_initial_state() {
     let (url, mut rx, _handle) = start_test_server().await;
@@ -86,6 +173,8 @@ async fn test_connect_sends_initial_state() {
             volume: Some(75),
             muted: Some(false),
             static_delay_ms: Some(100),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
             supported_commands: None,
         })
         .build();
@@ -145,6 +234,71 @@ async fn test_connect_without_player_state_sends_state_without_player() {
 }
 
 #[tokio::test]
+async fn test_connect_can_send_initial_external_source_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .initial_sync_state(ClientSyncState::ExternalSource)
+        .build();
+
+    let _client = builder.connect(&url).await.unwrap();
+
+    let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for message")
+        .expect("channel closed");
+
+    let parsed: Message = serde_json::from_str(&first_msg).unwrap();
+    match parsed {
+        Message::ClientState(cs) => {
+            assert_eq!(cs.state, Some(ClientSyncState::ExternalSource));
+            assert!(cs.player.is_none(), "expected no player state");
+        }
+        other => panic!("expected ClientState, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_connect_initial_external_source_preserves_player_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .initial_sync_state(ClientSyncState::ExternalSource)
+        .initial_player_state(PlayerState {
+            volume: Some(23),
+            muted: Some(true),
+            static_delay_ms: Some(250),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
+            supported_commands: None,
+        })
+        .build();
+
+    let _client = builder.connect(&url).await.unwrap();
+
+    let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for message")
+        .expect("channel closed");
+
+    let parsed: Message = serde_json::from_str(&first_msg).unwrap();
+    match parsed {
+        Message::ClientState(cs) => {
+            assert_eq!(cs.state, Some(ClientSyncState::ExternalSource));
+            let player = cs.player.expect("expected player state");
+            assert_eq!(player.volume, Some(23));
+            assert_eq!(player.muted, Some(true));
+            assert_eq!(player.static_delay_ms, Some(250));
+        }
+        other => panic!("expected ClientState, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_disconnect_sends_goodbye() {
     let (url, mut rx, _handle) = start_test_server().await;
 
@@ -170,6 +324,230 @@ async fn test_disconnect_sends_goodbye() {
         }
     }
     assert!(found_goodbye, "never received client/goodbye");
+}
+
+#[tokio::test]
+async fn test_sender_emits_stream_request_format() {
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    conn.sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await
+        .unwrap();
+
+    let request = recv_stream_request_format(&mut rx).await;
+
+    let player = request.player.expect("expected player format request");
+    assert_eq!(player.codec.as_deref(), Some("pcm"));
+    assert_eq!(player.channels, Some(2));
+    assert_eq!(player.sample_rate, Some(48_000));
+    assert_eq!(player.bit_depth, Some(16));
+    assert!(request.artwork.is_none());
+}
+
+#[tokio::test]
+async fn test_sender_emits_artwork_stream_request_format() {
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(artwork_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    conn.sender
+        .request_artwork_format(ArtworkFormatRequest {
+            channel: 1,
+            source: Some(ArtworkSource::Artist),
+            format: Some(ImageFormat::Png),
+            media_width: Some(400),
+            media_height: Some(300),
+        })
+        .await
+        .unwrap();
+
+    let request = recv_stream_request_format(&mut rx).await;
+
+    assert!(request.player.is_none());
+    let artwork = request.artwork.expect("expected artwork format request");
+    assert_eq!(artwork.channel, 1);
+    assert_eq!(artwork.source, Some(ArtworkSource::Artist));
+    assert_eq!(artwork.format, Some(ImageFormat::Png));
+    assert_eq!(artwork.media_width, Some(400));
+    assert_eq!(artwork.media_height, Some(300));
+}
+
+#[tokio::test]
+async fn test_sender_rejects_empty_stream_request_format() {
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    // Discard the initial client/state emitted immediately after handshake.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timed out waiting for initial state")
+        .expect("channel closed");
+
+    let result = conn.sender.request_stream_format(None, None).await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("requires player or artwork request"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_request_format_before_stream_start() {
+    // No stream/start: the server never starts a stream, so the gate stays shut.
+    let (url, mut rx, _handle) = start_test_server().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    let result = conn
+        .sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active player stream"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_player_request_after_stream_end() {
+    // The player stream starts then ends, so the gate closes again.
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    server_tx.send(stream_end(None)).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamEnd(_))).await;
+
+    let result = conn
+        .sender
+        .request_player_format(PlayerFormatRequest {
+            codec: Some("pcm".to_string()),
+            channels: Some(2),
+            sample_rate: Some(48_000),
+            bit_depth: Some(16),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active player stream"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_sender_rejects_artwork_request_without_artwork_stream() {
+    // Only a player stream is active; an artwork request has nothing to
+    // renegotiate and must be rejected for its own role.
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+
+    discard_initial_state(&mut rx).await;
+
+    server_tx.send(player_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    let result = conn
+        .sender
+        .request_artwork_format(ArtworkFormatRequest {
+            channel: 1,
+            source: Some(ArtworkSource::Artist),
+            format: Some(ImageFormat::Png),
+            media_width: Some(400),
+            media_height: Some(300),
+        })
+        .await;
+
+    match result {
+        Err(Error::Protocol(msg)) => assert!(
+            msg.contains("active artwork stream"),
+            "unexpected protocol error: {msg}"
+        ),
+        other => panic!("expected protocol error, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -321,6 +699,93 @@ async fn next_client_command(
             return cmd;
         }
     }
+}
+
+async fn next_client_state(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> sendspin::protocol::messages::ClientState {
+    loop {
+        let msg_text = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed");
+
+        let parsed: Message = serde_json::from_str(&msg_text).unwrap();
+        if let Message::ClientState(state) = parsed {
+            return state;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_enter_external_source_sends_external_source_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let initial = next_client_state(&mut rx).await;
+    assert_eq!(initial.state, Some(ClientSyncState::Synchronized));
+
+    client.enter_external_source().await.unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::ExternalSource));
+    assert!(state.player.is_none());
+}
+
+#[tokio::test]
+async fn test_exit_external_source_sends_synchronized_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let initial = next_client_state(&mut rx).await;
+    assert_eq!(initial.state, Some(ClientSyncState::Synchronized));
+
+    client.exit_external_source(None).await.unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+    assert!(state.player.is_none());
+}
+
+#[tokio::test]
+async fn test_exit_external_source_sends_full_player_state() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let _initial = next_client_state(&mut rx).await;
+
+    client
+        .exit_external_source(Some(PlayerState {
+            volume: Some(42),
+            muted: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let state = next_client_state(&mut rx).await;
+    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+    let player = state.player.expect("player state should be present");
+    assert_eq!(player.volume, Some(42));
+    assert_eq!(player.muted, Some(true));
 }
 
 // Macro to generate tests for simple controller commands (no parameters).
