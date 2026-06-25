@@ -7,8 +7,8 @@ use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::Sample;
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use cpal::{Sample, I24};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -505,11 +505,30 @@ impl SyncedPlayer {
         let mut last_generation = 0u64;
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
+        let mut f32_buffer = Vec::<f32>::new();
+        let device_config = device
+            .default_output_config()
+            .map_err(|e| Error::Output(e.to_string()))?;
+        let mut stream_config = device_config.config();
+        stream_config.buffer_size = config.buffer_size;
+        stream_config.channels = format.channels.into();
+        stream_config.sample_rate = format.sample_rate;
 
-        let stream = device
-            .build_output_stream(
-                config,
-                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+        macro_rules! output_stream {
+            ($sample:ty) => {
+                device.build_output_stream(
+                    &stream_config,
+                    move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
+                    let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
+                        if let Some(ref mut cb) = cb_config.process_callback {
+                            cb(buffer);
+                        }
+
+                        for (dst, &sample) in data.iter_mut().zip(buffer.iter()) {
+                            *dst = <$sample>::from_sample(sample);
+                        }
+                    };
+
                     // Read all queue state in a single lock to avoid
                     // a TOCTOU window between generation and cursor reads.
                     // After clear(), force_reanchor is true but cursor_us
@@ -562,14 +581,16 @@ impl SyncedPlayer {
                             let early_window = Duration::from_millis(1);
                             if !started && playback_instant + early_window < expected_instant {
                                 for sample in data.iter_mut() {
-                                    *sample = 0.0;
+                                    *sample =  <$sample>::from_sample(0.0);
                                 }
                                 let target = cb_config.gain_control.gain();
                                 let frames = data.len() / channels;
                                 gain_ramp.advance(frames, target);
-                                if let Some(ref mut cb) = cb_config.process_callback {
-                                    cb(data);
+                                f32_buffer.resize(data.len(), 0.0);
+                                for sample in &mut f32_buffer {
+                                    *sample = 0.0;
                                 }
+                                process_output(data, &mut f32_buffer);
                                 return;
                             }
                             started = true;
@@ -629,98 +650,132 @@ impl SyncedPlayer {
                         }
                     }
 
-                    // If playback hasn't started yet (clock sync not converged,
-                    // lock contention, or pre-start gate active), output silence.
-                    // Audio data stays in the ring buffer for when sync converges
-                    // and reanchor positions the cursor correctly.
-                    if !started {
-                        for sample in data.iter_mut() {
-                            *sample = 0.0;
-                        }
-                        let target = cb_config.gain_control.gain();
-                        let frames = data.len() / channels;
-                        gain_ramp.advance(frames, target);
-                        if let Some(ref mut cb) = cb_config.process_callback {
-                            cb(data);
-                        }
-                        return;
-                    }
 
-                    {
-                        let mut queue = queue.lock();
-                        let frames = data.len() / channels;
-                        let mut out_index = 0;
-
-                        for _ in 0..frames {
-                            if schedule.drop_every_n_frames > 0 {
-                                drop_counter = drop_counter.saturating_sub(1);
-                                if drop_counter == 0 {
-                                    // Discard one frame to catch up
-                                    let _ = queue.next_frame(channels, sample_rate);
-                                    drop_counter = schedule.drop_every_n_frames;
-                                    // Get and output the next frame (don't repeat last_frame)
-                                    if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                        last_frame.copy_from_slice(frame);
-                                        for sample in frame {
-                                            data[out_index] = sample.to_sample::<f32>();
-                                            out_index += 1;
-                                        }
-                                    } else {
-                                        for _ in 0..channels {
-                                            data[out_index] = 0.0;
-                                            out_index += 1;
-                                        }
-                                    }
-                                    continue;
-                                }
+                        // If playback hasn't started yet (clock sync not converged,
+                        // lock contention, or pre-start gate active), output silence.
+                        // Audio data stays in the ring buffer for when sync converges
+                        // and reanchor positions the cursor correctly.
+                        if !started {
+                            for sample in data.iter_mut() {
+                                *sample = <$sample>::from_sample(0.0);
                             }
+                            let target = cb_config.gain_control.gain();
+                            let frames = data.len() / channels;
+                            gain_ramp.advance(frames, target);
+                            f32_buffer.resize(data.len(), 0.0);
+                            for sample in &mut f32_buffer {
+                                *sample = 0.0;
+                            }
+                            process_output(data, &mut f32_buffer);
+                            return;
+                        }
 
-                            if schedule.insert_every_n_frames > 0 {
-                                insert_counter = insert_counter.saturating_sub(1);
-                                if insert_counter == 0 {
-                                    insert_counter = schedule.insert_every_n_frames;
-                                    for sample in &last_frame {
-                                        data[out_index] = sample.to_sample::<f32>();
+                        f32_buffer.resize(data.len(), 0.0);
+
+                        {
+                            let mut queue = queue.lock();
+                            let frames = data.len() / channels;
+                            let mut out_index = 0;
+
+                            for _ in 0..frames {
+                                if schedule.drop_every_n_frames > 0 {
+                                    drop_counter = drop_counter.saturating_sub(1);
+                                    if drop_counter == 0 {
+                                        // Discard one frame to catch up
+                                        let _ = queue.next_frame(channels, sample_rate);
+                                        drop_counter = schedule.drop_every_n_frames;
+                                        // Get and output the next frame (don't repeat last_frame)
+                                        if let Some(frame) = queue.next_frame(channels, sample_rate) {
+                                            last_frame.copy_from_slice(frame);
+                                            for sample in frame {
+                                                f32_buffer[out_index] = f32::from_sample(*sample);
+                                                out_index += 1;
+                                            }
+                                        } else {
+                                            for sample in &last_frame {
+                                                f32_buffer[out_index] = f32::from_sample(*sample);
+                                                out_index += 1;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                if schedule.insert_every_n_frames > 0 {
+                                    insert_counter = insert_counter.saturating_sub(1);
+                                    if insert_counter == 0 {
+                                        insert_counter = schedule.insert_every_n_frames;
+                                        for sample in &last_frame {
+                                            f32_buffer[out_index] = f32::from_sample(*sample);
+                                            out_index += 1;
+                                        }
+                                        continue;
+                                    }
+                                }
+
+                                if let Some(frame) = queue.next_frame(channels, sample_rate) {
+                                    last_frame.copy_from_slice(frame);
+                                    for sample in frame {
+                                        f32_buffer[out_index] = f32::from_sample(*sample);
                                         out_index += 1;
                                     }
-                                    continue;
+                                } else {
+                                    for _ in 0..channels {
+                                        f32_buffer[out_index] = 0.0;
+                                        out_index += 1;
+                                    }
                                 }
                             }
+                        } // queue lock dropped before user callback
 
-                            if let Some(frame) = queue.next_frame(channels, sample_rate) {
-                                last_frame.copy_from_slice(frame);
-                                for sample in frame {
-                                    data[out_index] = sample.to_sample::<f32>();
-                                    out_index += 1;
-                                }
-                            } else {
-                                for _ in 0..channels {
-                                    data[out_index] = 0.0;
-                                    out_index += 1;
-                                }
-                            }
+                        // Apply gain with per-frame ramping
+                        let target = cb_config.gain_control.gain();
+                        gain_ramp.apply(&mut f32_buffer, channels, target);
+
+                        process_output(data, &mut f32_buffer);
+                        if log::log_enabled!(log::Level::Trace) {
+                            log::trace!("RingBuffer ({} frames): {:?}", f32_buffer.len(), f32_buffer);
+
                         }
-                    } // queue lock dropped before user callback
+                    },
+                    move |err| {
+                        log::error!("Audio stream error: {}", err);
+                        *error.lock() = Some(err.to_string());
+                    },
+                    None,
+                )
+                .map_err(|e| Error::Output(e.to_string()))
+            };
+        }
 
-                    // Apply gain with per-frame ramping
-                    let target = cb_config.gain_control.gain();
-                    gain_ramp.apply(data, channels, target);
-
-                    if let Some(ref mut cb) = cb_config.process_callback {
-                        cb(data);
-                    }
-                },
-                move |err| {
-                    log::error!("Audio stream error: {}", err);
-                    *error.lock() = Some(err.to_string());
-                },
-                None,
-            )
-            .map_err(|e| Error::Output(e.to_string()))?;
-
-        Ok(stream)
+        log::debug!(
+            "Using output device: {}, config: {:?}",
+            device
+                .id()
+                .map(|id| format!("{:?}", id))
+                .map_err(|e| Error::Output(e.to_string()))?,
+            device_config,
+        );
+        match device_config.sample_format() {
+            SampleFormat::F32 => output_stream!(f32),
+            SampleFormat::F64 => output_stream!(f64),
+            SampleFormat::I8 => output_stream!(i8),
+            SampleFormat::I16 => output_stream!(i16),
+            SampleFormat::I24 => output_stream!(I24),
+            SampleFormat::I32 => output_stream!(i32),
+            SampleFormat::I64 => output_stream!(i64),
+            SampleFormat::U8 => output_stream!(u8),
+            SampleFormat::U16 => output_stream!(u16),
+            SampleFormat::U32 => output_stream!(u32),
+            SampleFormat::U64 => output_stream!(u64),
+            _ => Err(Error::Output(format!(
+                "Unsupported sample format: {:?}",
+                device_config.sample_format()
+            ))),
+        }
     }
 }
+
 #[cfg(test)]
 mod tests {
     // Note: SyncedPlayer's convenience methods (volume, is_muted, set_volume,
