@@ -213,7 +213,8 @@ impl WsSender {
         self.send_sync_state(ClientSyncState::ExternalSource).await
     }
 
-    /// Tell the server this client is ready for synchronized playback again.
+    /// Tell the server this client's clock filter has converged enough to resume
+    /// synchronized playback scheduling.
     ///
     /// Include player state when volume, mute, or static delay may have changed
     /// while the external source owned the device. Hardware/OS mixer changes

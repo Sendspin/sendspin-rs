@@ -288,17 +288,12 @@ pub enum PlayerStateCommand {
     SetStaticDelay,
 }
 
-/// Client synchronization state (top-level in client/state)
+/// Client operational state (top-level in client/state).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSyncState {
-    /// Client's clock is synchronized with the server; ready to receive
-    /// timestamped binary data.
+    /// Client's clock filter has converged enough to begin scheduling playback.
     Synchronized,
-    /// Client's clock is not yet synchronized with the server. This is the
-    /// client's initial state until clock synchronization is established. The
-    /// server does not send binary data to a client in this state.
-    NotSynchronized,
     /// Client is in use by an external system (e.g., different audio source, HDMI input)
     /// and is not currently participating in Sendspin playback with this server.
     ExternalSource,

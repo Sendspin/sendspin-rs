@@ -121,7 +121,8 @@ pub struct ProtocolClientBuilderFields {
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
     visualizer_v1_support: Option<VisualizerV1Support>,
-    /// Initial top-level synchronization state sent in the first `client/state`.
+    /// Initial top-level operational state sent in the first `client/state`.
+    /// [`ClientSyncState::ExternalSource`] when another source owns playback.
     #[builder(default = ClientSyncState::Synchronized)]
     initial_sync_state: ClientSyncState,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
