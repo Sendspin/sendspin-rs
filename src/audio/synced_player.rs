@@ -250,6 +250,22 @@ impl PlaybackQueue {
         self.cursor_remainder %= sample_rate as i64;
         self.cursor_us += advance;
     }
+
+    fn first_playable_cursor_at_or_after(&self, server_time_us: i64) -> Option<i64> {
+        if let Some(buffer) = self.current.as_ref() {
+            if buffer.timestamp + buffer.duration_us() > server_time_us {
+                return Some(buffer.timestamp.max(server_time_us));
+            }
+        }
+
+        for buffer in &self.queue {
+            if buffer.timestamp + buffer.duration_us() > server_time_us {
+                return Some(buffer.timestamp.max(server_time_us));
+            }
+        }
+
+        None
+    }
 }
 
 /// Bundles gain and post-processing parameters for the data callback.
@@ -529,14 +545,20 @@ impl SyncedPlayer {
                         }
                     };
 
-                    // Read all queue state in a single lock to avoid
-                    // a TOCTOU window between generation and cursor reads.
-                    // After clear(), force_reanchor is true but cursor_us
-                    // is None (initialized=false), so the reanchor block
-                    // is normally skipped and the flag persists. If clear()
-                    // races with an in-flight reanchor, the flag can be
-                    // cleared early; next_frame() re-anchors from the
-                    // first buffer's timestamp in that case.
+                    // Advance the gain ramp even while silent so the first real
+                    // audio resumes at the target gain with no fade-in.
+                    let mut emit_silence = |data: &mut [$sample]| {
+                        let target = cb_config.gain_control.gain();
+                        gain_ramp.advance(data.len() / channels, target);
+                        f32_buffer.clear();
+                        f32_buffer.resize(data.len(), 0.0);
+                        process_output(data, &mut f32_buffer);
+                    };
+
+                    // Read queue timing state together. The generation is
+                    // rechecked before consuming force_reanchor so a clear()
+                    // racing with this callback cannot clear the next startup's
+                    // one-shot handoff.
                     let (generation, cursor_us, force_reanchor) = {
                         let queue = queue.lock();
                         let cursor = if queue.initialized {
@@ -575,22 +597,44 @@ impl SyncedPlayer {
                         // direction; the two signs must stay in step or the
                         // planner chases a phantom error every callback.
                         let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
+
+                        // Startup handoff: anchor to `+ handoff_delta` (this buffer's
+                        // end = the next callback's start) so the next start gate sees
+                        // `expected ≈ playback_instant`. Playing now would misalign the
+                        // cursor by one buffer, so we stay silent for this one period.
+                        if force_reanchor {
+                            let frames = data.len() / channels;
+                            let handoff_delta =
+                                Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+                            let handoff_instant = playback_instant + handoff_delta;
+                            let client_micros =
+                                sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
+                            if let Some(server_time) = sync.client_to_server_micros(client_micros) {
+                                let mut queue = queue.lock();
+                                if queue.generation == generation && queue.initialized {
+                                    if let Some(cursor_us) =
+                                        queue.first_playable_cursor_at_or_after(server_time)
+                                    {
+                                        queue.cursor_us = cursor_us;
+                                        queue.cursor_remainder = 0;
+                                        queue.force_reanchor = false;
+                                        schedule = CorrectionSchedule::default();
+                                        insert_counter = 0;
+                                        drop_counter = 0;
+                                    }
+                                }
+                            }
+
+                            emit_silence(data);
+                            return;
+                        }
+
                         if let Some(expected_instant) =
                             sync.server_to_local_instant_with_latency(cursor_us, delay_us)
                         {
                             let early_window = Duration::from_millis(1);
                             if !started && playback_instant + early_window < expected_instant {
-                                for sample in data.iter_mut() {
-                                    *sample =  <$sample>::from_sample(0.0);
-                                }
-                                let target = cb_config.gain_control.gain();
-                                let frames = data.len() / channels;
-                                gain_ramp.advance(frames, target);
-                                f32_buffer.resize(data.len(), 0.0);
-                                for sample in &mut f32_buffer {
-                                    *sample = 0.0;
-                                }
-                                process_output(data, &mut f32_buffer);
+                                emit_silence(data);
                                 return;
                             }
                             started = true;
@@ -629,7 +673,7 @@ impl SyncedPlayer {
                                 drop_counter = schedule.drop_every_n_frames;
                             }
 
-                            if schedule.reanchor || force_reanchor {
+                            if schedule.reanchor {
                                 // Mirror of the start-gate subtraction: audio
                                 // emitted now is heard `delay_us` later, so
                                 // anchor the cursor to that hear-instant.
@@ -641,7 +685,6 @@ impl SyncedPlayer {
                                     let mut queue = queue.lock();
                                     queue.cursor_us = server_time;
                                     queue.cursor_remainder = 0;
-                                    queue.force_reanchor = false;
                                 }
                                 schedule = CorrectionSchedule::default();
                                 insert_counter = 0;
@@ -656,17 +699,7 @@ impl SyncedPlayer {
                         // Audio data stays in the ring buffer for when sync converges
                         // and reanchor positions the cursor correctly.
                         if !started {
-                            for sample in data.iter_mut() {
-                                *sample = <$sample>::from_sample(0.0);
-                            }
-                            let target = cb_config.gain_control.gain();
-                            let frames = data.len() / channels;
-                            gain_ramp.advance(frames, target);
-                            f32_buffer.resize(data.len(), 0.0);
-                            for sample in &mut f32_buffer {
-                                *sample = 0.0;
-                            }
-                            process_output(data, &mut f32_buffer);
+                            emit_silence(data);
                             return;
                         }
 
@@ -1084,6 +1117,59 @@ mod tests {
             queue.cursor_us, cursor_after_consume,
             "cursor must not regress after playback has started"
         );
+    }
+
+    #[test]
+    fn test_first_playable_cursor_skips_stale_audio() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        assert_eq!(queue.first_playable_cursor_at_or_after(5_000), Some(5_000));
+        assert_eq!(queue.first_playable_cursor_at_or_after(10_000), None);
+    }
+
+    #[test]
+    fn test_first_playable_cursor_waits_for_future_audio() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
+
+        queue.push(AudioBuffer {
+            timestamp: 20_000,
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        assert_eq!(queue.first_playable_cursor_at_or_after(5_000), Some(20_000));
+    }
+
+    #[test]
+    fn test_first_playable_cursor_uses_current_buffer() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        // Pull one frame so the buffer moves from `queue` into `current`,
+        // exercising the `current` branch of first_playable_cursor_at_or_after.
+        let _ = queue.next_frame(2, 48_000);
+        assert!(queue.current.is_some());
+        assert!(queue.queue.is_empty());
+
+        assert_eq!(queue.first_playable_cursor_at_or_after(5_000), Some(5_000));
+        assert_eq!(queue.first_playable_cursor_at_or_after(10_000), None);
     }
 
     #[test]
