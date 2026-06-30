@@ -115,6 +115,7 @@ fn test_client_sync_state_external_source() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn test_server_state_metadata_deserialization() {
     let json = r#"{
         "type": "server/state",
@@ -169,7 +170,9 @@ fn test_server_state_controller_deserialization() {
             "controller": {
                 "supported_commands": ["play", "next", "previous", "volume", "mute"],
                 "volume": 75,
-                "muted": false
+                "muted": false,
+                "repeat": "all",
+                "shuffle": true
             }
         }
     }"#;
@@ -181,6 +184,8 @@ fn test_server_state_controller_deserialization() {
             let controller = state.controller.expect("Expected controller");
             assert_eq!(controller.volume, 75);
             assert!(!controller.muted);
+            assert_eq!(controller.repeat, Some(RepeatMode::All));
+            assert_eq!(controller.shuffle, Some(true));
             assert!(controller.supported_commands.contains(&"play".to_string()));
             assert!(controller
                 .supported_commands

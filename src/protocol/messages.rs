@@ -340,9 +340,21 @@ pub struct MetadataState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<TrackProgress>,
     /// Repeat mode
+    ///
+    /// Deprecated: the spec moved `repeat` to the controller `server/state`
+    /// object. Prefer [`ControllerState::repeat`] instead. This field is kept
+    /// only to parse the legacy dual-emit and will be removed in a future
+    /// release.
+    #[deprecated(since = "0.3.0", note = "use ControllerState::repeat instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RepeatMode>,
     /// Shuffle state
+    ///
+    /// Deprecated: the spec moved `shuffle` to the controller `server/state`
+    /// object. Prefer [`ControllerState::shuffle`] instead. This field is kept
+    /// only to parse the legacy dual-emit and will be removed in a future
+    /// release.
+    #[deprecated(since = "0.3.0", note = "use ControllerState::shuffle instead")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shuffle: Option<bool>,
 }
@@ -379,6 +391,12 @@ pub struct ControllerState {
     pub volume: u8,
     /// Whether audio is muted
     pub muted: bool,
+    /// Repeat mode
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<RepeatMode>,
+    /// Shuffle state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shuffle: Option<bool>,
 }
 
 // =============================================================================
