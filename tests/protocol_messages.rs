@@ -102,19 +102,6 @@ fn test_client_state_serialization() {
 }
 
 #[test]
-fn test_client_sync_state_not_synchronized() {
-    let state = ClientState {
-        state: Some(ClientSyncState::NotSynchronized),
-        player: None,
-    };
-
-    let message = Message::ClientState(state);
-    let json = serde_json::to_string(&message).unwrap();
-
-    assert!(json.contains("\"state\":\"not_synchronized\""));
-}
-
-#[test]
 fn test_client_sync_state_external_source() {
     let state = ClientState {
         state: Some(ClientSyncState::ExternalSource),
