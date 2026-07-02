@@ -48,7 +48,7 @@ where
     }))
     .unwrap();
     write
-        .send(WsMessage::Text(server_hello))
+        .send(WsMessage::Text(server_hello.into()))
         .await
         .expect("send server/hello");
 
@@ -60,7 +60,7 @@ where
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
-            if tx.send(text).is_err() {
+            if tx.send(text.to_string()).is_err() {
                 break;
             }
         }

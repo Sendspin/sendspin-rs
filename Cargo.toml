@@ -17,8 +17,8 @@ native-tls = [
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.40", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio = { version = "1.52", features = ["full"] }
+tokio-tungstenite = "0.29"
 tokio-native-tls = { version = "0.3", optional = true }
 native-tls = { version = "0.2", optional = true }
 futures-util = "0.3"
@@ -28,14 +28,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Error handling
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Utilities
 log = "0.4"
-uuid = { version = "1.10", features = ["v4", "serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
 
 # Audio output
-cpal = "0.17"
+cpal = "0.18"
 
 # Concurrency
 crossbeam = "0.8"
@@ -50,8 +50,8 @@ libc = "0.2"
 [dev-dependencies]
 tokio-test = "0.4"
 env_logger = "0.11"
-clap = { version = "4.5", features = ["derive"] }
-mdns-sd = "0.11"
+clap = { version = "4.6", features = ["derive"] }
+mdns-sd = "0.20"
 
 [profile.release]
 opt-level = 3

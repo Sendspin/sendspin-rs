@@ -533,7 +533,7 @@ impl SyncedPlayer {
         macro_rules! output_stream {
             ($sample:ty) => {
                 device.build_output_stream(
-                    &stream_config,
+                    stream_config,
                     move |data: &mut [$sample], info: &cpal::OutputCallbackInfo| {
                     let mut process_output = |data: &mut [$sample], buffer: &mut Vec<f32>| {
                         if let Some(ref mut cb) = cb_config.process_callback {
@@ -581,10 +581,7 @@ impl SyncedPlayer {
 
                     let callback_instant = Instant::now();
                     let ts = info.timestamp();
-                    let playback_delta = ts
-                        .playback
-                        .duration_since(&ts.callback)
-                        .unwrap_or(Duration::ZERO);
+                    let playback_delta = ts.playback.duration_since(ts.callback);
                     let playback_instant = callback_instant + playback_delta;
 
                     // try_lock: skip sync if contended rather than blocking
