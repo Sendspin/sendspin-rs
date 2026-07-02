@@ -77,7 +77,7 @@ where
 {
     let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
     let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
-    sink.send(WsMessage::Text(json))
+    sink.send(WsMessage::Text(json.into()))
         .await
         .map_err(|e| Error::WebSocket(e.to_string()))?;
     sink.close()
@@ -184,7 +184,7 @@ impl WsSender {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteCommand::Send {
-                msg: WsMessage::Text(json),
+                msg: WsMessage::Text(json.into()),
                 ack: ack_tx,
             })
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
@@ -715,7 +715,7 @@ impl ProtocolClient {
             serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending client/hello: {}", hello_json);
         write
-            .send(WsMessage::Text(hello_json))
+            .send(WsMessage::Text(hello_json.into()))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
@@ -775,7 +775,7 @@ impl ProtocolClient {
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending initial client/state: {}", state_json);
         write
-            .send(WsMessage::Text(state_json))
+            .send(WsMessage::Text(state_json.into()))
             .await
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 

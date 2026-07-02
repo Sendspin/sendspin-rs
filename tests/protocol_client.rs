@@ -50,7 +50,7 @@ async fn start_test_server() -> (
             },
         ))
         .unwrap();
-        ws.send(WsMessage::Text(server_hello)).await.unwrap();
+        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
 
         // Forward all subsequent messages to the channel
         while let Some(Ok(msg)) = ws.next().await {
@@ -59,7 +59,7 @@ async fn start_test_server() -> (
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
-            if tx.send(text).is_err() {
+            if tx.send(text.to_string()).is_err() {
                 break;
             }
         }
@@ -70,7 +70,7 @@ async fn start_test_server() -> (
 
 /// Serialize a protocol message into a WebSocket text frame.
 fn text_message(msg: &Message) -> WsMessage {
-    WsMessage::Text(serde_json::to_string(msg).unwrap())
+    WsMessage::Text(serde_json::to_string(msg).unwrap().into())
 }
 
 /// A server→client `stream/start` that starts a player stream.
@@ -913,7 +913,7 @@ async fn start_test_server_with_roles(
             },
         ))
         .unwrap();
-        ws.send(WsMessage::Text(server_hello)).await.unwrap();
+        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
 
         while let Some(Ok(msg)) = ws.next().await {
             let text = match msg {
@@ -921,7 +921,7 @@ async fn start_test_server_with_roles(
                 WsMessage::Close(_) => break,
                 _ => continue,
             };
-            if tx.send(text).is_err() {
+            if tx.send(text.to_string()).is_err() {
                 break;
             }
         }
@@ -1027,7 +1027,7 @@ async fn start_test_server_with_sender() -> (
             },
         ))
         .unwrap();
-        ws.send(WsMessage::Text(server_hello)).await.unwrap();
+        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
 
         // Fan in: forward client messages to `client_tx`, forward outgoing
         // `server_send_rx` messages to the socket.
@@ -1040,7 +1040,7 @@ async fn start_test_server_with_sender() -> (
                         WsMessage::Close(_) => break,
                         _ => continue,
                     };
-                    if client_tx.send(text).is_err() { break }
+                    if client_tx.send(text.to_string()).is_err() { break }
                 }
                 outgoing = server_send_rx.recv() => {
                     let Some(out) = outgoing else { break };
@@ -1103,7 +1103,9 @@ async fn test_message_router_forwards_binary_audio() {
     let audio_frame: Vec<u8> = vec![
         0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0xDE, 0xAD,
     ];
-    server_tx.send(WsMessage::Binary(audio_frame)).unwrap();
+    server_tx
+        .send(WsMessage::Binary(audio_frame.into()))
+        .unwrap();
 
     let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.audio.recv())
         .await
@@ -1131,7 +1133,9 @@ async fn test_message_router_forwards_binary_artwork() {
     let artwork_frame: Vec<u8> = vec![
         0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xD8, 0xFF, 0xE0,
     ];
-    server_tx.send(WsMessage::Binary(artwork_frame)).unwrap();
+    server_tx
+        .send(WsMessage::Binary(artwork_frame.into()))
+        .unwrap();
 
     let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.artwork.recv())
         .await
@@ -1159,7 +1163,7 @@ async fn test_message_router_forwards_binary_visualizer() {
     let vis_frame: Vec<u8> = vec![
         0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x01, 0x02, 0x03,
     ];
-    server_tx.send(WsMessage::Binary(vis_frame)).unwrap();
+    server_tx.send(WsMessage::Binary(vis_frame.into())).unwrap();
 
     let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.visualizer.recv())
         .await
@@ -1189,7 +1193,9 @@ async fn test_message_router_forwards_text_messages() {
         },
     ))
     .unwrap();
-    server_tx.send(WsMessage::Text(server_state)).unwrap();
+    server_tx
+        .send(WsMessage::Text(server_state.into()))
+        .unwrap();
 
     let msg = tokio::time::timeout(std::time::Duration::from_secs(2), conn.messages.recv())
         .await
@@ -1299,7 +1305,7 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
             },
         ))
         .unwrap();
-        ws.send(WsMessage::Text(hello)).await.unwrap();
+        ws.send(WsMessage::Text(hello.into())).await.unwrap();
         let _ = ws.next().await; // initial client/state
         ws.close(None).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
