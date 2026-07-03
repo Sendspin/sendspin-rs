@@ -36,9 +36,13 @@ impl BufferPool {
 
     /// Get a buffer from the pool (or allocate if pool is empty)
     pub fn get(&self) -> Vec<i32> {
-        self.pool
-            .pop()
-            .unwrap_or_else(|| Vec::with_capacity(self.capacity))
+        self.pool.pop().unwrap_or_else(|| {
+            log::warn!(
+                "Buffer pool exhausted (capacity={} samples); falling back to heap allocation",
+                self.capacity
+            );
+            Vec::with_capacity(self.capacity)
+        })
     }
 
     /// Return a buffer to the pool

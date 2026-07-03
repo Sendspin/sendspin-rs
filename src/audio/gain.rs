@@ -53,6 +53,7 @@ impl GainControl {
     /// because the gain ramp smooths any transition.
     pub fn set_volume(&self, volume: u8) {
         let (clamped, gain) = volume_to_gain(volume);
+        log::debug!("Volume set: {clamped}% (gain={gain:.3})");
         // Store gain first so a concurrent reader never sees the new volume
         // with a stale gain value (the ramp smooths any brief inconsistency).
         self.state
@@ -63,6 +64,7 @@ impl GainControl {
 
     /// Set the mute state. When muted, output gain is 0 regardless of volume.
     pub fn set_mute(&self, muted: bool) {
+        log::debug!("Mute set: {muted}");
         self.state.muted.store(muted, Ordering::Relaxed);
     }
 

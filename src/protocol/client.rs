@@ -63,6 +63,7 @@ async fn writer_task<S>(
             }
         }
     }
+    log::debug!("Writer task exiting");
     // On exit `rx` drops, dropping the ack sender of any still-queued command;
     // callers awaiting those acks see the cancellation and treat it as a closed
     // connection (see `WsSender::send_message`).
@@ -621,6 +622,7 @@ impl ConnectionGuard {
     /// ack so the goodbye + close frames are known to have flushed (or
     /// surface the wire error if they didn't), then reap the writer.
     pub async fn disconnect(mut self, reason: GoodbyeReason) -> Result<(), Error> {
+        log::debug!("Disconnecting (reason: {reason:?})");
         // Stop clock-sync first so it can't enqueue time samples behind the
         // goodbye. The reader stays up until the goodbye/close has flushed
         // (below) so the socket isn't half-closed while we're still writing.
@@ -645,6 +647,7 @@ impl ConnectionGuard {
             h.abort();
         }
 
+        log::debug!("Disconnect complete");
         goodbye_result
     }
 }
@@ -879,10 +882,10 @@ impl ProtocolClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
-                    log::debug!("Received binary frame ({} bytes)", data.len());
+                    log::trace!("Received binary frame ({} bytes)", data.len());
                     match BinaryFrame::from_bytes(&data) {
                         Ok(BinaryFrame::Audio(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed audio chunk: timestamp={}, data_len={}",
                                 chunk.timestamp,
                                 chunk.data.len()
@@ -895,7 +898,7 @@ impl ProtocolClient {
                             }
                         }
                         Ok(BinaryFrame::Artwork(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed artwork chunk: channel={}, timestamp={}, data_len={}",
                                 chunk.channel,
                                 chunk.timestamp,
@@ -909,7 +912,7 @@ impl ProtocolClient {
                             }
                         }
                         Ok(BinaryFrame::Visualizer(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed visualizer chunk: timestamp={}, data_len={}",
                                 chunk.timestamp,
                                 chunk.data.len()
@@ -981,6 +984,7 @@ impl ProtocolClient {
                 _ => {}
             }
         }
+        log::debug!("Message router: WebSocket stream ended");
     }
 
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,

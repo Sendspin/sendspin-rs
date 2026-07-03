@@ -54,6 +54,10 @@ impl TimeFilter {
 
     fn update(&mut self, measurement: i64, max_error: i64, time_added: i64) {
         if time_added <= self.last_update {
+            log::warn!(
+                "TimeFilter: non-monotonic sample rejected (t4={time_added} <= last_update={})",
+                self.last_update
+            );
             return;
         }
 
@@ -116,6 +120,11 @@ impl TimeFilter {
         if self.count < 100 {
             self.count += 1;
         } else if residual.abs() > max_residual_cutoff {
+            log::debug!(
+                "TimeFilter: outlier residual={:.1}µs exceeds cutoff={:.1}µs, inflating covariance",
+                residual,
+                max_residual_cutoff
+            );
             new_drift_covariance *= self.forget_variance_factor;
             new_offset_drift_covariance *= self.forget_variance_factor;
             new_offset_covariance *= self.forget_variance_factor;
@@ -282,8 +291,25 @@ impl ClockSync {
         // samples would drive covariance to zero and eventually NaN.
         let max_error = (rtt / 2).max(1);
 
+        let was_synced = self.filter.is_synchronized();
+        let was_plausible = self.filter.drift_is_plausible();
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
+        if !was_synced && self.filter.is_synchronized() {
+            log::info!(
+                "Clock sync achieved: offset={:.0}µs, rtt={}µs",
+                self.filter.offset,
+                rtt
+            );
+        }
+        if was_plausible && !self.filter.drift_is_plausible() {
+            log::warn!(
+                "Clock sync: drift {:.4} exceeded plausibility limit {}; \
+                 time conversions will return None until it recovers",
+                self.filter.current.drift,
+                TimeFilter::MAX_DRIFT
+            );
+        }
     }
 
     /// Get current RTT in microseconds
