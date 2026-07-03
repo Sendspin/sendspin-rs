@@ -524,6 +524,7 @@ impl SyncedPlayer {
         let mut insert_counter = 0u32;
         let mut drop_counter = 0u32;
         let mut started = false;
+        let mut handoff_warned = false;
         let mut last_generation = 0u64;
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
@@ -575,6 +576,9 @@ impl SyncedPlayer {
                         (queue.generation, cursor, queue.force_reanchor)
                     };
                     if generation != last_generation {
+                        log::debug!(
+                            "Playback queue cleared (generation {last_generation} -> {generation})"
+                        );
                         last_generation = generation;
                         started = false;
                         schedule = CorrectionSchedule::default();
@@ -583,6 +587,7 @@ impl SyncedPlayer {
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
                         }
+                        handoff_warned = false;
                     }
 
                     let callback_instant = Instant::now();
@@ -624,6 +629,12 @@ impl SyncedPlayer {
                                         schedule = CorrectionSchedule::default();
                                         insert_counter = 0;
                                         drop_counter = 0;
+                                    } else if !handoff_warned {
+                                        handoff_warned = true;
+                                        log::warn!(
+                                            "Startup handoff: no playable buffer at or after \
+                                             server_time={server_time}µs — staying silent"
+                                        );
                                     }
                                 }
                             }

@@ -622,6 +622,7 @@ impl ConnectionGuard {
     /// ack so the goodbye + close frames are known to have flushed (or
     /// surface the wire error if they didn't), then reap the writer.
     pub async fn disconnect(mut self, reason: GoodbyeReason) -> Result<(), Error> {
+        log::debug!("Disconnecting (reason: {reason:?})");
         // Stop clock-sync first so it can't enqueue time samples behind the
         // goodbye. The reader stays up until the goodbye/close has flushed
         // (below) so the socket isn't half-closed while we're still writing.
@@ -646,6 +647,7 @@ impl ConnectionGuard {
             h.abort();
         }
 
+        log::debug!("Disconnect complete");
         goodbye_result
     }
 }
