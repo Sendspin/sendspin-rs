@@ -879,10 +879,10 @@ impl ProtocolClient {
         while let Some(msg) = read.next().await {
             match msg {
                 Ok(WsMessage::Binary(data)) => {
-                    log::debug!("Received binary frame ({} bytes)", data.len());
+                    log::trace!("Received binary frame ({} bytes)", data.len());
                     match BinaryFrame::from_bytes(&data) {
                         Ok(BinaryFrame::Audio(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed audio chunk: timestamp={}, data_len={}",
                                 chunk.timestamp,
                                 chunk.data.len()
@@ -895,7 +895,7 @@ impl ProtocolClient {
                             }
                         }
                         Ok(BinaryFrame::Artwork(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed artwork chunk: channel={}, timestamp={}, data_len={}",
                                 chunk.channel,
                                 chunk.timestamp,
@@ -909,7 +909,7 @@ impl ProtocolClient {
                             }
                         }
                         Ok(BinaryFrame::Visualizer(chunk)) => {
-                            log::debug!(
+                            log::trace!(
                                 "Parsed visualizer chunk: timestamp={}, data_len={}",
                                 chunk.timestamp,
                                 chunk.data.len()
