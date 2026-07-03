@@ -234,6 +234,11 @@ impl ProtocolClientBuilder {
         let tcp = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Connection(format!("TCP bind failed: {e}")))?;
+        let local = tcp
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
+        log::info!("ProtocolListener bound on {local}");
         Ok(ProtocolListener::new(tcp, self))
     }
 

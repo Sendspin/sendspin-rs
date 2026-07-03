@@ -397,6 +397,12 @@ impl SyncedPlayer {
             callback_outputs,
         )?;
         stream.play().map_err(|e| Error::Output(e.to_string()))?;
+        log::info!(
+            "SyncedPlayer started: {} channels, {} Hz, {}-bit",
+            format.channels,
+            format.sample_rate,
+            format.bit_depth,
+        );
 
         Ok(Self {
             format,
@@ -634,7 +640,10 @@ impl SyncedPlayer {
                                 emit_silence(data);
                                 return;
                             }
-                            started = true;
+                            if !started {
+                                started = true;
+                                log::debug!("Audio playback started");
+                            }
 
                             let error_us = if playback_instant >= expected_instant {
                                 playback_instant
@@ -682,6 +691,9 @@ impl SyncedPlayer {
                                     let mut queue = queue.lock();
                                     queue.cursor_us = server_time;
                                     queue.cursor_remainder = 0;
+                                    log::debug!(
+                                        "Sync reanchor applied: cursor reset to server_time={server_time}µs"
+                                    );
                                 }
                                 schedule = CorrectionSchedule::default();
                                 insert_counter = 0;

@@ -63,6 +63,7 @@ async fn writer_task<S>(
             }
         }
     }
+    log::debug!("Writer task exiting");
     // On exit `rx` drops, dropping the ack sender of any still-queued command;
     // callers awaiting those acks see the cancellation and treat it as a closed
     // connection (see `WsSender::send_message`).
@@ -981,6 +982,7 @@ impl ProtocolClient {
                 _ => {}
             }
         }
+        log::debug!("Message router: WebSocket stream ended");
     }
 
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,

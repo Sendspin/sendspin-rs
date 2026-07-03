@@ -282,8 +282,16 @@ impl ClockSync {
         // samples would drive covariance to zero and eventually NaN.
         let max_error = (rtt / 2).max(1);
 
+        let was_synced = self.filter.is_synchronized();
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
+        if !was_synced && self.filter.is_synchronized() {
+            log::info!(
+                "Clock sync achieved: offset={:.0}µs, rtt={}µs",
+                self.filter.offset,
+                rtt
+            );
+        }
     }
 
     /// Get current RTT in microseconds
