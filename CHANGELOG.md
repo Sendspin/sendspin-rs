@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2](https://github.com/Sendspin/sendspin-rs/compare/v0.3.1...v0.3.2) - 2026-07-03
+
+### Other
+
+- Fix/update logging ([#76](https://github.com/Sendspin/sendspin-rs/pull/76))
+
 ## [0.3.1](https://github.com/Sendspin/sendspin-rs/compare/v0.3.0...v0.3.1) - 2026-07-02
 
 ### Other
