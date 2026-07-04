@@ -253,8 +253,9 @@ impl PlaybackQueue {
 
     fn first_playable_cursor_at_or_after(&self, server_time_us: i64) -> Option<i64> {
         if let Some(buffer) = self.current.as_ref() {
-            if buffer.timestamp + buffer.duration_us() > server_time_us {
-                return Some(buffer.timestamp.max(server_time_us));
+            let remaining_start = buffer.timestamp.max(self.cursor_us);
+            if buffer.timestamp + buffer.duration_us() > server_time_us.max(remaining_start) {
+                return Some(remaining_start.max(server_time_us));
             }
         }
 
@@ -496,9 +497,19 @@ impl SyncedPlayer {
     /// audio by this amount, so the player shifts each sample's emission earlier
     /// by the same delay to keep alignment correct. Values above the maximum are
     /// clamped. Takes effect on the next audio callback.
+    ///
+    /// A delay change is an intentional local timing offset, not clock drift.
+    /// Request a one-shot reanchor so the audio callback either skips forward or
+    /// waits for the new target time instead of feeding the delay delta through
+    /// pitch-shifting drift correction.
     pub fn set_static_delay(&self, delay_ms: u16) {
         self.static_delay_us
             .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+
+        let mut queue = self.queue.lock();
+        if queue.initialized {
+            queue.force_reanchor = true;
+        }
     }
 
     /// Current static delay in milliseconds.
@@ -605,16 +616,22 @@ impl SyncedPlayer {
                         // direction; the two signs must stay in step or the
                         // planner chases a phantom error every callback.
                         let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
+                        let mut effective_cursor_us = cursor_us;
 
-                        // Startup handoff: anchor to `+ handoff_delta` (this buffer's
-                        // end = the next callback's start) so the next start gate sees
-                        // `expected ≈ playback_instant`. Playing now would misalign the
-                        // cursor by one buffer, so we stay silent for this one period.
                         if force_reanchor {
-                            let frames = data.len() / channels;
-                            let handoff_delta =
-                                Duration::from_secs_f64(frames as f64 / sample_rate as f64);
-                            let handoff_instant = playback_instant + handoff_delta;
+                            let mut reanchor_applied = false;
+                            let handoff_instant = if started {
+                                playback_instant
+                            } else {
+                                // Startup handoff: anchor to `+ handoff_delta` (this buffer's
+                                // end = the next callback's start) so the next start gate sees
+                                // `expected ≈ playback_instant`. Playing now would misalign the
+                                // cursor by one buffer, so we stay silent for this one period.
+                                let frames = data.len() / channels;
+                                let handoff_delta =
+                                    Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+                                playback_instant + handoff_delta
+                            };
                             let client_micros =
                                 sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
                             if let Some(server_time) = sync.client_to_server_micros(client_micros) {
@@ -626,28 +643,35 @@ impl SyncedPlayer {
                                         queue.cursor_us = cursor_us;
                                         queue.cursor_remainder = 0;
                                         queue.force_reanchor = false;
+                                        effective_cursor_us = cursor_us;
+                                        reanchor_applied = true;
                                         schedule = CorrectionSchedule::default();
                                         insert_counter = 0;
                                         drop_counter = 0;
+                                        log::debug!(
+                                            "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
+                                        );
                                     } else if !handoff_warned {
                                         handoff_warned = true;
                                         log::warn!(
-                                            "Startup handoff: no playable buffer at or after \
+                                            "Sync reanchor: no playable buffer at or after \
                                              server_time={server_time}µs — staying silent"
                                         );
                                     }
                                 }
                             }
 
-                            emit_silence(data);
-                            return;
+                            if !reanchor_applied || !started {
+                                emit_silence(data);
+                                return;
+                            }
                         }
 
-                        if let Some(expected_instant) =
-                            sync.server_to_local_instant_with_latency(cursor_us, delay_us)
+                        if let Some(expected_instant) = sync
+                            .server_to_local_instant_with_latency(effective_cursor_us, delay_us)
                         {
                             let early_window = Duration::from_millis(1);
-                            if !started && playback_instant + early_window < expected_instant {
+                            if playback_instant + early_window < expected_instant {
                                 emit_silence(data);
                                 return;
                             }
@@ -1189,6 +1213,28 @@ mod tests {
         assert!(queue.queue.is_empty());
 
         assert_eq!(queue.first_playable_cursor_at_or_after(5_000), Some(5_000));
+        assert_eq!(queue.first_playable_cursor_at_or_after(10_000), None);
+    }
+
+    #[test]
+    fn test_first_playable_cursor_does_not_rewind_current_buffer() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
+
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(samples.into_boxed_slice()),
+            format,
+        });
+
+        for _ in 0..240 {
+            let _ = queue.next_frame(2, 48_000);
+        }
+        assert_eq!(queue.cursor_us, 5_000);
+
+        assert_eq!(queue.first_playable_cursor_at_or_after(1_000), Some(5_000));
+        assert_eq!(queue.first_playable_cursor_at_or_after(6_000), Some(6_000));
         assert_eq!(queue.first_playable_cursor_at_or_after(10_000), None);
     }
 
