@@ -17,6 +17,8 @@ pub mod protocol;
 /// Clock synchronization utilities
 pub mod sync;
 
+pub(crate) mod log_sampling;
+
 pub use audio::GainControl;
 pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
 pub use protocol::client_builder::ProtocolClientBuilder;

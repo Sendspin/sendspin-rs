@@ -2,6 +2,7 @@
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
 use crate::error::Error;
+use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
     ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
@@ -180,7 +181,14 @@ impl WsSender {
     /// Send a message to the server.
     pub async fn send_message(&self, msg: Message) -> Result<(), Error> {
         let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        log::debug!("Sending message: {}", json);
+        // Time pings go out at 1Hz for as long as the connection lives; keep
+        // that housekeeping at trace so debug shows only meaningful traffic.
+        let level = if matches!(msg, Message::ClientTime(_)) {
+            log::Level::Trace
+        } else {
+            log::Level::Debug
+        };
+        log::log!(level, "Sending message: {}", json);
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -583,13 +591,12 @@ impl BinaryFrame {
             binary_types::VISUALIZER => {
                 Ok(BinaryFrame::Visualizer(VisualizerChunk::from_bytes(frame)?))
             }
-            _ => {
-                log::debug!("Unknown binary type: {}", type_id);
-                Ok(BinaryFrame::Unknown {
-                    type_id,
-                    data: Arc::from(&frame[1..]),
-                })
-            }
+            // The router warns when it sees the Unknown variant; parsing
+            // itself stays quiet to avoid reporting the same frame twice.
+            _ => Ok(BinaryFrame::Unknown {
+                type_id,
+                data: Arc::from(&frame[1..]),
+            }),
         }
     }
 }
@@ -730,14 +737,15 @@ impl ProtocolClient {
             };
             match result {
                 Ok(WsMessage::Text(text)) => {
-                    log::debug!("Received text message: {}", text);
+                    log::trace!("Received text frame: {}", text);
                     let msg: Message = serde_json::from_str(&text).map_err(|e| {
-                        log::error!("Failed to parse server message: {}", e);
+                        log::error!("Failed to parse server message: {} (payload: {})", e, text);
                         Error::Protocol(e.to_string())
                     })?;
 
                     match msg {
                         Message::ServerHello(server_hello) => {
+                            log::debug!("Received server/hello: {:?}", server_hello);
                             log::info!(
                                 "Connected to server: {} ({})",
                                 server_hello.name,
@@ -878,69 +886,83 @@ impl ProtocolClient {
         let mut artwork_closed = false;
         let mut visualizer_closed = false;
         let mut message_closed = false;
+        let mut audio_chunk_count = 0u64;
+        let mut visualizer_chunk_count = 0u64;
 
         while let Some(msg) = read.next().await {
             match msg {
-                Ok(WsMessage::Binary(data)) => {
-                    log::trace!("Received binary frame ({} bytes)", data.len());
-                    match BinaryFrame::from_bytes(&data) {
-                        Ok(BinaryFrame::Audio(chunk)) => {
+                Ok(WsMessage::Binary(data)) => match BinaryFrame::from_bytes(&data) {
+                    Ok(BinaryFrame::Audio(chunk)) => {
+                        audio_chunk_count += 1;
+                        if should_log_sample(audio_chunk_count) {
                             log::trace!(
-                                "Parsed audio chunk: timestamp={}, data_len={}",
+                                "Received audio chunk: chunk={}, timestamp={}µs, payload_bytes={}, wire_bytes={}",
+                                audio_chunk_count,
                                 chunk.timestamp,
-                                chunk.data.len()
+                                chunk.data.len(),
+                                data.len()
                             );
-                            if !audio_closed && audio_tx.send(chunk).is_err() {
-                                log::error!(
-                                    "Audio receiver dropped — audio data will be discarded"
-                                );
-                                audio_closed = true;
-                            }
                         }
-                        Ok(BinaryFrame::Artwork(chunk)) => {
-                            log::trace!(
-                                "Parsed artwork chunk: channel={}, timestamp={}, data_len={}",
-                                chunk.channel,
-                                chunk.timestamp,
-                                chunk.data.len()
-                            );
-                            if !artwork_closed && artwork_tx.send(chunk).is_err() {
-                                log::error!(
-                                    "Artwork receiver dropped — artwork data will be discarded"
-                                );
-                                artwork_closed = true;
-                            }
-                        }
-                        Ok(BinaryFrame::Visualizer(chunk)) => {
-                            log::trace!(
-                                "Parsed visualizer chunk: timestamp={}, data_len={}",
-                                chunk.timestamp,
-                                chunk.data.len()
-                            );
-                            if !visualizer_closed && visualizer_tx.send(chunk).is_err() {
-                                log::error!("Visualizer receiver dropped — visualizer data will be discarded");
-                                visualizer_closed = true;
-                            }
-                        }
-                        Ok(BinaryFrame::Unknown { type_id, .. }) => {
-                            log::warn!("Received unknown binary type: {}", type_id);
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to parse binary frame: {}", e);
+                        if !audio_closed && audio_tx.send(chunk).is_err() {
+                            log::error!("Audio receiver dropped — audio data will be discarded");
+                            audio_closed = true;
                         }
                     }
-                }
+                    Ok(BinaryFrame::Artwork(chunk)) => {
+                        // Artwork arrives in short bursts on track changes, so
+                        // every chunk is worth a line; audio and visualizer
+                        // chunks stream continuously and are sampled instead.
+                        log::trace!(
+                            "Received artwork chunk: channel={}, timestamp={}µs, payload_bytes={}",
+                            chunk.channel,
+                            chunk.timestamp,
+                            chunk.data.len()
+                        );
+                        if !artwork_closed && artwork_tx.send(chunk).is_err() {
+                            log::error!(
+                                "Artwork receiver dropped — artwork data will be discarded"
+                            );
+                            artwork_closed = true;
+                        }
+                    }
+                    Ok(BinaryFrame::Visualizer(chunk)) => {
+                        visualizer_chunk_count += 1;
+                        if should_log_sample(visualizer_chunk_count) {
+                            log::trace!(
+                                "Received visualizer chunk: chunk={}, timestamp={}µs, payload_bytes={}",
+                                visualizer_chunk_count,
+                                chunk.timestamp,
+                                chunk.data.len()
+                            );
+                        }
+                        if !visualizer_closed && visualizer_tx.send(chunk).is_err() {
+                            log::error!(
+                                "Visualizer receiver dropped — visualizer data will be discarded"
+                            );
+                            visualizer_closed = true;
+                        }
+                    }
+                    Ok(BinaryFrame::Unknown { type_id, .. }) => {
+                        log::warn!("Received unknown binary type: {}", type_id);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse binary frame: {}", e);
+                    }
+                },
                 Ok(WsMessage::Text(text)) => {
                     // Capture receive time before deserialization so
                     // t4 is as close to the true arrival time as possible.
                     let t4 = clock.now_micros();
-                    log::debug!("Received text message: {}", text);
+                    log::trace!("Received text frame: {}", text);
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
-                            log::debug!("Parsed message: {:?}", msg);
                             // ServerTime is consumed here for clock sync
                             // and intentionally NOT forwarded to message_rx
                             // consumers — it's an internal protocol detail.
+                            // It also arrives at 1Hz for as long as the
+                            // connection lives, so it stays out of the debug
+                            // view; ClockSync::update logs the computed sync
+                            // state instead.
                             if let Message::ServerTime(ref st) = msg {
                                 clock_sync.lock().update(
                                     st.client_transmitted,
@@ -949,6 +971,7 @@ impl ProtocolClient {
                                     t4,
                                 );
                             } else {
+                                log::debug!("Received message: {:?}", msg);
                                 // Settle the request-format gate before
                                 // forwarding, so a consumer reacting to this
                                 // stream/start or stream/end sees current state.
@@ -968,7 +991,7 @@ impl ProtocolClient {
                             }
                         }
                         Err(e) => {
-                            log::warn!("Failed to parse message: {}", e);
+                            log::warn!("Failed to parse message: {} (payload: {})", e, text);
                         }
                     }
                 }
