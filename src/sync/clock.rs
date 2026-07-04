@@ -278,6 +278,16 @@ impl ClockSync {
         // (network congestion). Store only valid RTT so that quality()
         // doesn't report Good on a negative value.
         if !(0..=100_000).contains(&rtt) {
+            // Samples arrive at ~1Hz, so this stays bounded; a run of these
+            // lines is the "sync is starving" diagnostic.
+            log::debug!(
+                "Clock sync sample discarded: rtt={}µs outside 0..=100000µs (t1={}, t2={}, t3={}, t4={})",
+                rtt,
+                t1,
+                t2,
+                t3,
+                t4
+            );
             return;
         }
         self.rtt_micros = Some(rtt);
@@ -295,6 +305,13 @@ impl ClockSync {
         let was_plausible = self.filter.drift_is_plausible();
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
+        log::trace!(
+            "Clock sync sample: offset={:.0}µs, rtt={}µs, drift={:.6}, synchronized={}",
+            self.filter.offset,
+            rtt,
+            self.filter.current.drift,
+            self.filter.is_synchronized(),
+        );
         if !was_synced && self.filter.is_synchronized() {
             log::info!(
                 "Clock sync achieved: offset={:.0}µs, rtt={}µs",
