@@ -817,8 +817,9 @@ impl ProtocolClient {
             .await;
         });
 
-        // First two samples fire 10ms apart so the Kalman filter converges
-        // in ~20ms; the remainder run at 1Hz for ongoing drift correction.
+        // First two samples fire 10ms apart so an offset estimate (and
+        // playback start) is available almost immediately; drift converges
+        // over the following 1Hz samples (see TimeFilter).
         let sync_sender = WsSender {
             tx: out_tx.clone(),
             stream_state: Arc::clone(&stream_state),

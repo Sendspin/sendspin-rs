@@ -83,10 +83,19 @@ impl TimeFilter {
 
         if self.count == 1 {
             self.count = 2;
-            self.drift = (measurement as f64 - self.offset) / dt;
+            if dt < Self::MIN_DRIFT_BASELINE_MICROS {
+                // Δoffset/Δt over a tiny Δt is measurement noise amplified
+                // without bound. Seed drift at zero with uncertainty from the
+                // floored baseline; later Kalman updates refine it.
+                self.drift = 0.0;
+                self.drift_covariance = (self.offset_covariance + measurement_variance)
+                    / (Self::MIN_DRIFT_BASELINE_MICROS * Self::MIN_DRIFT_BASELINE_MICROS);
+            } else {
+                self.drift = (measurement as f64 - self.offset) / dt;
+                // Divide by dt^2, not dt: variance of (x/c) is var(x)/c^2.
+                self.drift_covariance = (self.offset_covariance + measurement_variance) / (dt * dt);
+            }
             self.offset = measurement as f64;
-            // Divide by dt^2, not dt: variance of (x/c) is var(x)/c^2.
-            self.drift_covariance = (self.offset_covariance + measurement_variance) / (dt * dt);
             self.offset_covariance = measurement_variance;
             self.current = TimeElement {
                 last_update: self.last_update,
@@ -150,6 +159,11 @@ impl TimeFilter {
         };
     }
 
+    /// Minimum baseline for estimating drift from the first two samples.
+    /// The fast-start pair can arrive bunched to near-zero spacing, so it
+    /// never qualifies; drift converges through later Kalman updates.
+    const MIN_DRIFT_BASELINE_MICROS: f64 = 100_000.0;
+
     /// Maximum plausible drift magnitude. Real clock drift between
     /// hardware oscillators is measured in ppm; 20% is far beyond
     /// physical reality. This is a last-resort safety net for a
@@ -181,8 +195,15 @@ impl TimeFilter {
         drift * drift >= threshold
     }
 
+    /// True when the filter would apply its drift estimate but it is beyond
+    /// physical plausibility. An implausible estimate the SNR gate already
+    /// rejects blocks nothing: conversions then run with zero drift.
+    fn conversions_blocked(&self) -> bool {
+        self.current.use_drift && !self.drift_is_plausible()
+    }
+
     fn effective_drift(&self) -> Option<f64> {
-        if !self.drift_is_plausible() {
+        if self.conversions_blocked() {
             return None;
         }
 
@@ -209,6 +230,16 @@ impl TimeFilter {
 
     fn is_synchronized(&self) -> bool {
         self.count >= 2 && self.offset_covariance.is_finite()
+    }
+
+    /// Samples required before the estimate is trusted for fine-grained
+    /// playback corrections. At the sync cadence (two fast-start samples,
+    /// then 1Hz — see `ProtocolClient`), ten samples settle ~9s after
+    /// connect.
+    const SETTLE_MIN_SAMPLES: u32 = 10;
+
+    fn is_settled(&self) -> bool {
+        self.count >= Self::SETTLE_MIN_SAMPLES
     }
 }
 
@@ -302,7 +333,7 @@ impl ClockSync {
         let max_error = (rtt / 2).max(1);
 
         let was_synced = self.filter.is_synchronized();
-        let was_plausible = self.filter.drift_is_plausible();
+        let was_blocked = self.filter.conversions_blocked();
         self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
         log::trace!(
@@ -319,9 +350,9 @@ impl ClockSync {
                 rtt
             );
         }
-        if was_plausible && !self.filter.drift_is_plausible() {
+        if !was_blocked && self.filter.conversions_blocked() {
             log::warn!(
-                "Clock sync: drift {:.4} exceeded plausibility limit {}; \
+                "Clock sync: in-use drift {:.4} exceeded plausibility limit {}; \
                  time conversions will return None until it recovers",
                 self.filter.current.drift,
                 TimeFilter::MAX_DRIFT
@@ -401,6 +432,14 @@ impl ClockSync {
     /// Check if clock sync has converged
     pub fn is_synchronized(&self) -> bool {
         self.filter.is_synchronized()
+    }
+
+    /// Whether the estimate has settled enough to drive fine-grained
+    /// playback corrections. [`is_synchronized`](Self::is_synchronized)
+    /// means conversions are available at all: playback starts when
+    /// synchronized; the correction planner waits until settled.
+    pub fn is_settled(&self) -> bool {
+        self.filter.is_settled()
     }
 }
 
@@ -506,5 +545,69 @@ mod tests {
             with_bad.compute_client_time(10_000),
             without_bad.compute_client_time(10_000),
         );
+    }
+
+    #[test]
+    fn bunched_first_pair_seeds_zero_drift_and_keeps_conversions() {
+        let mut f = TimeFilter::new(0.01, 1.001);
+        // Fast-start pair arriving 190µs apart with a large offset delta:
+        // pre-fix, this computed drift = -6037/190 ≈ -31.8 and then blocked
+        // all conversions on implausibility for a full sample interval.
+        f.update(1_000_000, 12_797, 1_000);
+        f.update(994_000, 6_813, 1_190);
+
+        assert_eq!(f.drift, 0.0, "tiny-baseline pair must not estimate drift");
+        assert!(f.is_synchronized());
+        assert!(
+            f.compute_client_time(2_000_000).is_some(),
+            "conversions must be available right after the fast-start pair"
+        );
+    }
+
+    #[test]
+    fn long_baseline_pair_still_estimates_drift() {
+        let mut f = TimeFilter::new(0.01, 1.001);
+        f.update(1_000, 10, 1_000);
+        // dt = 200ms, at/above the baseline floor: quotient drift applies.
+        f.update(1_200, 10, 201_000);
+        assert!((f.drift - (200.0 / 200_000.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unused_implausible_drift_does_not_block_conversions() {
+        let mut f = primed_filter();
+        // A diverged-looking drift that the SNR gate refuses to use must
+        // not veto conversions: effective drift is zero, which is safe.
+        f.current.drift = 5.0;
+        f.current.use_drift = false;
+        assert!(!f.conversions_blocked());
+        assert_eq!(f.effective_drift(), Some(0.0));
+    }
+
+    #[test]
+    fn in_use_implausible_drift_blocks_conversions() {
+        let mut f = primed_filter();
+        f.current.drift = 5.0;
+        f.current.use_drift = true;
+        assert!(f.conversions_blocked());
+        assert_eq!(f.effective_drift(), None);
+    }
+
+    #[test]
+    fn in_use_plausible_drift_is_applied() {
+        let mut f = primed_filter();
+        f.current.drift = 0.0001;
+        f.current.use_drift = true;
+        assert_eq!(f.effective_drift(), Some(0.0001));
+    }
+
+    #[test]
+    fn settles_after_minimum_samples() {
+        let mut f = TimeFilter::new(0.01, 1.001);
+        for i in 0..i64::from(TimeFilter::SETTLE_MIN_SAMPLES) {
+            assert!(!f.is_settled(), "must not settle before sample {}", i + 1);
+            f.update(1_000 + i, 10, 1_000 + i * 1_000_000);
+        }
+        assert!(f.is_settled());
     }
 }
