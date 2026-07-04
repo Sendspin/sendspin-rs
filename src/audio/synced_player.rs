@@ -332,6 +332,9 @@ struct CallbackStats {
     /// Schedule updates within the current correction episode; the sampling
     /// key for the correction trace line. Reset when correction disengages.
     correction_updates: u64,
+    /// Corrections the planner requested during clock warm-up that were
+    /// suppressed; the sampling key for the warm-up trace line.
+    warmup_suppressed_corrections: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
     queue_low: bool,
@@ -678,6 +681,9 @@ impl SyncedPlayer {
         let mut drop_counter = 0u32;
         let mut started = false;
         let mut handoff_warned = false;
+        let mut sync_settle_logged = false;
+        let mut last_callback_instant: Option<Instant> = None;
+        let mut last_playback_delta_us: Option<u64> = None;
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
         let initial_gain = cb_config.gain_control.gain();
@@ -784,6 +790,38 @@ impl SyncedPlayer {
                     let playback_delta = ts.playback.duration_since(ts.callback);
                     let playback_instant = callback_instant + playback_delta;
 
+                    // Both values are normally steady, so a step in either
+                    // explains a sync-error step: a callback gap means this
+                    // thread stalled; a playback-delta shift means the OS
+                    // moved the presentation timeline.
+                    let playback_delta_us = playback_delta.as_micros() as u64;
+                    if let Some(last) = last_callback_instant {
+                        let gap_us = callback_instant.duration_since(last).as_micros() as u64;
+                        let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
+                        if gap_us > 2 * period_us {
+                            log::debug!(
+                                "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
+                                us_to_ms(gap_us),
+                                us_to_ms(period_us),
+                                stats.callbacks,
+                                generation,
+                            );
+                        }
+                    }
+                    last_callback_instant = Some(callback_instant);
+                    if let Some(last) = last_playback_delta_us {
+                        if playback_delta_us.abs_diff(last) > 1_000 {
+                            log::debug!(
+                                "Output timeline shifted: playback_delta {:.1}ms -> {:.1}ms, callback={}, generation={}",
+                                us_to_ms(last),
+                                us_to_ms(playback_delta_us),
+                                stats.callbacks,
+                                generation,
+                            );
+                        }
+                    }
+                    last_playback_delta_us = Some(playback_delta_us);
+
                     // try_lock: skip sync if contended rather than blocking
                     // the audio thread. force_reanchor is sticky in the
                     // queue, so it will be retried on the next callback.
@@ -812,6 +850,16 @@ impl SyncedPlayer {
                         // planner chases a phantom error every callback.
                         let delay_us = cb_config.static_delay_us.load(Ordering::Relaxed);
                         let mut effective_cursor_us = cursor_us;
+                        let sync_settled = sync.is_settled();
+                        if sync_settled && !sync_settle_logged {
+                            sync_settle_logged = true;
+                            log::debug!(
+                                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
+                                stats.callbacks,
+                                stats.warmup_suppressed_corrections,
+                                generation,
+                            );
+                        }
 
                         if force_reanchor {
                             let mut reanchor_applied = false;
@@ -877,8 +925,13 @@ impl SyncedPlayer {
                         if let Some(expected_instant) = sync
                             .server_to_local_instant_with_latency(effective_cursor_us, delay_us)
                         {
+                            // Pre-start only: hold silence until the cursor's
+                            // scheduled instant. After start, "early" readings
+                            // are jitter — injecting silence here caused real
+                            // dropouts (audible blips); the planner handles
+                            // sustained earliness instead.
                             let early_window = Duration::from_millis(1);
-                            if playback_instant + early_window < expected_instant {
+                            if !started && playback_instant + early_window < expected_instant {
                                 stats.silent_callbacks += 1;
                                 if trace_logging && should_log_sample(stats.silent_callbacks) {
                                     let early_us = expected_instant
@@ -920,8 +973,34 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
-                            let new_schedule =
+                            let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
+                            // While the sync estimate is still converging,
+                            // measured error is mostly movement of the
+                            // estimate itself; correcting for it chases
+                            // filter noise audibly. Trust the server's audio
+                            // until settled, honoring only gross reanchors.
+                            let new_schedule = if sync_settled || planned_schedule.reanchor {
+                                planned_schedule
+                            } else {
+                                if planned_schedule.is_correcting() {
+                                    stats.warmup_suppressed_corrections += 1;
+                                    if trace_logging
+                                        && should_log_sample(
+                                            stats.warmup_suppressed_corrections,
+                                        )
+                                    {
+                                        log::trace!(
+                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, generation={}",
+                                            stats.callbacks,
+                                            stats.warmup_suppressed_corrections,
+                                            error_us as f64 / 1000.0,
+                                            generation,
+                                        );
+                                    }
+                                }
+                                CorrectionSchedule::default()
+                            };
                             if new_schedule != schedule {
                                 if new_schedule.is_correcting() != schedule.is_correcting() {
                                     if new_schedule.is_correcting() {
@@ -997,6 +1076,19 @@ impl SyncedPlayer {
                                 drop_counter = 0;
                                 stats.correction_updates = 0;
                             }
+                        } else if schedule.is_correcting() {
+                            // Conversions went dark (the implausible-drift
+                            // safety net): stop correcting rather than
+                            // resample blind on the stale cadence.
+                            log::debug!(
+                                "Sync conversions unavailable; clearing correction schedule: callback={}, generation={}",
+                                stats.callbacks,
+                                generation,
+                            );
+                            schedule = CorrectionSchedule::default();
+                            insert_counter = 0;
+                            drop_counter = 0;
+                            stats.correction_updates = 0;
                         }
                     }
 

@@ -154,10 +154,11 @@ fn test_conversions_use_offset_only_when_drift_snr_is_low() {
 
     // First sample: offset = +100µs with tight uncertainty.
     sync.update(1_000, 1_100, 1_100, 1_000);
-    // Second sample: offset = +120µs, but a 1ms RTT gives the drift estimate
-    // high covariance. Its SNR is below 2σ, so both conversion directions
-    // should ignore drift and use only the current offset.
-    sync.update(1_000, 1_620, 1_620, 2_000);
+    // Second sample 200ms later (a legitimate drift baseline): offset =
+    // +120µs, but a 1ms RTT gives the drift estimate high covariance. Its
+    // SNR is below 2σ, so both conversion directions should ignore drift
+    // and use only the current offset.
+    sync.update(200_000, 200_620, 200_620, 201_000);
 
     assert!(sync.is_synchronized());
     assert_eq!(sync.server_to_client_micros(3_120), Some(3_000));
@@ -168,10 +169,11 @@ fn test_conversions_use_offset_only_when_drift_snr_is_low() {
 fn test_conversions_apply_drift_when_snr_is_high() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // The same +100µs → +120µs drift as the low-SNR test, but with low-RTT
-    // samples. The covariance is small enough for the 2σ SNR gate to pass.
+    // Offset moves +100µs → +4100µs over a 200ms baseline (drift = 0.02),
+    // with low-RTT samples. The covariance is small enough for the 2σ SNR
+    // gate to pass, so conversions apply the drift estimate.
     sync.update(1_000, 1_100, 1_100, 1_000);
-    sync.update(2_000, 2_120, 2_120, 2_000);
+    sync.update(201_000, 205_100, 205_100, 201_000);
 
     assert!(sync.is_synchronized());
     assert_eq!(sync.server_to_client_micros(3_120), Some(2_980));
@@ -182,11 +184,12 @@ fn test_conversions_apply_drift_when_snr_is_high() {
 fn test_diverged_drift_returns_none() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // Two samples 10µs apart where the NTP offset drops from 100 to 88,
-    // giving drift = -1.2 — far beyond any real hardware clock skew.
-    // Both conversions should return None rather than produce garbage.
-    sync.update(1000, 1100, 1100, 1000);
-    sync.update(1010, 1098, 1098, 1010);
+    // Two samples 200ms apart (a legitimate drift baseline) where the NTP
+    // offset collapses from +100µs to -99_900µs, giving drift = -0.5 with
+    // high SNR — far beyond any real hardware clock skew. The filter would
+    // apply that drift, so both conversions must refuse and return None.
+    sync.update(1_000, 1_100, 1_100, 1_000);
+    sync.update(201_000, 101_100, 101_100, 201_000);
 
     assert!(
         sync.server_to_client_micros(2000).is_none(),
