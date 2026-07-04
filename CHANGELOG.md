@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3](https://github.com/Sendspin/sendspin-rs/compare/v0.3.2...v0.3.3) - 2026-07-04
+
+### Added
+
+- Add comprehensive trace-level logging ([#80](https://github.com/Sendspin/sendspin-rs/pull/80))
+
+### Fixed
+
+- Eliminate early-stream audio glitches from clock sync warm-up ([#81](https://github.com/Sendspin/sendspin-rs/pull/81))
+
+### Other
+
+- Fix static delay reanchor handling ([#78](https://github.com/Sendspin/sendspin-rs/pull/78))
+
 ## [0.3.2](https://github.com/Sendspin/sendspin-rs/compare/v0.3.1...v0.3.2) - 2026-07-03
 
 ### Other
