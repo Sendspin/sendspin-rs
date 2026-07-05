@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/Sendspin/sendspin-rs/compare/v0.3.3...v0.3.4) - 2026-07-05
+
+### Fixed
+
+- Stop evicting queued audio on sub-frame timestamp overlaps ([#82](https://github.com/Sendspin/sendspin-rs/pull/82))
+
 ## [0.3.3](https://github.com/Sendspin/sendspin-rs/compare/v0.3.2...v0.3.3) - 2026-07-04
 
 ### Added
