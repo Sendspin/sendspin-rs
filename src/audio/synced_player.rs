@@ -147,15 +147,24 @@ impl PlaybackQueue {
         // already in the queue. Remove all overlapping buffers to prevent
         // duplicate audio that causes audible stuttering (~500ms of audio
         // played twice). The server will send fresh buffers for any gaps.
-        //
-        // Two buffers overlap when their time ranges intersect:
-        //   start_a < end_b && start_b < end_a
         // This works for any chunk size (the sendspin spec allows arbitrarily
         // small chunks), unlike the previous fixed-threshold approach.
+        //
+        // The overlap must be at least one frame to count. A sub-frame
+        // "overlap" cannot contain a duplicated sample — it is timestamp
+        // rounding, not a rebase: at rates where chunks are not a whole
+        // number of microseconds (44.1kHz: 1102 frames = 24988.66µs), the
+        // server's floor-based timestamp grid steps 24988µs while we measure
+        // the buffer as 24989µs, landing a third of all chunks 1µs "inside"
+        // their predecessor. Evicting on those phantom overlaps silently
+        // discarded ~34% of all 44.1kHz audio (heard as continuous popping).
+        let rate = i64::from(buffer.format.sample_rate.max(1));
+        let frame_us = (1_000_000 + rate - 1) / rate;
         let new_end = buffer.timestamp + buffer.duration_us();
         self.queue.retain(|b| {
             let existing_end = b.timestamp + b.duration_us();
-            !(buffer.timestamp < existing_end && b.timestamp < new_end)
+            let overlap_us = new_end.min(existing_end) - buffer.timestamp.max(b.timestamp);
+            overlap_us < frame_us
         });
 
         let pos = self
@@ -1851,6 +1860,120 @@ mod tests {
         assert_eq!(queue.queue.len(), 2);
         assert_eq!(queue.queue[0].timestamp, 0);
         assert_eq!(queue.queue[1].timestamp, 5_000);
+    }
+
+    #[test]
+    fn test_push_keeps_chunks_on_44_1k_floor_timestamp_grid() {
+        // Regression for the field "continuous popping" report: aiosendspin's
+        // 25ms chunks at 44.1kHz are 1102 frames = 24988.66µs, and its
+        // floor-based timestamp grid advances 24988µs for a third of chunks
+        // while `duration_us` rounds every chunk to 24989µs. Those chunks
+        // start 1µs "inside" their predecessor; the phantom overlap must not
+        // evict anything (pre-fix it discarded ~34% of all queued audio).
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 44_100,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        };
+
+        // Mirror the server's residue arithmetic:
+        // delta, residue = divmod(residue + frames * 1e6, rate).
+        let mut ts = 282_697_405_880_i64; // first chunk ts from the field trace
+        let mut residue = 0_i64;
+        for _ in 0..12 {
+            let samples: Vec<i32> = vec![0; 1102 * 2];
+            queue.push(AudioBuffer {
+                timestamp: ts,
+                samples: Arc::from(samples.into_boxed_slice()),
+                format: format.clone(),
+            });
+            residue += 1102 * 1_000_000;
+            ts += residue / 44_100;
+            residue %= 44_100;
+        }
+
+        assert_eq!(
+            queue.queue.len(),
+            12,
+            "sub-frame timestamp jitter must never evict queued audio"
+        );
+    }
+
+    #[test]
+    fn test_push_keeps_floor_grid_chunks_at_all_supported_rates() {
+        // The 44.1k regression swept across the whole rate family. 25ms
+        // chunks are floor(rate/40) frames; the server grid advances by
+        // floor-based (divmod) deltas. The mismatch between that grid and
+        // our round-to-nearest duration_us is at most 1µs, which must stay
+        // below the one-frame eviction threshold at every rate. (Only 44.1k
+        // and 22.05k actually exhibit the mismatch; the rest divide 25ms
+        // evenly and are exact.)
+        for &rate in &[
+            8_000_u32, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 88_200, 96_000,
+            176_400, 192_000,
+        ] {
+            let mut queue = PlaybackQueue::new();
+            let format = AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: rate,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            };
+            let frames = (rate / 40) as usize;
+            let mut ts = 1_000_000_i64;
+            let mut residue = 0_i64;
+            for _ in 0..16 {
+                queue.push(AudioBuffer {
+                    timestamp: ts,
+                    samples: Arc::from(vec![0_i32; frames * 2].into_boxed_slice()),
+                    format: format.clone(),
+                });
+                residue += frames as i64 * 1_000_000;
+                ts += residue / i64::from(rate);
+                residue %= i64::from(rate);
+            }
+            assert_eq!(
+                queue.queue.len(),
+                16,
+                "rate {rate}: floor-grid timestamp jitter must not evict chunks"
+            );
+        }
+    }
+
+    #[test]
+    fn test_push_dedup_still_evicts_one_frame_overlap_at_44_1k() {
+        // Counterpart to the floor-grid regression: an overlap of a full
+        // frame or more is real duplicate audio and must still dedup.
+        let mut queue = PlaybackQueue::new();
+        let format = AudioFormat {
+            codec: Codec::Pcm,
+            sample_rate: 44_100,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        };
+
+        let samples_a: Vec<i32> = vec![111; 1102 * 2];
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(samples_a.into_boxed_slice()),
+            format: format.clone(),
+        });
+        // Chunk A spans [0, 24989). A chunk rebased 1ms back into it
+        // overlaps by ~1ms ≫ one frame (23µs): evict A.
+        let samples_b: Vec<i32> = vec![222; 1102 * 2];
+        queue.push(AudioBuffer {
+            timestamp: 23_989,
+            samples: Arc::from(samples_b.into_boxed_slice()),
+            format,
+        });
+
+        assert_eq!(queue.queue.len(), 1);
+        assert_eq!(queue.queue[0].timestamp, 23_989);
     }
 
     #[test]
