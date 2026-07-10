@@ -119,25 +119,36 @@ impl Default for CorrectionPlanner {
 }
 
 /// Measurements kept by [`SyncErrorFilter`]. 101 callbacks is ~1s at the
-/// common 10ms WASAPI period (2-4s on 20-40ms periods): long enough to
-/// out-vote period-quantized flapping, short enough that a real displacement
-/// shifts the median within half a window.
-pub const SYNC_ERROR_WINDOW: usize = 101;
+/// common 10ms WASAPI period (2-4s on 20-40ms periods): long enough that the
+/// floor mode gets sampled even through dense flapping, short enough that a
+/// real displacement reaches the output within about a second.
+pub(crate) const SYNC_ERROR_WINDOW: usize = 101;
 
-/// Windowed median over recent sync-error measurements.
+/// Windowed minimum (floor tracker) over recent sync-error measurements.
 ///
 /// Audio presentation timestamps are quantized to the engine period: under
-/// scheduler jitter the wake-time padding snapshot flaps by a whole period
-/// (observed as a 2ms <-> 12ms alternation on shared-mode WASAPI) while the
-/// endpoint FIFO plays gaplessly. The instantaneous error is therefore
-/// bimodal measurement noise around the true alignment. The median tracks
-/// the majority mode and only moves when a shift *persists* — real
-/// displacement or clock drift — never on single-callback excursions, which
-/// makes it safe to feed to [`CorrectionPlanner`].
+/// scheduler jitter the wake-time padding snapshot jumps *up* by whole
+/// periods (observed as a 2ms <-> 12ms alternation on shared-mode WASAPI)
+/// while the endpoint FIFO plays gaplessly. The noise is one-sided — extra
+/// queued padding can only make a reading later, never earlier — so the
+/// window floor is the honest alignment estimate, and it stays put no matter
+/// how often the flap occurs or which mode holds the majority. A real
+/// displacement (engine starvation inserting silence, a cursor jump) shifts
+/// every reading *including the floor*, so it still reaches the planner
+/// within one window.
 ///
-/// Allocation-free and O(window) per update; sized for the audio callback.
+/// The response is deliberately asymmetric: a drop in error propagates
+/// immediately (a new low sample becomes the floor at once, so a running
+/// correction converges without overshoot), while a rise propagates only
+/// once the old floor ages out of the window — exactly the conservatism an
+/// engage decision wants. A spuriously *low* outlier would bias toward
+/// under-correction, the safe direction, and has no plausible physical
+/// source (padding cannot go below empty; clock-filter movement is
+/// microseconds).
+///
+/// Allocation-free, O(window) scan per update; sized for the audio callback.
 #[derive(Debug, Clone)]
-pub struct SyncErrorFilter {
+pub(crate) struct SyncErrorFilter {
     samples: [i64; SYNC_ERROR_WINDOW],
     len: usize,
     next: usize,
@@ -160,14 +171,14 @@ impl SyncErrorFilter {
         self.next = 0;
     }
 
-    /// True once the window is fully populated. Medians over a partial
-    /// window are still returned by [`SyncErrorFilter::update`], but engage
+    /// True once the window is fully populated. A floor over a partial
+    /// window is still returned by [`SyncErrorFilter::update`], but engage
     /// decisions should wait for warmth (see [`EngageGate`]).
     pub fn is_warm(&self) -> bool {
         self.len == SYNC_ERROR_WINDOW
     }
 
-    /// Record a raw error measurement (µs) and return the windowed median.
+    /// Record a raw error measurement (µs) and return the windowed minimum.
     pub fn update(&mut self, raw_error_us: i64) -> i64 {
         self.samples[self.next] = raw_error_us;
         self.next = (self.next + 1) % SYNC_ERROR_WINDOW;
@@ -176,11 +187,12 @@ impl SyncErrorFilter {
         }
         // While filling, the live samples are the contiguous prefix
         // (next == len until the first wrap); afterwards the whole array.
-        let mut scratch = [0i64; SYNC_ERROR_WINDOW];
-        let filled = &mut scratch[..self.len];
-        filled.copy_from_slice(&self.samples[..self.len]);
-        filled.sort_unstable();
-        filled[self.len / 2]
+        // Stale slots past `len` are never read. `len >= 1` here, so the
+        // fold always sees at least one real sample.
+        self.samples[..self.len]
+            .iter()
+            .copied()
+            .fold(i64::MAX, i64::min)
     }
 }
 
@@ -191,10 +203,11 @@ impl Default for SyncErrorFilter {
 }
 
 /// Consecutive correcting plans required before a correction may engage from
-/// idle: ~0.5s at a 10ms callback period. A phantom error (measurement flap)
-/// reverses within a callback or two and never builds a streak; drift and
-/// real displacement hold the streak trivially.
-pub const ENGAGE_STREAK_PLANS: u32 = 50;
+/// idle: ~0.5s at a 10ms callback period. Filtered errors already move at
+/// window timescale, so a genuine displacement holds the streak trivially;
+/// the gate keeps engagement evidence-backed across filter resets and
+/// warm-up, when the estimate is least trustworthy.
+pub(crate) const ENGAGE_STREAK_PLANS: u32 = 50;
 
 /// Gate between the planner and the applied schedule: an idle stream only
 /// starts correcting after a sustained run of correcting plans over a warm
@@ -202,15 +215,15 @@ pub const ENGAGE_STREAK_PLANS: u32 = 50;
 /// frames are audible as ticks), so engagement must be evidence-backed;
 /// disengagement and replanning of a running correction stay immediate
 /// because stopping or retuning is never audible.
-#[derive(Debug, Clone, Default)]
-pub struct EngageGate {
+#[derive(Debug, Clone)]
+pub(crate) struct EngageGate {
     streak: u32,
 }
 
 impl EngageGate {
     /// Create a gate with no accumulated streak.
     pub fn new() -> Self {
-        Self::default()
+        Self { streak: 0 }
     }
 
     /// Clear the accumulated streak.
@@ -241,6 +254,12 @@ impl EngageGate {
         } else {
             CorrectionSchedule::default()
         }
+    }
+}
+
+impl Default for EngageGate {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -410,45 +429,77 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_median_ignores_minority_flap() {
-        // Period-quantized flapping: one +10ms excursion every third sample
-        // (the observed WASAPI padding alternation) must not move the median.
+    fn test_filter_floor_ignores_flap_at_any_duty() {
+        // Period-quantized flapping is one-sided (+one period). Even when
+        // the high mode holds a 90% majority — the case that defeats a
+        // median — the floor must stay on the quiet mode as long as it is
+        // sampled at least once per window.
         let mut filter = SyncErrorFilter::new();
-        let mut median = 0;
-        for i in 0..SYNC_ERROR_WINDOW * 2 {
-            let raw = if i % 3 == 0 { 10_000 } else { 0 };
-            median = filter.update(raw);
+        for i in 0..SYNC_ERROR_WINDOW * 3 {
+            let raw = if i % 10 == 0 { 0 } else { 10_000 };
+            let floor = filter.update(raw);
+            if i >= 1 {
+                assert_eq!(floor, 0, "flap majority must not lift the floor");
+            }
         }
-        assert_eq!(median, 0, "minority mode must not shift the median");
     }
 
     #[test]
-    fn test_filter_median_follows_persistent_step() {
-        // A real displacement shifts every subsequent measurement; the
-        // median must follow within ~half a window.
+    fn test_filter_floor_follows_persistent_rise_after_full_window() {
+        // A real displacement shifts every reading including the floor; the
+        // output must follow once the old floor ages out of the window.
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
             filter.update(0);
         }
-        let mut median = 0;
-        for _ in 0..(SYNC_ERROR_WINDOW / 2 + 1) {
-            median = filter.update(10_000);
+        let mut floor = 0;
+        for i in 0..SYNC_ERROR_WINDOW {
+            floor = filter.update(10_000);
+            if i < SYNC_ERROR_WINDOW - 1 {
+                assert_eq!(floor, 0, "rise must wait for the window to age out");
+            }
         }
-        assert_eq!(median, 10_000, "persistent step must reach the median");
+        assert_eq!(floor, 10_000, "persistent rise must reach the output");
     }
 
     #[test]
-    fn test_filter_reset_clears_window() {
+    fn test_filter_floor_follows_drop_immediately() {
+        // A running correction shrinks the error; the floor must track the
+        // new low on the very next sample so the correction converges
+        // without overshoot.
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
             filter.update(10_000);
         }
+        assert_eq!(filter.update(2_000), 2_000, "new low becomes the floor");
+    }
+
+    #[test]
+    fn test_filter_handles_negative_errors() {
+        // Negative true error (audio early, insert side) with one-sided
+        // positive excursions on top.
+        let mut filter = SyncErrorFilter::new();
+        for i in 0..SYNC_ERROR_WINDOW {
+            let raw = if i % 3 == 0 { 10_000 } else { -5_000 };
+            filter.update(raw);
+        }
+        assert_eq!(filter.update(-5_000), -5_000);
+    }
+
+    #[test]
+    fn test_filter_reset_clears_window() {
+        // Fill with a LOW value so stale slots would drag the floor down if
+        // reset failed to fence them off.
+        let mut filter = SyncErrorFilter::new();
+        for _ in 0..SYNC_ERROR_WINDOW {
+            filter.update(-10_000);
+        }
         filter.reset();
         assert!(!filter.is_warm());
         assert_eq!(
-            filter.update(0),
-            0,
-            "median after reset must reflect only new samples"
+            filter.update(5_000),
+            5_000,
+            "floor after reset must reflect only new samples"
         );
     }
 

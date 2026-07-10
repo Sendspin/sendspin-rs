@@ -92,12 +92,15 @@ const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
 /// Endpoint buffer requested on Windows when the caller does not override
 /// [`SyncedPlayerConfig::buffer_size`].
 ///
-/// WASAPI's shared-mode default allocates two 10ms engine periods, so one
-/// late wake of the event-loop thread drains the buffer completely and the
-/// next slip starves the mixer (silence insertion — a real timeline
-/// displacement). Four periods of margin make an occasional late wake a
-/// non-event; even promoted to MMCSS the thread shares the real-time class
-/// with every other pro-audio client and will sometimes lose its slot.
+/// WASAPI's shared-mode default allocates two engine periods (20ms at the
+/// common 10ms period), so one late wake of the event-loop thread drains the
+/// buffer completely and the next slip starves the mixer (silence insertion —
+/// a real timeline displacement). Requesting ~40ms deepens the endpoint
+/// queue only — the engine still wakes us every period — leaving roughly
+/// three periods queued at each wake, so the mixer survives two to three
+/// consecutive late wakes. That margin matters even with MMCSS: the thread
+/// shares the real-time class with every other pro-audio client and will
+/// sometimes lose its slot.
 ///
 /// Depth does not affect inter-device sync: the sync error is measured
 /// against padding-compensated presentation timestamps, so queued depth
@@ -851,7 +854,7 @@ impl SyncedPlayer {
                     if let Some(last) = last_callback_instant {
                         let gap_us = callback_instant.duration_since(last).as_micros() as u64;
                         let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
-                        if gap_us > 2 * period_us {
+                        if gap_us >= 2 * period_us {
                             log::debug!(
                                 "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
                                 us_to_ms(gap_us),
@@ -947,6 +950,13 @@ impl SyncedPlayer {
                                         schedule = CorrectionSchedule::default();
                                         insert_counter = 0;
                                         drop_counter = 0;
+                                        // The cursor just jumped (e.g. a
+                                        // static-delay change, which does not
+                                        // bump the generation); prior
+                                        // measurements describe the old
+                                        // timeline.
+                                        error_filter.reset();
+                                        engage_gate.reset();
                                         log::debug!(
                                             "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
                                         );
@@ -1030,12 +1040,13 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
-                            // Median-filter the measurement: presentation
-                            // timestamps quantize to the engine period, so a
-                            // single callback's reading can be a whole period
-                            // off while the endpoint FIFO plays gaplessly
-                            // (see SyncErrorFilter). Plan against the stable
-                            // majority, never one wake's snapshot.
+                            // Floor-filter the measurement (windowed min):
+                            // presentation timestamps quantize to the engine
+                            // period, so a single callback's reading can sit
+                            // a whole period above the true alignment while
+                            // the endpoint FIFO plays gaplessly (see
+                            // SyncErrorFilter). Plan against the window
+                            // floor, never one wake's snapshot.
                             let error_us = error_filter.update(raw_error_us);
                             let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
@@ -1380,8 +1391,21 @@ impl SyncedPlayer {
                     }
                     },
                     move |err| {
-                        log::error!("Audio stream error: {}", err);
-                        *error.lock() = Some(err.to_string());
+                        let message = err.to_string();
+                        // cpal's `realtime` feature reports a failed thread
+                        // promotion through this callback; playback continues
+                        // at normal priority. Warn without storing:
+                        // take_error()/has_error() signal fatal stream
+                        // failures, and a consumer must not tear down a
+                        // working stream over a scheduling downgrade.
+                        if message.contains("promote audio thread") {
+                            log::warn!(
+                                "Audio thread priority promotion failed (non-fatal): {message}"
+                            );
+                            return;
+                        }
+                        log::error!("Audio stream error: {message}");
+                        *error.lock() = Some(message);
                     },
                     None,
                 )
