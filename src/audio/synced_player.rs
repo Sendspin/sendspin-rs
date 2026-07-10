@@ -386,6 +386,11 @@ struct CallbackStats {
     /// Corrections the planner requested that the engage gate suppressed
     /// while awaiting a sustained error; the sampling key for its trace line.
     gate_suppressed_corrections: u64,
+    /// Correction episodes started (idle -> correcting transitions, including
+    /// reanchor engagements). Mirrors the "Sync correction engaged" debug
+    /// line 1:1 so the generation summary can answer "did the corrector ever
+    /// fire?" retroactively even when debug logging was off during playback.
+    correction_engagements: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
     queue_low: bool,
@@ -827,7 +832,7 @@ impl SyncedPlayer {
                     };
                     if generation != last_generation {
                         log::debug!(
-                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}",
+                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
                             last_generation,
                             generation,
                             us_to_ms(queued_us),
@@ -837,6 +842,7 @@ impl SyncedPlayer {
                             stats.underrun_callbacks,
                             stats.underrun_frames,
                             stats.sync_lock_misses,
+                            stats.correction_engagements,
                         );
                         last_generation = generation;
                         started = false;
@@ -1123,6 +1129,7 @@ impl SyncedPlayer {
                             if new_schedule != schedule {
                                 if new_schedule.is_correcting() != schedule.is_correcting() {
                                     if new_schedule.is_correcting() {
+                                        stats.correction_engagements += 1;
                                         log::debug!(
                                             "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
                                             error_us as f64 / 1000.0,

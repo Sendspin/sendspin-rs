@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Count correction engagements per playback generation and report the total in
+  the generation-change summary line, so "did the corrector ever fire?" is
+  answerable from logs retroactively even when debug logging was off
+
 ### Fixed
 
 - Stop drift corrections from chasing period-quantized presentation-timestamp
