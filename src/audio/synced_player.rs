@@ -2,7 +2,9 @@
 // ABOUTME: Uses DAC callback timestamps to drop/insert frames for alignment
 
 use crate::audio::gain::{GainControl, GainRamp};
-use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
+use crate::audio::sync_correction::{
+    CorrectionPlanner, CorrectionSchedule, EngageGate, SyncErrorFilter,
+};
 use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
@@ -344,6 +346,9 @@ struct CallbackStats {
     /// Corrections the planner requested during clock warm-up that were
     /// suppressed; the sampling key for the warm-up trace line.
     warmup_suppressed_corrections: u64,
+    /// Corrections the planner requested that the engage gate suppressed
+    /// while awaiting a sustained error; the sampling key for its trace line.
+    gate_suppressed_corrections: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
     queue_low: bool,
@@ -684,6 +689,8 @@ impl SyncedPlayer {
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
+        let mut error_filter = SyncErrorFilter::new();
+        let mut engage_gate = EngageGate::new();
         let mut last_frame = vec![i32::EQUILIBRIUM; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
@@ -787,6 +794,8 @@ impl SyncedPlayer {
                         schedule = CorrectionSchedule::default();
                         insert_counter = 0;
                         drop_counter = 0;
+                        error_filter.reset();
+                        engage_gate.reset();
                         stats.reset_for_generation();
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
@@ -862,6 +871,10 @@ impl SyncedPlayer {
                         let sync_settled = sync.is_settled();
                         if sync_settled && !sync_settle_logged {
                             sync_settle_logged = true;
+                            // Warm-up measurements track the converging clock
+                            // estimate, not playback; start the filter fresh.
+                            error_filter.reset();
+                            engage_gate.reset();
                             log::debug!(
                                 "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
                                 stats.callbacks,
@@ -973,7 +986,7 @@ impl SyncedPlayer {
                                 );
                             }
 
-                            let error_us = if playback_instant >= expected_instant {
+                            let raw_error_us = if playback_instant >= expected_instant {
                                 playback_instant
                                     .duration_since(expected_instant)
                                     .as_micros() as i64
@@ -982,8 +995,39 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
+                            // Median-filter the measurement: presentation
+                            // timestamps quantize to the engine period, so a
+                            // single callback's reading can be a whole period
+                            // off while the endpoint FIFO plays gaplessly
+                            // (see SyncErrorFilter). Plan against the stable
+                            // majority, never one wake's snapshot.
+                            let error_us = error_filter.update(raw_error_us);
                             let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
+                            // Starting a correction mutates real audio, so it
+                            // must be backed by a sustained error over a warm
+                            // filter; phantom flaps never build the streak.
+                            let gated_schedule = engage_gate.admit(
+                                planned_schedule,
+                                schedule.is_correcting(),
+                                error_filter.is_warm(),
+                            );
+                            if gated_schedule != planned_schedule {
+                                stats.gate_suppressed_corrections += 1;
+                                if trace_logging
+                                    && should_log_sample(stats.gate_suppressed_corrections)
+                                {
+                                    log::trace!(
+                                        "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                                        stats.callbacks,
+                                        stats.gate_suppressed_corrections,
+                                        error_us as f64 / 1000.0,
+                                        raw_error_us as f64 / 1000.0,
+                                        generation,
+                                    );
+                                }
+                            }
+                            let planned_schedule = gated_schedule;
                             // While the sync estimate is still converging,
                             // measured error is mostly movement of the
                             // estimate itself; correcting for it chases
@@ -1000,10 +1044,11 @@ impl SyncedPlayer {
                                         )
                                     {
                                         log::trace!(
-                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, generation={}",
+                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
                                             stats.callbacks,
                                             stats.warmup_suppressed_corrections,
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             generation,
                                         );
                                     }
@@ -1014,8 +1059,9 @@ impl SyncedPlayer {
                                 if new_schedule.is_correcting() != schedule.is_correcting() {
                                     if new_schedule.is_correcting() {
                                         log::debug!(
-                                            "Sync correction engaged: error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
+                                            "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             new_schedule.insert_every_n_frames,
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
@@ -1024,8 +1070,9 @@ impl SyncedPlayer {
                                         );
                                     } else {
                                         log::debug!(
-                                            "Sync correction disengaged: error={:.3}ms, callback={}, generation={}",
+                                            "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             stats.callbacks,
                                             generation,
                                         );
@@ -1045,10 +1092,11 @@ impl SyncedPlayer {
                                         && should_log_sample(stats.correction_updates)
                                     {
                                         log::trace!(
-                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
+                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
                                             stats.callbacks,
                                             stats.correction_updates,
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             new_schedule.insert_every_n_frames,
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
@@ -1084,6 +1132,10 @@ impl SyncedPlayer {
                                 insert_counter = 0;
                                 drop_counter = 0;
                                 stats.correction_updates = 0;
+                                // The cursor just jumped; prior measurements
+                                // describe the old timeline.
+                                error_filter.reset();
+                                engage_gate.reset();
                             }
                         } else if schedule.is_correcting() {
                             // Conversions went dark (the implausible-drift
@@ -1098,6 +1150,8 @@ impl SyncedPlayer {
                             insert_counter = 0;
                             drop_counter = 0;
                             stats.correction_updates = 0;
+                            error_filter.reset();
+                            engage_gate.reset();
                         }
                     }
 
