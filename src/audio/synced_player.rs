@@ -53,7 +53,9 @@ pub struct SyncedPlayerConfig {
     pub volume: u8,
     /// Initial mute state.
     pub muted: bool,
-    /// Optional fixed cpal buffer size in frames.
+    /// Optional fixed cpal buffer size in frames. When `None`, Windows
+    /// requests a 40ms endpoint buffer (see `WINDOWS_DEFAULT_BUFFER_MS` for
+    /// the rationale) and other platforms use the cpal device default.
     pub buffer_size: Option<u32>,
 }
 
@@ -85,6 +87,37 @@ const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
         delay_ms
     };
     clamped as u64 * 1_000
+}
+
+/// Endpoint buffer requested on Windows when the caller does not override
+/// [`SyncedPlayerConfig::buffer_size`].
+///
+/// WASAPI's shared-mode default allocates two 10ms engine periods, so one
+/// late wake of the event-loop thread drains the buffer completely and the
+/// next slip starves the mixer (silence insertion — a real timeline
+/// displacement). Four periods of margin make an occasional late wake a
+/// non-event; even promoted to MMCSS the thread shares the real-time class
+/// with every other pro-audio client and will sometimes lose its slot.
+///
+/// Depth does not affect inter-device sync: the sync error is measured
+/// against padding-compensated presentation timestamps, so queued depth
+/// cancels out of the alignment math. The cost is bounded reaction latency —
+/// a track-skip flush, volume ramp, or drift correction reaches the speaker
+/// only after the already-queued frames drain.
+const WINDOWS_DEFAULT_BUFFER_MS: u32 = 40;
+
+/// Frames for [`WINDOWS_DEFAULT_BUFFER_MS`] at `sample_rate`.
+const fn windows_default_buffer_frames(sample_rate: u32) -> u32 {
+    sample_rate * WINDOWS_DEFAULT_BUFFER_MS / 1000
+}
+
+/// Endpoint buffer request when the caller does not specify one.
+fn default_buffer_size(sample_rate: u32) -> cpal::BufferSize {
+    if cfg!(target_os = "windows") {
+        cpal::BufferSize::Fixed(windows_default_buffer_frames(sample_rate))
+    } else {
+        cpal::BufferSize::Default
+    }
 }
 
 struct PlaybackQueue {
@@ -393,7 +426,9 @@ impl SyncedPlayer {
     /// The player starts at `volume` (0-100) and `muted` state. These are
     /// applied immediately — the first audio callback uses the correct gain
     /// with no ramp from a default value.
-    /// The `buffer_size` overrides cpal audio device default. If not set, the default buffer size is used.
+    /// The `buffer_size` overrides the endpoint buffer request. If not set,
+    /// Windows requests 40ms of margin (see `WINDOWS_DEFAULT_BUFFER_MS` for
+    /// the rationale) and other platforms use the cpal device default.
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
@@ -463,7 +498,7 @@ impl SyncedPlayer {
             sample_rate: cpal::SampleRate::from(format.sample_rate),
             buffer_size: match config.buffer_size {
                 Some(frames) => cpal::BufferSize::Fixed(frames),
-                None => cpal::BufferSize::Default,
+                None => default_buffer_size(format.sample_rate),
             },
         };
 
@@ -1390,7 +1425,8 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, PlaybackQueue, SyncedPlayer, SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
+        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
     };
     use crate::audio::{AudioBuffer, AudioFormat, Codec};
     use crate::error::Error;
@@ -1446,6 +1482,13 @@ mod tests {
             ),
             other => panic!("expected Error::Output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_windows_default_buffer_frames_is_40ms() {
+        assert_eq!(windows_default_buffer_frames(44_100), 1_764);
+        assert_eq!(windows_default_buffer_frames(48_000), 1_920);
+        assert_eq!(windows_default_buffer_frames(192_000), 7_680);
     }
 
     #[test]
