@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop drift corrections from chasing period-quantized presentation-timestamp
+  noise: sync errors are median-filtered over a ~1s window and corrections only
+  engage after a sustained over-threshold streak, so measurement flapping no
+  longer drops or repeats audible frames
+- Promote the Windows audio callback thread to real-time priority (MMCSS via
+  cpal's `realtime` feature) so UI load can no longer starve the WASAPI event
+  loop
+- Request a 40ms WASAPI endpoint buffer by default on Windows (engine default
+  is 20ms), giving late callback wakes margin before the mixer starves;
+  explicit `SyncedPlayerConfig::buffer_size` still overrides
+
 ## [0.3.4](https://github.com/Sendspin/sendspin-rs/compare/v0.3.3...v0.3.4) - 2026-07-05
 
 ### Fixed
