@@ -53,8 +53,9 @@ libc = "0.2"
 # callback thread runs at normal priority and loses its 10ms period race to
 # UI/WebView load, which shows up as callback gaps and endpoint-buffer
 # starvation. Windows-only: CoreAudio already schedules its callback threads
-# real-time, and Linux promotion needs the dbus/RtKit variant (realtime-dbus)
-# plus a system libdbus build dependency.
+# real-time (the feature is also inert there — cpal has no macOS
+# audio_thread_priority dependency), and Linux promotion needs the dbus/RtKit
+# variant (realtime-dbus) plus a system libdbus build dependency.
 cpal = { version = "0.18", features = ["realtime"] }
 
 [dev-dependencies]
