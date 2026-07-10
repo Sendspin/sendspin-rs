@@ -388,8 +388,8 @@ struct CallbackStats {
     gate_suppressed_corrections: u64,
     /// Correction episodes started (idle -> correcting transitions, including
     /// reanchor engagements). Mirrors the "Sync correction engaged" debug
-    /// line 1:1 so the generation summary can answer "did the corrector ever
-    /// fire?" retroactively even when debug logging was off during playback.
+    /// line 1:1 so the generation summary can answer whether the corrector
+    /// ever fired, even when debug logging was off during playback.
     correction_engagements: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
@@ -744,15 +744,13 @@ impl SyncedPlayer {
         let mut sync_settle_logged = false;
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
-        // Running minimum of the presentation-latency snapshot, per
-        // generation. Reanchors derive their timeline anchor from this floor
-        // rather than one wake's reading: padding noise is one-sided (see
-        // SyncErrorFilter) and flap storms cluster at exactly stream start,
-        // so a single-sample anchor is biased toward the high mode and bakes
-        // a one-period offset into the timeline that corrections must then
-        // audibly unwind. A stale floor after a mid-stream latency-regime
-        // shift costs at most a one-time period realignment — the same cost
-        // any regime shift already carries.
+        // Running minimum of the presentation-latency snapshot, reset per
+        // generation. Reanchors anchor against this floor rather than one
+        // wake's reading: padding noise is one-sided (see SyncErrorFilter),
+        // so a single sample may run a whole period high, and anchoring to it
+        // bakes that period into the timeline until corrections audibly
+        // unwind it. A stale floor after a latency-regime shift costs at most
+        // one period of realignment — no worse than the shift itself.
         let mut min_playback_delta_us = u64::MAX;
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
@@ -1065,19 +1063,16 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
-                            // Floor-filter the measurement (windowed min):
-                            // presentation timestamps quantize to the engine
-                            // period, so a single callback's reading can sit
-                            // a whole period above the true alignment while
-                            // the endpoint FIFO plays gaplessly (see
-                            // SyncErrorFilter). Plan against the window
-                            // floor, never one wake's snapshot.
+                            // A single reading can sit a whole engine period
+                            // above true alignment while the FIFO plays
+                            // gaplessly (see SyncErrorFilter); plan against
+                            // the window floor, never one wake's snapshot.
                             let error_us = error_filter.update(raw_error_us);
                             let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
-                            // Starting a correction mutates real audio, so it
-                            // must be backed by a sustained error over a warm
-                            // filter; phantom flaps never build the streak.
+                            // Corrections mutate audible frames: engage only
+                            // on sustained evidence over a warm filter (see
+                            // EngageGate).
                             let gated_schedule = engage_gate.admit(
                                 planned_schedule,
                                 schedule.is_correcting(),
@@ -1141,10 +1136,9 @@ impl SyncedPlayer {
                                             generation,
                                         );
                                     } else {
-                                        // The floor lags upward moves, so at
-                                        // disengage `error=` can read larger
-                                        // in magnitude than the live
-                                        // `raw_error=` — expected, not a bug.
+                                        // The floor lags rises, so error= may
+                                        // read worse than raw_error= here;
+                                        // expected, not a bug.
                                         log::debug!(
                                             "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
                                             error_us as f64 / 1000.0,

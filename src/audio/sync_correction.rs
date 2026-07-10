@@ -432,10 +432,10 @@ mod tests {
 
     #[test]
     fn test_filter_floor_ignores_flap_at_any_duty() {
-        // Period-quantized flapping is one-sided (+one period). Even when
-        // the high mode holds a 90% majority — the case that defeats a
-        // median — the floor must stay on the quiet mode as long as it is
-        // sampled at least once per window.
+        // Period-quantized flapping is one-sided (+one period). Even a 90%
+        // majority in the high mode — enough to drag any central-tendency
+        // estimate — must not lift the floor while the quiet mode is sampled
+        // at least once per window.
         let mut filter = SyncErrorFilter::new();
         for i in 0..SYNC_ERROR_WINDOW * 3 {
             let raw = if i % 10 == 0 { 0 } else { 10_000 };
