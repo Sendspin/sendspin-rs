@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Stop drift corrections from chasing period-quantized presentation-timestamp
   noise: sync errors are floor-filtered (windowed minimum over ~1s, robust to
-  one-sided timestamp flapping at any duty cycle) and corrections only engage
-  after a sustained over-threshold streak, so measurement flapping no longer
-  triggers immediate drop/insert churn
+  one-sided timestamp flapping whenever the quiet mode is sampled at least
+  once per window), corrections only engage after a sustained over-threshold
+  streak, and stream reanchors derive their timeline anchor from the same
+  delta floor instead of a single wake's reading, so measurement flapping no
+  longer triggers immediate drop/insert churn or biased stream-start anchors
 - Promote the Windows audio callback thread to real-time priority (MMCSS via
   cpal's `realtime` feature), greatly reducing the chance of UI load starving
   the WASAPI event loop; a failed promotion is logged as a warning instead of

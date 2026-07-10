@@ -97,8 +97,9 @@ const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
 /// buffer completely and the next slip starves the mixer (silence insertion —
 /// a real timeline displacement). Requesting ~40ms deepens the endpoint
 /// queue only — the engine still wakes us every period — leaving roughly
-/// three periods queued at each wake, so the mixer survives two to three
-/// consecutive late wakes. That margin matters even with MMCSS: the thread
+/// three periods queued at each wake, so the mixer reliably survives two
+/// consecutive late wakes (a third lands exactly at empty). That margin
+/// matters even with MMCSS: the thread
 /// shares the real-time class with every other pro-audio client and will
 /// sometimes lose its slot.
 ///
@@ -738,6 +739,16 @@ impl SyncedPlayer {
         let mut sync_settle_logged = false;
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
+        // Running minimum of the presentation-latency snapshot, per
+        // generation. Reanchors derive their timeline anchor from this floor
+        // rather than one wake's reading: padding noise is one-sided (see
+        // SyncErrorFilter) and flap storms cluster at exactly stream start,
+        // so a single-sample anchor is biased toward the high mode and bakes
+        // a one-period offset into the timeline that corrections must then
+        // audibly unwind. A stale floor after a mid-stream latency-regime
+        // shift costs at most a one-time period realignment — the same cost
+        // any regime shift already carries.
+        let mut min_playback_delta_us = u64::MAX;
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
         let initial_gain = cb_config.gain_control.gain();
@@ -834,6 +845,7 @@ impl SyncedPlayer {
                         drop_counter = 0;
                         error_filter.reset();
                         engage_gate.reset();
+                        min_playback_delta_us = u64::MAX;
                         stats.reset_for_generation();
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
@@ -877,6 +889,7 @@ impl SyncedPlayer {
                         }
                     }
                     last_playback_delta_us = Some(playback_delta_us);
+                    min_playback_delta_us = min_playback_delta_us.min(playback_delta_us);
 
                     // try_lock: skip sync if contended rather than blocking
                     // the audio thread. force_reanchor is sticky in the
@@ -923,8 +936,14 @@ impl SyncedPlayer {
 
                         if force_reanchor {
                             let mut reanchor_applied = false;
+                            // Anchor from the delta floor, not this wake's
+                            // reading (see min_playback_delta_us above). The
+                            // floor already includes this callback's sample,
+                            // so it is never u64::MAX here.
+                            let anchor_instant = callback_instant
+                                + Duration::from_micros(min_playback_delta_us);
                             let handoff_instant = if started {
-                                playback_instant
+                                anchor_instant
                             } else {
                                 // Startup handoff: anchor to `+ handoff_delta` (this buffer's
                                 // end = the next callback's start) so the next start gate sees
@@ -932,7 +951,7 @@ impl SyncedPlayer {
                                 // cursor by one buffer, so we stay silent for this one period.
                                 let handoff_delta =
                                     Duration::from_secs_f64(frames as f64 / sample_rate as f64);
-                                playback_instant + handoff_delta
+                                anchor_instant + handoff_delta
                             };
                             let client_micros =
                                 sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
@@ -1115,6 +1134,10 @@ impl SyncedPlayer {
                                             generation,
                                         );
                                     } else {
+                                        // The floor lags upward moves, so at
+                                        // disengage `error=` can read larger
+                                        // in magnitude than the live
+                                        // `raw_error=` — expected, not a bug.
                                         log::debug!(
                                             "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
                                             error_us as f64 / 1000.0,
@@ -1161,8 +1184,12 @@ impl SyncedPlayer {
                             if schedule.reanchor {
                                 // Mirror of the start-gate subtraction: audio
                                 // emitted now is heard `delay_us` later, so
-                                // anchor the cursor to that hear-instant.
-                                let client_micros = sync.instant_to_client_micros(playback_instant)
+                                // anchor the cursor to that hear-instant —
+                                // derived from the delta floor, not this
+                                // wake's reading (see min_playback_delta_us).
+                                let anchor_instant = callback_instant
+                                    + Duration::from_micros(min_playback_delta_us);
+                                let client_micros = sync.instant_to_client_micros(anchor_instant)
                                     + delay_us as i64;
                                 if let Some(server_time) =
                                     sync.client_to_server_micros(client_micros)
@@ -1391,21 +1418,20 @@ impl SyncedPlayer {
                     }
                     },
                     move |err| {
-                        let message = err.to_string();
-                        // cpal's `realtime` feature reports a failed thread
-                        // promotion through this callback; playback continues
-                        // at normal priority. Warn without storing:
+                        // cpal reports a refused real-time promotion as
+                        // RealtimeDenied ("Audio will still play"); playback
+                        // continues at normal priority. Warn without storing:
                         // take_error()/has_error() signal fatal stream
                         // failures, and a consumer must not tear down a
                         // working stream over a scheduling downgrade.
-                        if message.contains("promote audio thread") {
+                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
                             log::warn!(
-                                "Audio thread priority promotion failed (non-fatal): {message}"
+                                "Audio thread priority promotion failed (non-fatal): {err}"
                             );
                             return;
                         }
-                        log::error!("Audio stream error: {message}");
-                        *error.lock() = Some(message);
+                        log::error!("Audio stream error: {err}");
+                        *error.lock() = Some(err.to_string());
                     },
                     None,
                 )

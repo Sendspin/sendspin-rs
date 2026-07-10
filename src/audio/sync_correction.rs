@@ -131,20 +131,22 @@ pub(crate) const SYNC_ERROR_WINDOW: usize = 101;
 /// periods (observed as a 2ms <-> 12ms alternation on shared-mode WASAPI)
 /// while the endpoint FIFO plays gaplessly. The noise is one-sided — extra
 /// queued padding can only make a reading later, never earlier — so the
-/// window floor is the honest alignment estimate, and it stays put no matter
-/// how often the flap occurs or which mode holds the majority. A real
-/// displacement (engine starvation inserting silence, a cursor jump) shifts
-/// every reading *including the floor*, so it still reaches the planner
-/// within one window.
+/// window floor is the honest alignment estimate: it holds regardless of
+/// which mode has the majority, so long as the floor mode is sampled at
+/// least once per window. A real displacement (engine starvation inserting
+/// silence, a cursor jump) shifts every reading *including the floor*, so it
+/// still reaches the planner within one window.
 ///
 /// The response is deliberately asymmetric: a drop in error propagates
 /// immediately (a new low sample becomes the floor at once, so a running
 /// correction converges without overshoot), while a rise propagates only
 /// once the old floor ages out of the window — exactly the conservatism an
 /// engage decision wants. A spuriously *low* outlier would bias toward
-/// under-correction, the safe direction, and has no plausible physical
-/// source (padding cannot go below empty; clock-filter movement is
-/// microseconds).
+/// under-correction, the safe direction. The padding term never produces
+/// one (padding cannot go below empty); the clock filter normally moves by
+/// microseconds once settled, though an outlier time sample can still step
+/// the estimate by low single-digit milliseconds in either direction — a
+/// negative step costs at most one window of under-correction.
 ///
 /// Allocation-free, O(window) scan per update; sized for the audio callback.
 #[derive(Debug, Clone)]
@@ -484,6 +486,39 @@ mod tests {
             filter.update(raw);
         }
         assert_eq!(filter.update(-5_000), -5_000);
+    }
+
+    #[test]
+    fn test_filter_single_low_evicted_exactly_after_window() {
+        // One low among highs must stop being the floor exactly WINDOW
+        // updates after it was recorded.
+        let mut filter = SyncErrorFilter::new();
+        filter.update(1_000);
+        for i in 0..SYNC_ERROR_WINDOW - 1 {
+            assert_eq!(filter.update(10_000), 1_000, "low still in window at {i}");
+        }
+        assert_eq!(
+            filter.update(10_000),
+            10_000,
+            "low must age out exactly one window after it was recorded"
+        );
+    }
+
+    #[test]
+    fn test_filter_tracks_min_across_multiple_wraps() {
+        // Distinct values across several ring cycles: the floor must always
+        // equal the true minimum of the last WINDOW samples.
+        let mut filter = SyncErrorFilter::new();
+        let mut recent: Vec<i64> = Vec::new();
+        for i in 0..(SYNC_ERROR_WINDOW as i64 * 5) {
+            let value = (i * 37) % 1_000 + if i % 13 == 0 { -500 } else { 0 };
+            recent.push(value);
+            if recent.len() > SYNC_ERROR_WINDOW {
+                recent.remove(0);
+            }
+            let expected = *recent.iter().min().unwrap();
+            assert_eq!(filter.update(value), expected, "mismatch at update {i}");
+        }
     }
 
     #[test]
