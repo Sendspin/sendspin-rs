@@ -2,7 +2,9 @@
 // ABOUTME: Uses DAC callback timestamps to drop/insert frames for alignment
 
 use crate::audio::gain::{GainControl, GainRamp};
-use crate::audio::sync_correction::{CorrectionPlanner, CorrectionSchedule};
+use crate::audio::sync_correction::{
+    CorrectionPlanner, CorrectionSchedule, EngageGate, SyncErrorFilter,
+};
 use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
@@ -51,7 +53,9 @@ pub struct SyncedPlayerConfig {
     pub volume: u8,
     /// Initial mute state.
     pub muted: bool,
-    /// Optional fixed cpal buffer size in frames.
+    /// Optional fixed cpal buffer size in frames. When `None`, Windows
+    /// requests a 40ms endpoint buffer (see `WINDOWS_DEFAULT_BUFFER_MS` for
+    /// the rationale) and other platforms use the cpal device default.
     pub buffer_size: Option<u32>,
 }
 
@@ -83,6 +87,41 @@ const fn static_delay_ms_to_us(delay_ms: u16) -> u64 {
         delay_ms
     };
     clamped as u64 * 1_000
+}
+
+/// Endpoint buffer requested on Windows when the caller does not override
+/// [`SyncedPlayerConfig::buffer_size`].
+///
+/// WASAPI's shared-mode default allocates two engine periods (20ms at the
+/// common 10ms period), so one late wake of the event-loop thread drains the
+/// buffer completely and the next slip starves the mixer (silence insertion —
+/// a real timeline displacement). Requesting ~40ms deepens the endpoint
+/// queue only — the engine still wakes us every period — leaving roughly
+/// three periods queued at each wake, so the mixer reliably survives two
+/// consecutive late wakes (a third lands exactly at empty). That margin
+/// matters even with MMCSS: the thread
+/// shares the real-time class with every other pro-audio client and will
+/// sometimes lose its slot.
+///
+/// Depth does not affect inter-device sync: the sync error is measured
+/// against padding-compensated presentation timestamps, so queued depth
+/// cancels out of the alignment math. The cost is bounded reaction latency —
+/// a track-skip flush, volume ramp, or drift correction reaches the speaker
+/// only after the already-queued frames drain.
+const WINDOWS_DEFAULT_BUFFER_MS: u32 = 40;
+
+/// Frames for [`WINDOWS_DEFAULT_BUFFER_MS`] at `sample_rate`.
+const fn windows_default_buffer_frames(sample_rate: u32) -> u32 {
+    sample_rate * WINDOWS_DEFAULT_BUFFER_MS / 1000
+}
+
+/// Endpoint buffer request when the caller does not specify one.
+fn default_buffer_size(sample_rate: u32) -> cpal::BufferSize {
+    if cfg!(target_os = "windows") {
+        cpal::BufferSize::Fixed(windows_default_buffer_frames(sample_rate))
+    } else {
+        cpal::BufferSize::Default
+    }
 }
 
 struct PlaybackQueue {
@@ -344,6 +383,14 @@ struct CallbackStats {
     /// Corrections the planner requested during clock warm-up that were
     /// suppressed; the sampling key for the warm-up trace line.
     warmup_suppressed_corrections: u64,
+    /// Corrections the planner requested that the engage gate suppressed
+    /// while awaiting a sustained error; the sampling key for its trace line.
+    gate_suppressed_corrections: u64,
+    /// Correction episodes started (idle -> correcting transitions, including
+    /// reanchor engagements). Mirrors the "Sync correction engaged" debug
+    /// line 1:1 so the generation summary can answer whether the corrector
+    /// ever fired, even when debug logging was off during playback.
+    correction_engagements: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
     queue_low: bool,
@@ -388,7 +435,9 @@ impl SyncedPlayer {
     /// The player starts at `volume` (0-100) and `muted` state. These are
     /// applied immediately — the first audio callback uses the correct gain
     /// with no ramp from a default value.
-    /// The `buffer_size` overrides cpal audio device default. If not set, the default buffer size is used.
+    /// The `buffer_size` overrides the endpoint buffer request. If not set,
+    /// Windows requests 40ms of margin (see `WINDOWS_DEFAULT_BUFFER_MS` for
+    /// the rationale) and other platforms use the cpal device default.
     pub fn new(
         format: AudioFormat,
         clock_sync: Arc<Mutex<ClockSync>>,
@@ -458,7 +507,7 @@ impl SyncedPlayer {
             sample_rate: cpal::SampleRate::from(format.sample_rate),
             buffer_size: match config.buffer_size {
                 Some(frames) => cpal::BufferSize::Fixed(frames),
-                None => cpal::BufferSize::Default,
+                None => default_buffer_size(format.sample_rate),
             },
         };
 
@@ -684,6 +733,8 @@ impl SyncedPlayer {
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
         let planner = CorrectionPlanner::new();
+        let mut error_filter = SyncErrorFilter::new();
+        let mut engage_gate = EngageGate::new();
         let mut last_frame = vec![i32::EQUILIBRIUM; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
@@ -693,6 +744,14 @@ impl SyncedPlayer {
         let mut sync_settle_logged = false;
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
+        // Running minimum of the presentation-latency snapshot, reset per
+        // generation. Reanchors anchor against this floor rather than one
+        // wake's reading: padding noise is one-sided (see SyncErrorFilter),
+        // so a single sample may run a whole period high, and anchoring to it
+        // bakes that period into the timeline until corrections audibly
+        // unwind it. A stale floor after a latency-regime shift costs at most
+        // one period of realignment — no worse than the shift itself.
+        let mut min_playback_delta_us = u64::MAX;
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
         let initial_gain = cb_config.gain_control.gain();
@@ -771,7 +830,7 @@ impl SyncedPlayer {
                     };
                     if generation != last_generation {
                         log::debug!(
-                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}",
+                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
                             last_generation,
                             generation,
                             us_to_ms(queued_us),
@@ -781,12 +840,16 @@ impl SyncedPlayer {
                             stats.underrun_callbacks,
                             stats.underrun_frames,
                             stats.sync_lock_misses,
+                            stats.correction_engagements,
                         );
                         last_generation = generation;
                         started = false;
                         schedule = CorrectionSchedule::default();
                         insert_counter = 0;
                         drop_counter = 0;
+                        error_filter.reset();
+                        engage_gate.reset();
+                        min_playback_delta_us = u64::MAX;
                         stats.reset_for_generation();
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
@@ -807,7 +870,7 @@ impl SyncedPlayer {
                     if let Some(last) = last_callback_instant {
                         let gap_us = callback_instant.duration_since(last).as_micros() as u64;
                         let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
-                        if gap_us > 2 * period_us {
+                        if gap_us >= 2 * period_us {
                             log::debug!(
                                 "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
                                 us_to_ms(gap_us),
@@ -830,6 +893,7 @@ impl SyncedPlayer {
                         }
                     }
                     last_playback_delta_us = Some(playback_delta_us);
+                    min_playback_delta_us = min_playback_delta_us.min(playback_delta_us);
 
                     // try_lock: skip sync if contended rather than blocking
                     // the audio thread. force_reanchor is sticky in the
@@ -862,6 +926,10 @@ impl SyncedPlayer {
                         let sync_settled = sync.is_settled();
                         if sync_settled && !sync_settle_logged {
                             sync_settle_logged = true;
+                            // Warm-up measurements track the converging clock
+                            // estimate, not playback; start the filter fresh.
+                            error_filter.reset();
+                            engage_gate.reset();
                             log::debug!(
                                 "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
                                 stats.callbacks,
@@ -872,8 +940,14 @@ impl SyncedPlayer {
 
                         if force_reanchor {
                             let mut reanchor_applied = false;
+                            // Anchor from the delta floor, not this wake's
+                            // reading (see min_playback_delta_us above). The
+                            // floor already includes this callback's sample,
+                            // so it is never u64::MAX here.
+                            let anchor_instant = callback_instant
+                                + Duration::from_micros(min_playback_delta_us);
                             let handoff_instant = if started {
-                                playback_instant
+                                anchor_instant
                             } else {
                                 // Startup handoff: anchor to `+ handoff_delta` (this buffer's
                                 // end = the next callback's start) so the next start gate sees
@@ -881,7 +955,7 @@ impl SyncedPlayer {
                                 // cursor by one buffer, so we stay silent for this one period.
                                 let handoff_delta =
                                     Duration::from_secs_f64(frames as f64 / sample_rate as f64);
-                                playback_instant + handoff_delta
+                                anchor_instant + handoff_delta
                             };
                             let client_micros =
                                 sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
@@ -899,6 +973,13 @@ impl SyncedPlayer {
                                         schedule = CorrectionSchedule::default();
                                         insert_counter = 0;
                                         drop_counter = 0;
+                                        // The cursor just jumped (e.g. a
+                                        // static-delay change, which does not
+                                        // bump the generation); prior
+                                        // measurements describe the old
+                                        // timeline.
+                                        error_filter.reset();
+                                        engage_gate.reset();
                                         log::debug!(
                                             "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
                                         );
@@ -973,7 +1054,7 @@ impl SyncedPlayer {
                                 );
                             }
 
-                            let error_us = if playback_instant >= expected_instant {
+                            let raw_error_us = if playback_instant >= expected_instant {
                                 playback_instant
                                     .duration_since(expected_instant)
                                     .as_micros() as i64
@@ -982,8 +1063,37 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
+                            // A single reading can sit a whole engine period
+                            // above true alignment while the FIFO plays
+                            // gaplessly (see SyncErrorFilter); plan against
+                            // the window floor, never one wake's snapshot.
+                            let error_us = error_filter.update(raw_error_us);
                             let planned_schedule =
                                 planner.plan(error_us, sample_rate, schedule.is_correcting());
+                            // Corrections mutate audible frames: engage only
+                            // on sustained evidence over a warm filter (see
+                            // EngageGate).
+                            let gated_schedule = engage_gate.admit(
+                                planned_schedule,
+                                schedule.is_correcting(),
+                                error_filter.is_warm(),
+                            );
+                            if gated_schedule != planned_schedule {
+                                stats.gate_suppressed_corrections += 1;
+                                if trace_logging
+                                    && should_log_sample(stats.gate_suppressed_corrections)
+                                {
+                                    log::trace!(
+                                        "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                                        stats.callbacks,
+                                        stats.gate_suppressed_corrections,
+                                        error_us as f64 / 1000.0,
+                                        raw_error_us as f64 / 1000.0,
+                                        generation,
+                                    );
+                                }
+                            }
+                            let planned_schedule = gated_schedule;
                             // While the sync estimate is still converging,
                             // measured error is mostly movement of the
                             // estimate itself; correcting for it chases
@@ -1000,10 +1110,11 @@ impl SyncedPlayer {
                                         )
                                     {
                                         log::trace!(
-                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, generation={}",
+                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
                                             stats.callbacks,
                                             stats.warmup_suppressed_corrections,
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             generation,
                                         );
                                     }
@@ -1013,9 +1124,11 @@ impl SyncedPlayer {
                             if new_schedule != schedule {
                                 if new_schedule.is_correcting() != schedule.is_correcting() {
                                     if new_schedule.is_correcting() {
+                                        stats.correction_engagements += 1;
                                         log::debug!(
-                                            "Sync correction engaged: error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
+                                            "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             new_schedule.insert_every_n_frames,
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
@@ -1023,9 +1136,13 @@ impl SyncedPlayer {
                                             generation,
                                         );
                                     } else {
+                                        // The floor lags rises, so error= may
+                                        // read worse than raw_error= here;
+                                        // expected, not a bug.
                                         log::debug!(
-                                            "Sync correction disengaged: error={:.3}ms, callback={}, generation={}",
+                                            "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             stats.callbacks,
                                             generation,
                                         );
@@ -1045,10 +1162,11 @@ impl SyncedPlayer {
                                         && should_log_sample(stats.correction_updates)
                                     {
                                         log::trace!(
-                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
+                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
                                             stats.callbacks,
                                             stats.correction_updates,
                                             error_us as f64 / 1000.0,
+                                            raw_error_us as f64 / 1000.0,
                                             new_schedule.insert_every_n_frames,
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
@@ -1067,8 +1185,12 @@ impl SyncedPlayer {
                             if schedule.reanchor {
                                 // Mirror of the start-gate subtraction: audio
                                 // emitted now is heard `delay_us` later, so
-                                // anchor the cursor to that hear-instant.
-                                let client_micros = sync.instant_to_client_micros(playback_instant)
+                                // anchor the cursor to that hear-instant —
+                                // derived from the delta floor, not this
+                                // wake's reading (see min_playback_delta_us).
+                                let anchor_instant = callback_instant
+                                    + Duration::from_micros(min_playback_delta_us);
+                                let client_micros = sync.instant_to_client_micros(anchor_instant)
                                     + delay_us as i64;
                                 if let Some(server_time) =
                                     sync.client_to_server_micros(client_micros)
@@ -1084,6 +1206,10 @@ impl SyncedPlayer {
                                 insert_counter = 0;
                                 drop_counter = 0;
                                 stats.correction_updates = 0;
+                                // The cursor just jumped; prior measurements
+                                // describe the old timeline.
+                                error_filter.reset();
+                                engage_gate.reset();
                             }
                         } else if schedule.is_correcting() {
                             // Conversions went dark (the implausible-drift
@@ -1098,6 +1224,8 @@ impl SyncedPlayer {
                             insert_counter = 0;
                             drop_counter = 0;
                             stats.correction_updates = 0;
+                            error_filter.reset();
+                            engage_gate.reset();
                         }
                     }
 
@@ -1291,7 +1419,19 @@ impl SyncedPlayer {
                     }
                     },
                     move |err| {
-                        log::error!("Audio stream error: {}", err);
+                        // cpal reports a refused real-time promotion as
+                        // RealtimeDenied ("Audio will still play"); playback
+                        // continues at normal priority. Warn without storing:
+                        // take_error()/has_error() signal fatal stream
+                        // failures, and a consumer must not tear down a
+                        // working stream over a scheduling downgrade.
+                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
+                            log::warn!(
+                                "Audio thread priority promotion failed (non-fatal): {err}"
+                            );
+                            return;
+                        }
+                        log::error!("Audio stream error: {err}");
                         *error.lock() = Some(err.to_string());
                     },
                     None,
@@ -1336,7 +1476,8 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, PlaybackQueue, SyncedPlayer, SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
+        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
     };
     use crate::audio::{AudioBuffer, AudioFormat, Codec};
     use crate::error::Error;
@@ -1392,6 +1533,13 @@ mod tests {
             ),
             other => panic!("expected Error::Output, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_windows_default_buffer_frames_is_40ms() {
+        assert_eq!(windows_default_buffer_frames(44_100), 1_764);
+        assert_eq!(windows_default_buffer_frames(48_000), 1_920);
+        assert_eq!(windows_default_buffer_frames(192_000), 7_680);
     }
 
     #[test]

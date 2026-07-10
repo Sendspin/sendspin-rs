@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    println!("Connecting to {}...", &args.server);
+    println!("Connecting to {}...", args.server);
 
     let test = ProtocolClientBuilder::builder()
         .client_id(uuid::Uuid::new_v4().to_string())
