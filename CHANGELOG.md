@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5](https://github.com/Sendspin/sendspin-rs/compare/v0.3.4...v0.3.5) - 2026-07-10
+
+### Other
+
+- Fix timing robustness ([#84](https://github.com/Sendspin/sendspin-rs/pull/84))
+
 ### Added
 
 - Count correction engagements per playback generation and report the total in
