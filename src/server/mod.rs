@@ -18,10 +18,19 @@
 //   - Per-client codec transcoding/resampling (v1 is PCM-only, one format
 //     per group — a client that can't take the group's format is out of luck
 //     for now).
-//   - Late-join catch-up and historical buffer replay (a client that joins
-//     mid-stream just gets audio from that point forward).
 //   - Non-player roles: color, visualizer, artwork, controller, metadata.
 //   - External player registration.
+//
+// Explicitly NOT planned, by decision rather than by deferral: late-join
+// catch-up / historical buffer replay. aiosendspin's version of this exists
+// almost entirely to re-encode cached history through a newly-joined role's
+// own codec/format when it differs from what's cached — moot here, since v1
+// has one shared PCM format per group. What's left without that (a member
+// joining mid-stream gets stream/start plus whatever the next push_audio()
+// call sends, synchronized with everyone already there, but nothing from
+// before it joined — proven by tests/group_sync.rs's
+// a_late_joiner_gets_current_stream_start_and_only_subsequent_audio) is
+// judged sufficient; a short join gap is acceptable.
 //
 // dial_client itself is one-shot; ClientManager is the supervised version —
 // continuous discovery plus reconnect-with-backoff — and is what real
