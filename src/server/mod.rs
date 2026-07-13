@@ -21,9 +21,11 @@
 //   - Late-join catch-up and historical buffer replay (a client that joins
 //     mid-stream just gets audio from that point forward).
 //   - Non-player roles: color, visualizer, artwork, controller, metadata.
-//   - Reconnect-with-backoff for dialed clients (dial_client is one-shot;
-//     aiosendspin retries indefinitely with exponential backoff).
 //   - External player registration.
+//
+// dial_client itself is one-shot; ClientManager is the supervised version —
+// continuous discovery plus reconnect-with-backoff — and is what real
+// deployments should use instead of driving ClientBrowser/dial_client by hand.
 
 mod binary;
 mod connection;
@@ -31,6 +33,7 @@ mod dial;
 mod discovery;
 mod group;
 mod listener;
+mod manager;
 
 pub use binary::encode_audio_frame;
 pub use connection::{ServerConnection, ServerConnectionGuard, ServerSender};
@@ -38,3 +41,4 @@ pub use dial::dial_client;
 pub use discovery::{Advertisement, ClientBrowser};
 pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
+pub use manager::{ClientEvent, ClientManager};
