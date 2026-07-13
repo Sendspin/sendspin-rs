@@ -44,6 +44,11 @@ crossbeam = "0.8"
 parking_lot = "0.12"
 typed-builder = "0.23.2"
 
+# mDNS advertising for the server role (src/server/discovery.rs) — was
+# already a dev-dependency for the client-side examples; the server role
+# needs it as a real dependency to advertise `_sendspin-server._tcp.local.`.
+mdns-sd = "0.20"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
@@ -62,7 +67,6 @@ cpal = { version = "0.18", features = ["realtime"] }
 tokio-test = "0.4"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
-mdns-sd = "0.20"
 
 [profile.release]
 opt-level = 3
