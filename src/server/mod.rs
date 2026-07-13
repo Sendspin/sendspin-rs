@@ -16,8 +16,10 @@
 
 mod binary;
 mod connection;
+mod group;
 mod listener;
 
 pub use binary::encode_audio_frame;
 pub use connection::{ServerConnection, ServerConnectionGuard, ServerSender};
+pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
