@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -622,6 +623,8 @@ pub struct ConnectionGuard {
     router_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     writer_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Closes when the router task exits; see [`Self::closed`].
+    closed_rx: watch::Receiver<()>,
 }
 
 impl ConnectionGuard {
@@ -656,6 +659,23 @@ impl ConnectionGuard {
 
         log::debug!("Disconnect complete");
         goodbye_result
+    }
+
+    /// Resolves once the connection is dead: the router task has exited
+    /// (peer close, transport failure, or teardown) and dropped its end of
+    /// the watch channel. Cancel-safe.
+    ///
+    /// Liveness means the *reader*. A write-side failure alone does not
+    /// fire this — on TCP it resets the read side too in short order, and
+    /// sends toward a dead writer fail fast rather than hang.
+    pub(crate) async fn closed(&mut self) {
+        // The sender never sends; the only wakeup is Err(closed).
+        let _ = self.closed_rx.changed().await;
+    }
+
+    /// Non-blocking [`Self::closed`].
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed_rx.has_changed().is_err()
     }
 }
 
@@ -803,7 +823,12 @@ impl ProtocolClient {
         let clock_sync_router = Arc::clone(&clock_sync);
         let clock_router = Arc::clone(&clock);
         let stream_state_router = Arc::clone(&stream_state);
+        // The router task owns the sender and drops it when it exits for any
+        // reason (peer close, transport error, abort), waking
+        // ConnectionGuard::closed() observers.
+        let (closed_tx, closed_rx) = watch::channel(());
         let router_handle = tokio::spawn(async move {
+            let _closed_tx = closed_tx;
             Self::message_router(
                 read,
                 audio_tx,
@@ -866,6 +891,7 @@ impl ProtocolClient {
                 router_handle: Some(router_handle),
                 sync_handle: Some(sync_handle),
                 writer_handle: Some(writer_handle),
+                closed_rx,
             },
         })
     }
