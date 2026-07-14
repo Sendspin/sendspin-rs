@@ -32,19 +32,24 @@ use tokio_native_tls::TlsAcceptor;
 /// [`ProtocolClientBuilder::accept`] on each, `tokio::spawn`-ing per peer.
 ///
 /// The Sendspin spec allows multiple servers to initiate connections to the
-/// same client. The keep-or-switch policy belongs to the application: read
-/// [`ProtocolClient::server_hello`] for `server_id` and `connection_reason`,
-/// compare against your persisted last-played server, and send
-/// [`GoodbyeReason::AnotherServer`] to the loser. This listener does not
-/// enforce a policy.
+/// same client. For the batteries-included path, hand this listener to
+/// [`ConnectionManager`], which runs inbound handshakes concurrently,
+/// applies the spec keep-or-switch policy ([`should_switch`]), and sends
+/// [`GoodbyeReason::AnotherServer`] to losers automatically. To run the
+/// policy yourself instead: read [`ProtocolClient::server_hello`] for
+/// `server_id` and `connection_reason`, decide with [`should_switch`]
+/// against your persisted last-played server, and send the loser's goodbye.
+/// This listener itself does not enforce a policy.
 ///
-/// Practical notes:
+/// Practical notes for the manual path:
 /// - Disconnect consumes the handle. Call [`ProtocolClient::disconnect`]
 ///   pre-split, or `connection.guard.disconnect(...)` post-split.
 /// - [`Self::accept`] is serial. If the loser's goodbye is on the critical
 ///   path, run it on a spawned task so the next inbound peer can handshake
 ///   while the previous one is tearing down.
 ///
+/// [`ConnectionManager`]: crate::protocol::manager::ConnectionManager
+/// [`should_switch`]: crate::protocol::manager::should_switch
 /// [`GoodbyeReason::AnotherServer`]: crate::protocol::messages::GoodbyeReason::AnotherServer
 pub struct ProtocolListener {
     tcp: TcpListener,
@@ -124,12 +129,7 @@ impl ProtocolListener {
     /// will block this future indefinitely, so wrap it in a timeout if
     /// untrusted peers can reach the socket.
     pub async fn accept(&self) -> Result<(ProtocolClient, SocketAddr), Error> {
-        let (tcp_stream, peer_addr) = self
-            .tcp
-            .accept()
-            .await
-            .map_err(|e| Error::Connection(format!("TCP accept failed: {e}")))?;
-        log::debug!("Accepted TCP connection from {}", peer_addr);
+        let (tcp_stream, peer_addr) = self.accept_tcp().await?;
 
         match self.handshake_and_drive(tcp_stream).await {
             Ok(client) => Ok((client, peer_addr)),
@@ -142,9 +142,28 @@ impl ProtocolListener {
         }
     }
 
-    /// Split from [`Self::accept`] so the cheap TCP accept can capture the
-    /// peer address before any fallible step (TLS, WS, protocol handshake).
-    async fn handshake_and_drive(&self, tcp_stream: TcpStream) -> Result<ProtocolClient, Error> {
+    /// Accept a raw TCP connection without starting any handshake. Split from
+    /// [`Self::accept`] so the cheap TCP accept can capture the peer address
+    /// before any fallible step, and so [`ConnectionManager`] can run the
+    /// handshake on a separate task.
+    ///
+    /// [`ConnectionManager`]: crate::protocol::manager::ConnectionManager
+    pub(crate) async fn accept_tcp(&self) -> Result<(TcpStream, SocketAddr), Error> {
+        let (tcp_stream, peer_addr) = self
+            .tcp
+            .accept()
+            .await
+            .map_err(|e| Error::Connection(format!("TCP accept failed: {e}")))?;
+        log::debug!("Accepted TCP connection from {}", peer_addr);
+        Ok((tcp_stream, peer_addr))
+    }
+
+    /// Drive TLS (if configured), the WebSocket upgrade, and the protocol
+    /// hello/state exchange over an accepted TCP stream.
+    pub(crate) async fn handshake_and_drive(
+        &self,
+        tcp_stream: TcpStream,
+    ) -> Result<ProtocolClient, Error> {
         // Branched (rather than unified through a trait-object stream)
         // so the WS handshake is monomorphized on the concrete transport.
         #[cfg(feature = "native-tls")]
