@@ -1,9 +1,12 @@
 // ABOUTME: Audio decoder implementations
-// ABOUTME: PCM, Opus, FLAC decoders (Phase 1: PCM only)
+// ABOUTME: PCM and FLAC decoders (Opus planned)
 
+/// FLAC decoder implementation
+pub mod flac;
 /// PCM decoder implementation
 pub mod pcm;
 
+pub use flac::FlacDecoder;
 pub use pcm::{PcmDecoder, PcmEndian};
 
 use crate::error::Error;

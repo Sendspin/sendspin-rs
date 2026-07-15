@@ -1,11 +1,13 @@
 // ABOUTME: End-to-end player example
 // ABOUTME: Connects to server, receives audio, and plays it back
 
+use base64::prelude::*;
 use clap::Parser;
-use sendspin::audio::decode::{Decoder, PcmDecoder, PcmEndian};
+use sendspin::audio::decode::{Decoder, FlacDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
-    Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand,
+    AudioFormatSpec, Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState,
+    PlayerStateCommand, PlayerV1Support,
 };
 use sendspin::ProtocolClientBuilder;
 use std::sync::Arc;
@@ -167,9 +169,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let required_lead_time_ms = 500;
     let min_buffer_ms = 500;
 
+    // Advertise FLAC ahead of PCM so servers that support it send the
+    // bandwidth-friendly lossless stream; PCM remains the fallback.
+    let supported_formats = [("flac", 24), ("flac", 16), ("pcm", 24), ("pcm", 16)]
+        .into_iter()
+        .map(|(codec, bit_depth)| AudioFormatSpec {
+            codec: codec.to_string(),
+            channels: 2,
+            sample_rate: 48000,
+            bit_depth,
+        })
+        .collect();
+
     let test = ProtocolClientBuilder::builder()
         .client_id(client_id)
         .name(args.name.clone())
+        .player_v1_support(PlayerV1Support {
+            supported_formats,
+            buffer_capacity: 50 * 1024 * 1024,
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
+        })
         .initial_player_state(PlayerState {
             volume: Some(100),
             muted: Some(false),
@@ -202,7 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Message handling variables
-    let mut decoder: Option<PcmDecoder> = None;
+    let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut audio_format: Option<AudioFormat> = None;
     let mut endian_locked: Option<PcmEndian> = None; // Auto-detect on first chunk
     let mut buffered_duration_us: u64 = 0; // Track buffered audio duration in microseconds
@@ -241,6 +260,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if let Some(ref player_config) = stream_start.player {
+                            // Tear down the previous stream's decoder state
+                            // before any validation: every `continue` below
+                            // must leave "no decoder, no format" rather than
+                            // a stale pairing that would misdecode the new
+                            // stream's chunks.
+                            decoder = None;
+                            audio_format = None;
+                            endian_locked = None;
+
                             println!(
                                 "Stream starting: codec='{}' {}Hz {}ch {}bit",
                                 player_config.codec,
@@ -250,32 +278,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
 
                             // Validate codec before proceeding
-                            if player_config.codec != "pcm" {
-                                eprintln!("ERROR: Unsupported codec '{}' - only 'pcm' is supported!", player_config.codec);
-                                eprintln!("Server is sending compressed audio that we can't decode!");
-                                continue;
-                            }
+                            let codec = match player_config.codec.as_str() {
+                                "pcm" => Codec::Pcm,
+                                "flac" => Codec::Flac,
+                                other => {
+                                    eprintln!("ERROR: Unsupported codec '{}' - only 'pcm' and 'flac' are supported!", other);
+                                    eprintln!("Server is sending compressed audio that we can't decode!");
+                                    continue;
+                                }
+                            };
 
                             if player_config.bit_depth != 16 && player_config.bit_depth != 24 {
-                                eprintln!("ERROR: Unsupported bit depth {} - only 16 or 24-bit PCM supported!", player_config.bit_depth);
+                                eprintln!("ERROR: Unsupported bit depth {} - only 16 or 24-bit supported!", player_config.bit_depth);
                                 continue;
                             }
 
+                            // Codec header arrives base64-encoded (for FLAC:
+                            // the fLaC marker plus STREAMINFO block).
+                            let codec_header: Option<Vec<u8>> = match player_config.codec_header.as_deref() {
+                                Some(b64) => match BASE64_STANDARD.decode(b64) {
+                                    Ok(header) => Some(header),
+                                    Err(e) => {
+                                        eprintln!("ERROR: Invalid base64 codec header: {}", e);
+                                        continue;
+                                    }
+                                },
+                                None => None,
+                            };
+
+                            decoder = match codec {
+                                // PCM decoder is created on the first chunk,
+                                // after endianness is locked in.
+                                Codec::Pcm => None,
+                                Codec::Flac => {
+                                    let flac = match codec_header.as_deref() {
+                                        Some(header) => match FlacDecoder::with_header(header) {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                eprintln!("ERROR: Invalid FLAC codec header: {}", e);
+                                                continue;
+                                            }
+                                        },
+                                        None => FlacDecoder::new(),
+                                    };
+                                    Some(Box::new(flac))
+                                }
+                                // `codec` was narrowed to Pcm/Flac when parsing
+                                // player_config.codec above.
+                                _ => unreachable!(),
+                            };
+
                             audio_format = Some(AudioFormat {
-                                codec: Codec::Pcm,
+                                codec,
                                 sample_rate: player_config.sample_rate,
                                 channels: player_config.channels,
                                 bit_depth: player_config.bit_depth,
-                                codec_header: None,
+                                codec_header,
                             });
 
-                            // Decoder will be created on first chunk after auto-detecting endianness
-                            decoder = None;
-                            endian_locked = None;
                             buffered_duration_us = 0; // Reset on new stream
                             playback_started = false;
                             first_chunk_logged = false; // Reset for new stream
-                            println!("Waiting for first audio chunk to auto-detect endianness...");
+                            match codec {
+                                Codec::Pcm => println!("Waiting for first audio chunk to auto-detect endianness..."),
+                                _ => println!("Decoder ready, waiting for audio chunks..."),
+                            }
                         } else {
                             println!("Received stream/start without player config");
                         }
@@ -357,35 +424,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     first_chunk_logged = true;
                 }
 
+                // PCM-specific handling: raw sample chunks need a frame-size
+                // sanity check and one-time endianness selection. Compressed
+                // codecs (FLAC) are framed by the codec itself.
                 if let Some(ref fmt) = audio_format {
-                    // Frame sanity check
-                    let bytes_per_sample = match fmt.bit_depth {
-                        16 => 2,
-                        24 => 3,
-                        _ => {
-                            eprintln!("Unsupported bit depth: {}", fmt.bit_depth);
-                            continue;
+                    if fmt.codec == Codec::Pcm {
+                        // Frame sanity check
+                        let bytes_per_sample = match fmt.bit_depth {
+                            16 => 2,
+                            24 => 3,
+                            _ => {
+                                eprintln!("Unsupported bit depth: {}", fmt.bit_depth);
+                                continue;
+                            }
+                        } as usize;
+                        let frame_size = bytes_per_sample * fmt.channels as usize;
+
+                        if chunk.data.len() % frame_size != 0 {
+                            eprintln!(
+                                "BAD FRAME: {} bytes not multiple of frame size {} ({}-bit, {}ch)",
+                                chunk.data.len(), frame_size, fmt.bit_depth, fmt.channels
+                            );
+                            continue; // Don't decode garbage
                         }
-                    } as usize;
-                    let frame_size = bytes_per_sample * fmt.channels as usize;
 
-                    if chunk.data.len() % frame_size != 0 {
-                        eprintln!(
-                            "BAD FRAME: {} bytes not multiple of frame size {} ({}-bit, {}ch)",
-                            chunk.data.len(), frame_size, fmt.bit_depth, fmt.channels
-                        );
-                        continue; // Don't decode garbage
-                    }
-
-                    // One-time endianness setup on first chunk
-                    // Per spec: macOS and most systems use Little-Endian PCM
-                    // Only use Big-Endian if explicitly signaled by server
-                    if endian_locked.is_none() {
-                        // Default to Little-Endian (standard for macOS/Windows/Linux)
-                        let endian = PcmEndian::Little;
-                        endian_locked = Some(endian);
-                        decoder = Some(PcmDecoder::with_endian(fmt.bit_depth, endian));
-                        println!("Using Little-Endian PCM (standard for modern systems)");
+                        // One-time endianness setup on first chunk
+                        // Per spec: macOS and most systems use Little-Endian PCM
+                        // Only use Big-Endian if explicitly signaled by server
+                        if endian_locked.is_none() {
+                            // Default to Little-Endian (standard for macOS/Windows/Linux)
+                            let endian = PcmEndian::Little;
+                            endian_locked = Some(endian);
+                            decoder = Some(Box::new(PcmDecoder::with_endian(fmt.bit_depth, endian)));
+                            println!("Using Little-Endian PCM (standard for modern systems)");
+                        }
                     }
                 }
 

@@ -37,6 +37,9 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 # Audio output
 cpal = "0.18"
 
+# Audio decoding
+flac-codec = "=1.3.2"
+
 # Concurrency
 crossbeam = "0.8"
 
@@ -60,6 +63,7 @@ cpal = { version = "0.18", features = ["realtime"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+base64 = "0.22"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 mdns-sd = "0.20"
