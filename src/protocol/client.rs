@@ -7,7 +7,7 @@ use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
     ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
     PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat,
-    StreamStart,
+    StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -118,14 +118,15 @@ pub struct Connection {
 /// the versioned `player@v1` names used during role negotiation.
 const ROLE_PLAYER: &str = "player";
 const ROLE_ARTWORK: &str = "artwork";
+const ROLE_VISUALIZER: &str = "visualizer";
 
 /// Which role streams are currently active, updated by the message router from
-/// `stream/start` and `stream/end`. Only `player` and `artwork` are tracked —
-/// the only roles `stream/request-format` can target.
+/// `stream/start` and `stream/end`.
 #[derive(Debug, Default)]
 struct StreamState {
     player_active: AtomicBool,
     artwork_active: AtomicBool,
+    visualizer_active: AtomicBool,
 }
 
 impl StreamState {
@@ -138,6 +139,9 @@ impl StreamState {
         if start.artwork.is_some() {
             self.artwork_active.store(true, Ordering::Release);
         }
+        if start.visualizer.is_some() {
+            self.visualizer_active.store(true, Ordering::Release);
+        }
     }
 
     /// `stream/end` with no roles ends every stream; otherwise only those listed.
@@ -148,6 +152,9 @@ impl StreamState {
         if role_ended(end, ROLE_ARTWORK) {
             self.artwork_active.store(false, Ordering::Release);
         }
+        if role_ended(end, ROLE_VISUALIZER) {
+            self.visualizer_active.store(false, Ordering::Release);
+        }
     }
 
     fn is_player_active(&self) -> bool {
@@ -156,6 +163,10 @@ impl StreamState {
 
     fn is_artwork_active(&self) -> bool {
         self.artwork_active.load(Ordering::Acquire)
+    }
+
+    fn is_visualizer_active(&self) -> bool {
+        self.visualizer_active.load(Ordering::Acquire)
     }
 }
 
@@ -245,9 +256,9 @@ impl WsSender {
     /// as `None` are unconstrained by the client.
     ///
     /// This low-level sender does not enforce negotiated roles; callers should
-    /// only use it for connections where the server granted `player@v1` and/or
-    /// `artwork@v1`. Use [`Connection::server_hello`] when you need to inspect
-    /// the negotiated roles before sending.
+    /// only use it for connections where the server granted the requested role.
+    /// Use [`Connection::server_hello`] when you need to inspect the negotiated
+    /// roles before sending.
     ///
     /// A requested component is rejected unless that role's stream is currently
     /// active (between its `stream/start` and `stream/end`): there is nothing to
@@ -257,10 +268,31 @@ impl WsSender {
         player: Option<PlayerFormatRequest>,
         artwork: Option<ArtworkFormatRequest>,
     ) -> Result<(), Error> {
-        if player.is_none() && artwork.is_none() {
+        self.request_stream_formats(player, artwork, None).await
+    }
+
+    /// Request changes to any combination of active stream formats.
+    ///
+    /// Each supplied component must have a corresponding active stream. The
+    /// existing [`Self::request_stream_format`] method remains available for
+    /// player/artwork-only callers.
+    pub async fn request_stream_formats(
+        &self,
+        player: Option<PlayerFormatRequest>,
+        artwork: Option<ArtworkFormatRequest>,
+        visualizer: Option<VisualizerFormatRequest>,
+    ) -> Result<(), Error> {
+        if player.is_none() && artwork.is_none() && visualizer.is_none() {
             return Err(Error::Protocol(
-                "stream/request-format requires player or artwork request".to_string(),
+                "stream/request-format requires a player, artwork, or visualizer request"
+                    .to_string(),
             ));
+        }
+
+        if let Some(request) = visualizer.as_ref() {
+            request
+                .validate()
+                .map_err(|message| Error::Protocol(message.to_string()))?;
         }
 
         if player.is_some() && !self.stream_state.is_player_active() {
@@ -275,9 +307,16 @@ impl WsSender {
             ));
         }
 
+        if visualizer.is_some() && !self.stream_state.is_visualizer_active() {
+            return Err(Error::Protocol(
+                "stream/request-format requires an active visualizer stream".to_string(),
+            ));
+        }
+
         self.send_message(Message::StreamRequestFormat(StreamRequestFormat {
             player,
             artwork,
+            visualizer,
         }))
         .await
     }
@@ -290,6 +329,15 @@ impl WsSender {
     /// Request a change to an active artwork stream format.
     pub async fn request_artwork_format(&self, artwork: ArtworkFormatRequest) -> Result<(), Error> {
         self.request_stream_format(None, Some(artwork)).await
+    }
+
+    /// Request a change to an active visualizer stream format.
+    pub async fn request_visualizer_format(
+        &self,
+        visualizer: VisualizerFormatRequest,
+    ) -> Result<(), Error> {
+        self.request_stream_formats(None, None, Some(visualizer))
+            .await
     }
 
     fn send_goodbye(
@@ -418,9 +466,16 @@ pub mod binary_types {
     pub const ARTWORK_CHANNEL_2: u8 = 0x0A;
     /// Artwork channel 3 (type 11)
     pub const ARTWORK_CHANNEL_3: u8 = 0x0B;
-    /// Visualizer data (type 16)
-    pub const VISUALIZER: u8 = 0x10;
-
+    /// Visualizer loudness data (type 16).
+    pub const VISUALIZER_LOUDNESS: u8 = 0x10;
+    /// Visualizer beat data (type 17).
+    pub const VISUALIZER_BEAT: u8 = 0x11;
+    /// Visualizer dominant-frequency data (type 18).
+    pub const VISUALIZER_F_PEAK: u8 = 0x12;
+    /// Visualizer spectrum data (type 19).
+    pub const VISUALIZER_SPECTRUM: u8 = 0x13;
+    /// Visualizer energy-onset data (type 20).
+    pub const VISUALIZER_PEAK: u8 = 0x14;
     /// Check if a binary type ID is for artwork (8-11)
     pub fn is_artwork(type_id: u8) -> bool {
         (ARTWORK_CHANNEL_0..=ARTWORK_CHANNEL_3).contains(&type_id)
@@ -433,6 +488,11 @@ pub mod binary_types {
         } else {
             None
         }
+    }
+
+    /// Check if a binary type ID is for visualizer data (16-20).
+    pub fn is_visualizer(type_id: u8) -> bool {
+        (VISUALIZER_LOUDNESS..=VISUALIZER_PEAK).contains(&type_id)
     }
 }
 
@@ -519,17 +579,34 @@ impl ArtworkChunk {
     }
 }
 
-/// Visualizer chunk from server (binary type 16)
+/// Visualizer chunk from server (binary types 16-20).
 #[derive(Debug, Clone)]
 pub struct VisualizerChunk {
-    /// Server timestamp in microseconds
+    /// Visualizer binary message type (16-20).
+    pub type_id: u8,
+    /// Server timestamp in microseconds.
     pub timestamp: i64,
-    /// FFT/visualization data bytes
+    /// Raw visualization data bytes, left for the application to decode.
     pub data: Arc<[u8]>,
 }
 
 impl VisualizerChunk {
-    /// Parse from WebSocket binary frame (type 16 = visualizer)
+    /// Return the typed visualizer data kind represented by this chunk.
+    ///
+    /// Returns `None` if a chunk was constructed manually with an invalid
+    /// `type_id`; frames parsed by [`Self::from_bytes`] always return `Some`.
+    pub fn data_type(&self) -> Option<VisualizerDataType> {
+        match self.type_id {
+            binary_types::VISUALIZER_LOUDNESS => Some(VisualizerDataType::Loudness),
+            binary_types::VISUALIZER_BEAT => Some(VisualizerDataType::Beat),
+            binary_types::VISUALIZER_F_PEAK => Some(VisualizerDataType::FPeak),
+            binary_types::VISUALIZER_SPECTRUM => Some(VisualizerDataType::Spectrum),
+            binary_types::VISUALIZER_PEAK => Some(VisualizerDataType::Peak),
+            _ => None,
+        }
+    }
+
+    /// Parse from a WebSocket binary frame (visualizer types 16-20).
     pub fn from_bytes(frame: &[u8]) -> Result<Self, Error> {
         if frame.len() < 9 {
             return Err(Error::Protocol(format!(
@@ -538,10 +615,9 @@ impl VisualizerChunk {
             )));
         }
 
-        if frame[0] != binary_types::VISUALIZER {
+        if !binary_types::is_visualizer(frame[0]) {
             return Err(Error::Protocol(format!(
-                "Invalid visualizer chunk type: expected {}, got {}",
-                binary_types::VISUALIZER,
+                "Invalid visualizer chunk type: expected 16-20, got {}",
                 frame[0]
             )));
         }
@@ -552,7 +628,11 @@ impl VisualizerChunk {
 
         let data = Arc::from(&frame[9..]);
 
-        Ok(Self { timestamp, data })
+        Ok(Self {
+            type_id: frame[0],
+            timestamp,
+            data,
+        })
     }
 }
 
@@ -563,7 +643,7 @@ pub enum BinaryFrame {
     Audio(AudioChunk),
     /// Artwork image (types 8-11)
     Artwork(ArtworkChunk),
-    /// Visualizer data (type 16)
+    /// Visualizer data (types 16-20)
     Visualizer(VisualizerChunk),
     /// Unknown binary type
     Unknown {
@@ -588,7 +668,7 @@ impl BinaryFrame {
             t if binary_types::is_artwork(t) => {
                 Ok(BinaryFrame::Artwork(ArtworkChunk::from_bytes(frame)?))
             }
-            binary_types::VISUALIZER => {
+            t if binary_types::is_visualizer(t) => {
                 Ok(BinaryFrame::Visualizer(VisualizerChunk::from_bytes(frame)?))
             }
             // The router warns when it sees the Unknown variant; parsing

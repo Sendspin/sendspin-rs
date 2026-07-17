@@ -188,11 +188,78 @@ pub enum ImageFormat {
     Bmp,
 }
 
-/// Visualizer@v1 capabilities
+/// Visualizer@v1 capabilities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualizerV1Support {
-    /// Buffer capacity for visualization data
+    /// Visualization data types requested by the client.
+    pub types: Vec<VisualizerDataType>,
+    /// Maximum total size of buffered visualizer messages in bytes.
     pub buffer_capacity: u32,
+    /// Maximum periodic visualization frames per second.
+    pub rate_max: u32,
+    /// Spectrum configuration, required when `types` includes `spectrum`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<SpectrumConfig>,
+}
+
+impl VisualizerV1Support {
+    /// Validate the cross-field spectrum requirement from the Sendspin spec.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_spectrum(&self.types, self.spectrum.as_ref())
+    }
+}
+
+/// Visualization data type carried by a visualizer binary message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisualizerDataType {
+    /// Overall A-weighted loudness.
+    Loudness,
+    /// Musical beat event.
+    Beat,
+    /// Dominant frequency and amplitude.
+    FPeak,
+    /// FFT magnitudes mapped to display bins.
+    Spectrum,
+    /// Energy onset event.
+    Peak,
+}
+
+/// Spectrum display-bin configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpectrumConfig {
+    /// Number of display bins.
+    pub n_disp_bins: u32,
+    /// Frequency-to-bin mapping.
+    pub scale: SpectrumScale,
+    /// Lowest frequency in Hz.
+    pub f_min: u32,
+    /// Highest frequency in Hz.
+    pub f_max: u32,
+}
+
+fn validate_spectrum(
+    types: &[VisualizerDataType],
+    spectrum: Option<&SpectrumConfig>,
+) -> Result<(), &'static str> {
+    let has_spectrum = types.contains(&VisualizerDataType::Spectrum);
+    match (has_spectrum, spectrum.is_some()) {
+        (true, false) => Err("spectrum configuration is required for spectrum data"),
+        (false, true) => Err("spectrum configuration requires spectrum data"),
+        _ => Ok(()),
+    }
+}
+
+/// Frequency-to-bin mapping for spectrum data.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SpectrumScale {
+    /// HTK mel-frequency spacing.
+    Mel,
+    /// Base-10 logarithmic spacing.
+    Log,
+    /// Linear frequency spacing.
+    Lin,
 }
 
 /// Server hello message
@@ -549,10 +616,26 @@ pub struct StreamArtworkChannelConfig {
     pub height: u32,
 }
 
-/// Stream visualizer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Stream visualizer configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StreamVisualizerConfig {
-    // FFT details TBD per spec
+    /// Visualization data types the server will stream.
+    pub types: Vec<VisualizerDataType>,
+    /// Maximum periodic visualization frames per second.
+    pub rate_max: u32,
+    /// Whether the beat tracker identifies bar starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracks_downbeats: Option<bool>,
+    /// Spectrum configuration, present when `types` includes `spectrum`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<SpectrumConfig>,
+}
+
+impl StreamVisualizerConfig {
+    /// Validate the cross-field spectrum requirement from the Sendspin spec.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        validate_spectrum(&self.types, self.spectrum.as_ref())
+    }
 }
 
 /// Stream end message
@@ -580,6 +663,40 @@ pub struct StreamRequestFormat {
     /// Requested artwork format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artwork: Option<ArtworkFormatRequest>,
+    /// Requested visualizer format
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visualizer: Option<VisualizerFormatRequest>,
+}
+
+/// Requested visualizer stream format. Omitted fields keep their current value.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VisualizerFormatRequest {
+    /// New visualization data types.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub types: Option<Vec<VisualizerDataType>>,
+    /// New periodic visualization frames-per-second cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_max: Option<u32>,
+    /// New spectrum configuration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum: Option<SpectrumConfig>,
+}
+
+impl VisualizerFormatRequest {
+    /// Validate that this request changes at least one field.
+    ///
+    /// This is a partial update: omitted fields retain their current value, so
+    /// a request may omit `spectrum` even when its new `types` includes it.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.types.is_none() && self.rate_max.is_none() && self.spectrum.is_none() {
+            return Err("visualizer format request must specify at least one field");
+        }
+        if let (Some(types), Some(spectrum)) = (self.types.as_ref(), self.spectrum.as_ref()) {
+            validate_spectrum(types, Some(spectrum))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Player format request

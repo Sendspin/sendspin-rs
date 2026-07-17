@@ -5,6 +5,7 @@ use sendspin::protocol::messages::{
     ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message,
     PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamArtworkChannelConfig,
     StreamArtworkConfig, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
+    VisualizerDataType, VisualizerFormatRequest,
 };
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
@@ -101,6 +102,20 @@ fn artwork_stream_start() -> WsMessage {
             }],
         }),
         visualizer: None,
+    }))
+}
+
+/// A server→client `stream/start` that starts a visualizer stream.
+fn visualizer_stream_start() -> WsMessage {
+    text_message(&Message::StreamStart(StreamStart {
+        player: None,
+        artwork: None,
+        visualizer: Some(sendspin::protocol::messages::StreamVisualizerConfig {
+            types: vec![VisualizerDataType::Spectrum],
+            rate_max: 60,
+            tracks_downbeats: None,
+            spectrum: None,
+        }),
     }))
 }
 
@@ -427,7 +442,7 @@ async fn test_sender_rejects_empty_stream_request_format() {
 
     match result {
         Err(Error::Protocol(msg)) => assert!(
-            msg.contains("requires player or artwork request"),
+            msg.contains("requires a player, artwork, or visualizer request"),
             "unexpected protocol error: {msg}"
         ),
         other => panic!("expected protocol error, got {:?}", other),
@@ -467,6 +482,58 @@ async fn test_sender_rejects_request_format_before_stream_start() {
         ),
         other => panic!("expected protocol error, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_sender_visualizer_request_requires_active_stream() {
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .visualizer_v1_support(sendspin::protocol::messages::VisualizerV1Support {
+            types: vec![VisualizerDataType::Spectrum],
+            buffer_capacity: 4096,
+            rate_max: 60,
+            spectrum: None,
+        })
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+    discard_initial_state(&mut rx).await;
+
+    let request = VisualizerFormatRequest {
+        types: Some(vec![VisualizerDataType::Loudness]),
+        rate_max: Some(30),
+        spectrum: None,
+    };
+    let empty = VisualizerFormatRequest {
+        types: None,
+        rate_max: None,
+        spectrum: None,
+    };
+    let result = conn.sender.request_visualizer_format(empty).await;
+    assert!(matches!(result, Err(Error::Protocol(msg)) if msg.contains("at least one field")));
+
+    let result = conn.sender.request_visualizer_format(request.clone()).await;
+    assert!(
+        matches!(result, Err(Error::Protocol(msg)) if msg.contains("active visualizer stream"))
+    );
+
+    server_tx.send(visualizer_stream_start()).unwrap();
+    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+
+    conn.sender
+        .request_visualizer_format(request)
+        .await
+        .unwrap();
+    let sent = recv_stream_request_format(&mut rx).await;
+    assert_eq!(
+        sent.visualizer.expect("visualizer request").rate_max,
+        Some(30)
+    );
 }
 
 #[tokio::test]
@@ -1169,8 +1236,25 @@ async fn test_message_router_forwards_binary_visualizer() {
         .await
         .expect("timed out waiting for visualizer chunk")
         .expect("visualizer channel closed");
+    assert_eq!(chunk.type_id, 0x10);
     assert_eq!(chunk.timestamp, 200);
     assert_eq!(&*chunk.data, &[0x01, 0x02, 0x03]);
+
+    for (type_id, expected) in [(0x11, vec![0x01]), (0x13, vec![0x02, 0x03])] {
+        server_tx
+            .send(WsMessage::Binary(
+                [vec![type_id], vec![0; 8], expected.clone()]
+                    .concat()
+                    .into(),
+            ))
+            .unwrap();
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.visualizer.recv())
+            .await
+            .expect("timed out waiting for visualizer chunk")
+            .expect("visualizer channel closed");
+        assert_eq!(chunk.type_id, type_id);
+        assert_eq!(&*chunk.data, expected.as_slice());
+    }
 }
 
 #[tokio::test]

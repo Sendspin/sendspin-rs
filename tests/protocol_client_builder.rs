@@ -1,7 +1,7 @@
 use sendspin::protocol::client_builder::ProtocolClientBuilder;
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerV1Support,
-    VisualizerV1Support,
+    VisualizerDataType, VisualizerV1Support,
 };
 
 #[test]
@@ -80,7 +80,10 @@ fn test_supported_roles_with_visualizer_v1_support() {
         .client_id("test".to_string())
         .name("Test Client".to_string())
         .visualizer_v1_support(VisualizerV1Support {
+            types: vec![VisualizerDataType::Spectrum],
             buffer_capacity: 1024,
+            rate_max: 60,
+            spectrum: None,
         })
         .build();
 
@@ -111,7 +114,10 @@ fn test_supported_roles_with_multiple_supports() {
             }],
         })
         .visualizer_v1_support(VisualizerV1Support {
+            types: vec![VisualizerDataType::Loudness],
             buffer_capacity: 1024,
+            rate_max: 60,
+            spectrum: None,
         })
         .controller()
         .build();

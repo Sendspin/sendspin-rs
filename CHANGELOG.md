@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
+  dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
+  bytes for applications to decode and render.
+
+### Changed
+
+- Expand visualizer stream configuration and format-request APIs.
+
 ## [0.3.6](https://github.com/Sendspin/sendspin-rs/compare/v0.3.5...v0.3.6) - 2026-07-15
 
 ### Other

@@ -16,7 +16,11 @@ fn test_binary_type_constants() {
     assert_eq!(binary_types::ARTWORK_CHANNEL_1, 0x09);
     assert_eq!(binary_types::ARTWORK_CHANNEL_2, 0x0A);
     assert_eq!(binary_types::ARTWORK_CHANNEL_3, 0x0B);
-    assert_eq!(binary_types::VISUALIZER, 0x10);
+    assert_eq!(binary_types::VISUALIZER_LOUDNESS, 0x10);
+    assert_eq!(binary_types::VISUALIZER_BEAT, 0x11);
+    assert_eq!(binary_types::VISUALIZER_F_PEAK, 0x12);
+    assert_eq!(binary_types::VISUALIZER_SPECTRUM, 0x13);
+    assert_eq!(binary_types::VISUALIZER_PEAK, 0x14);
 }
 
 #[test]
@@ -29,6 +33,15 @@ fn test_is_artwork() {
     assert!(binary_types::is_artwork(0x0B)); // Artwork channel 3
     assert!(!binary_types::is_artwork(0x0C)); // Out of range
     assert!(!binary_types::is_artwork(0x10)); // Visualizer
+}
+
+#[test]
+fn test_is_visualizer() {
+    for type_id in 0x10..=0x14 {
+        assert!(binary_types::is_visualizer(type_id));
+    }
+    assert!(!binary_types::is_visualizer(0x0F));
+    assert!(!binary_types::is_visualizer(0x15));
 }
 
 #[test]
@@ -176,14 +189,43 @@ fn test_artwork_chunk_wrong_type() {
 #[test]
 fn test_visualizer_chunk_parsing() {
     let frame: Vec<u8> = vec![
-        0x10, // Type: visualizer
+        0x10, // Loudness
         0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x86, 0xA0, // Timestamp: 100000
-        0x01, 0x02, 0x03, 0x04, 0x05, // FFT data
+        0x01, 0x02, 0x03, 0x04, 0x05, // Raw visualization data
     ];
 
     let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
+    assert_eq!(chunk.type_id, 0x10);
+    assert_eq!(
+        chunk.data_type(),
+        Some(sendspin::protocol::messages::VisualizerDataType::Loudness)
+    );
     assert_eq!(chunk.timestamp, 100000);
-    assert_eq!(chunk.data.len(), 5);
+    assert_eq!(&*chunk.data, &[0x01, 0x02, 0x03, 0x04, 0x05]);
+}
+
+#[test]
+fn test_all_visualizer_types_are_accepted() {
+    let expected = [
+        sendspin::protocol::messages::VisualizerDataType::Loudness,
+        sendspin::protocol::messages::VisualizerDataType::Beat,
+        sendspin::protocol::messages::VisualizerDataType::FPeak,
+        sendspin::protocol::messages::VisualizerDataType::Spectrum,
+        sendspin::protocol::messages::VisualizerDataType::Peak,
+    ];
+    for (type_id, expected_type) in (0x10..=0x14).zip(expected) {
+        let frame = [type_id, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
+        let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
+        assert_eq!(chunk.type_id, type_id);
+        assert_eq!(chunk.data_type(), Some(expected_type));
+        assert_eq!(&*chunk.data, &[0xAA]);
+    }
+}
+
+#[test]
+fn test_reserved_visualizer_type_is_rejected() {
+    let frame = [0x15, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
+    assert!(VisualizerChunk::from_bytes(&frame).is_err());
 }
 
 #[test]
@@ -260,12 +302,13 @@ fn test_binary_frame_artwork() {
 #[test]
 fn test_binary_frame_visualizer() {
     let frame: Vec<u8> = vec![
-        0x10, // Visualizer
+        0x13, // Spectrum
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x56, 0x78,
     ];
 
     match BinaryFrame::from_bytes(&frame).unwrap() {
         BinaryFrame::Visualizer(chunk) => {
+            assert_eq!(chunk.type_id, 0x13);
             assert_eq!(chunk.timestamp, 3);
         }
         _ => panic!("Expected Visualizer frame"),
