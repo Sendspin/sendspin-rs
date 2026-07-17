@@ -3,8 +3,9 @@ use sendspin::protocol::messages::{
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
     ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
     ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest, PlayerState,
-    PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, StreamArtworkChannelConfig,
-    StreamRequestFormat,
+    PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig, SpectrumScale,
+    StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig, VisualizerDataType,
+    VisualizerFormatRequest, VisualizerV1Support,
 };
 
 // =============================================================================
@@ -318,6 +319,88 @@ fn test_stream_start_deserialization() {
 }
 
 #[test]
+fn test_visualizer_negotiation_serialization() {
+    let hello = ClientHello {
+        client_id: "visualizer-client".to_string(),
+        name: "Visualizer".to_string(),
+        version: 1,
+        supported_roles: vec!["visualizer@v1".to_string()],
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: Some(VisualizerV1Support {
+            types: vec![VisualizerDataType::Loudness, VisualizerDataType::Spectrum],
+            buffer_capacity: 4096,
+            rate_max: 60,
+            spectrum: Some(SpectrumConfig {
+                n_disp_bins: 32,
+                scale: SpectrumScale::Mel,
+                f_min: 40,
+                f_max: 16_000,
+            }),
+        }),
+    };
+    let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
+    assert!(json.contains("\"visualizer@v1_support\""));
+    assert!(json.contains("\"types\":[\"loudness\",\"spectrum\"]"));
+    assert!(json.contains("\"scale\":\"mel\""));
+
+    let start: Message = serde_json::from_str(
+        r#"{
+            "type": "stream/start",
+            "payload": {
+                "visualizer": {
+                    "types": ["beat", "peak"],
+                    "rate_max": 30,
+                    "tracks_downbeats": true
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    match start {
+        Message::StreamStart(start) => {
+            assert_eq!(
+                start.visualizer,
+                Some(StreamVisualizerConfig {
+                    types: vec![VisualizerDataType::Beat, VisualizerDataType::Peak],
+                    rate_max: 30,
+                    tracks_downbeats: Some(true),
+                    spectrum: None,
+                })
+            );
+        }
+        other => panic!("expected stream/start, got {other:?}"),
+    }
+
+    let request = StreamRequestFormat {
+        player: None,
+        artwork: None,
+        visualizer: Some(VisualizerFormatRequest {
+            types: Some(vec![VisualizerDataType::FPeak]),
+            rate_max: Some(24),
+            spectrum: None,
+        }),
+    };
+    let json = serde_json::to_string(&Message::StreamRequestFormat(request)).unwrap();
+    assert!(json.contains("\"visualizer\""));
+    assert!(json.contains("\"f_peak\""));
+
+    let partial = VisualizerFormatRequest {
+        types: Some(vec![VisualizerDataType::Spectrum]),
+        rate_max: None,
+        spectrum: None,
+    };
+    assert!(partial.validate().is_ok());
+    let empty = VisualizerFormatRequest {
+        types: None,
+        rate_max: None,
+        spectrum: None,
+    };
+    assert!(empty.validate().is_err());
+}
+
+#[test]
 fn test_stream_end_deserialization() {
     let json = r#"{
         "type": "stream/end",
@@ -369,6 +452,7 @@ fn test_stream_request_format_serialization() {
             media_width: Some(600),
             media_height: Some(600),
         }),
+        visualizer: None,
     };
 
     let message = Message::StreamRequestFormat(request);
@@ -393,6 +477,7 @@ fn test_stream_request_format_omits_unspecified_fields() {
             bit_depth: None,
         }),
         artwork: None,
+        visualizer: None,
     };
 
     let json = serde_json::to_string(&Message::StreamRequestFormat(request)).unwrap();
