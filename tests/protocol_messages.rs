@@ -207,6 +207,8 @@ fn test_client_command_serialization() {
             command: ControllerCommandType::Play,
             volume: None,
             mute: None,
+            position_ms: None,
+            offset_ms: None,
         }),
     };
 
@@ -275,6 +277,8 @@ fn test_client_command_volume() {
             command: ControllerCommandType::Volume,
             volume: Some(50),
             mute: None,
+            position_ms: None,
+            offset_ms: None,
         }),
     };
 
@@ -282,6 +286,126 @@ fn test_client_command_volume() {
     let json = serde_json::to_string(&message).unwrap();
 
     assert!(json.contains("\"volume\":50"));
+}
+
+#[test]
+fn test_client_command_seek() {
+    let command = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: ControllerCommandType::Seek,
+            volume: None,
+            mute: None,
+            position_ms: Some(90_500),
+            offset_ms: None,
+        }),
+    };
+
+    let message = Message::ClientCommand(command);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"command\":\"seek\""));
+    assert!(json.contains("\"position_ms\":90500"));
+    assert!(!json.contains("offset_ms"));
+
+    // Round-trip: the serialized form must deserialize back identically.
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    match parsed {
+        Message::ClientCommand(cmd) => {
+            let ctrl = cmd.controller.expect("Expected controller command");
+            assert_eq!(ctrl.command, ControllerCommandType::Seek);
+            assert_eq!(ctrl.position_ms, Some(90_500));
+            assert!(ctrl.offset_ms.is_none());
+        }
+        _ => panic!("Expected ClientCommand"),
+    }
+}
+
+#[test]
+fn test_client_command_seek_relative() {
+    let command = ClientCommand {
+        controller: Some(ControllerCommand {
+            command: ControllerCommandType::SeekRelative,
+            volume: None,
+            mute: None,
+            position_ms: None,
+            offset_ms: Some(-10_000),
+        }),
+    };
+
+    let message = Message::ClientCommand(command);
+    let json = serde_json::to_string(&message).unwrap();
+
+    assert!(json.contains("\"command\":\"seek_relative\""));
+    assert!(json.contains("\"offset_ms\":-10000"));
+    assert!(!json.contains("position_ms"));
+
+    // Round-trip: the serialized form must deserialize back identically,
+    // preserving the negative offset.
+    let parsed: Message = serde_json::from_str(&json).unwrap();
+    match parsed {
+        Message::ClientCommand(cmd) => {
+            let ctrl = cmd.controller.expect("Expected controller command");
+            assert_eq!(ctrl.command, ControllerCommandType::SeekRelative);
+            assert_eq!(ctrl.offset_ms, Some(-10_000));
+            assert!(ctrl.position_ms.is_none());
+        }
+        _ => panic!("Expected ClientCommand"),
+    }
+}
+
+#[test]
+fn test_server_state_controller_seek_max_ms() {
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "controller": {
+                "supported_commands": ["play", "seek", "seek_relative"],
+                "volume": 75,
+                "muted": false,
+                "seek_max_ms": 245000
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let controller = state.controller.expect("Expected controller");
+            assert_eq!(controller.seek_max_ms, Some(245_000));
+            assert!(controller.supported_commands.contains(&"seek".to_string()));
+            assert!(controller
+                .supported_commands
+                .contains(&"seek_relative".to_string()));
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_server_state_controller_seek_max_ms_absent_is_none() {
+    // Servers omit seek_max_ms when the seekable range is unknown; older
+    // servers never send it. Both must deserialize to None.
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "controller": {
+                "supported_commands": ["play", "seek_relative"],
+                "volume": 75,
+                "muted": false
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let controller = state.controller.expect("Expected controller");
+            assert_eq!(controller.seek_max_ms, None);
+        }
+        _ => panic!("Expected ServerState"),
+    }
 }
 
 // =============================================================================

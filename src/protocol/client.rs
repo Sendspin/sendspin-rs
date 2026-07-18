@@ -377,6 +377,8 @@ impl Controller {
             command,
             volume: None,
             mute: None,
+            position_ms: None,
+            offset_ms: None,
         })
         .await
     }
@@ -413,6 +415,8 @@ impl Controller {
             command: ControllerCommandType::Volume,
             volume: Some(volume.clamp(0, 100)),
             mute: None,
+            position_ms: None,
+            offset_ms: None,
         })
         .await
     }
@@ -423,6 +427,8 @@ impl Controller {
             command: ControllerCommandType::Mute,
             volume: None,
             mute: Some(muted),
+            position_ms: None,
+            offset_ms: None,
         })
         .await
     }
@@ -451,6 +457,40 @@ impl Controller {
     pub async fn switch(&self) -> Result<(), Error> {
         self.send_simple_command(ControllerCommandType::Switch)
             .await
+    }
+
+    /// Seek to an absolute playback position in milliseconds.
+    ///
+    /// Only send this when `seek` is in the server's `supported_commands`.
+    /// Per the spec, the server ignores the command if `position_ms` is
+    /// outside the range 0 to
+    /// [`ControllerState::seek_max_ms`](crate::protocol::messages::ControllerState::seek_max_ms).
+    pub async fn seek(&self, position_ms: u64) -> Result<(), Error> {
+        self.send_controller_command(ControllerCommand {
+            command: ControllerCommandType::Seek,
+            volume: None,
+            mute: None,
+            position_ms: Some(position_ms),
+            offset_ms: None,
+        })
+        .await
+    }
+
+    /// Seek by a signed offset in milliseconds from the current position
+    /// (positive forward, negative backward).
+    ///
+    /// Only send this when `seek_relative` is in the server's
+    /// `supported_commands`. The server applies the offset on a best-effort
+    /// basis and clamps the result to the seekable range.
+    pub async fn seek_relative(&self, offset_ms: i64) -> Result<(), Error> {
+        self.send_controller_command(ControllerCommand {
+            command: ControllerCommandType::SeekRelative,
+            volume: None,
+            mute: None,
+            position_ms: None,
+            offset_ms: Some(offset_ms),
+        })
+        .await
     }
 }
 
