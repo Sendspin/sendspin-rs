@@ -4,5 +4,3 @@ Cargo.lock
 *.swo
 .DS_Store
 temp/
-tests/conformance/.venv/
-tests/conformance/__pycache__/
