@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Sendspin/sendspin-rs/compare/v0.3.6...v0.4.0) - 2026-07-18
+
+### Added
+
+- add Opus audio decoding ([#95](https://github.com/Sendspin/sendspin-rs/pull/95))
+- [**breaking**] Add visualizer role support ([#93](https://github.com/Sendspin/sendspin-rs/pull/93))
+
+### Other
+
+- Add color role support ([#97](https://github.com/Sendspin/sendspin-rs/pull/97))
+- Add controller seek and seek_relative command support ([#96](https://github.com/Sendspin/sendspin-rs/pull/96))
+
 ### Added
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
