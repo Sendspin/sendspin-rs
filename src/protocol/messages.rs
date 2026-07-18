@@ -464,6 +464,11 @@ pub struct ControllerState {
     /// Shuffle state
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shuffle: Option<bool>,
+    /// Maximum absolute position in milliseconds a 'seek' may target (e.g.,
+    /// the end of the current track). Present whenever 'seek' is in
+    /// `supported_commands`; absent when the seekable range is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seek_max_ms: Option<u64>,
 }
 
 // =============================================================================
@@ -528,6 +533,14 @@ pub struct ControllerCommand {
     /// Optional mute state for mute command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mute: Option<bool>,
+    /// Absolute playback position in milliseconds, range 0 to
+    /// [`ControllerState::seek_max_ms`]. Only set for the `seek` command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_ms: Option<u64>,
+    /// Signed offset in milliseconds from the current position (positive
+    /// forward, negative backward). Only set for the `seek_relative` command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset_ms: Option<i64>,
 }
 
 /// Controller command type
@@ -560,6 +573,10 @@ pub enum ControllerCommandType {
     Unshuffle,
     /// Switch to next group
     Switch,
+    /// Seek to an absolute position (requires `position_ms`)
+    Seek,
+    /// Seek by a signed offset from the current position (requires `offset_ms`)
+    SeekRelative,
 }
 
 // =============================================================================

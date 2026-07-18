@@ -948,6 +948,30 @@ async fn test_controller_unshuffle_sends_correct_command() {
     assert_eq!(ctrl.command, ControllerCommandType::Unshuffle);
 }
 
+#[tokio::test]
+async fn test_controller_seek_sends_position() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.seek(123_456).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::Seek);
+    assert_eq!(ctrl.position_ms, Some(123_456));
+    assert!(ctrl.offset_ms.is_none());
+}
+
+#[tokio::test]
+async fn test_controller_seek_relative_sends_offset() {
+    let (mut rx, controller, _conn, _handle) = connect_with_controller().await;
+    controller.seek_relative(-15_000).await.unwrap();
+
+    let cmd = next_client_command(&mut rx).await;
+    let ctrl = cmd.controller.expect("expected controller command");
+    assert_eq!(ctrl.command, ControllerCommandType::SeekRelative);
+    assert_eq!(ctrl.offset_ms, Some(-15_000));
+    assert!(ctrl.position_ms.is_none());
+}
+
 /// Start a test server that only grants specific roles, ignoring what the client requests.
 async fn start_test_server_with_roles(
     granted_roles: Vec<String>,
