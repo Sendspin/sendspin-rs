@@ -37,8 +37,9 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 # Audio output
 cpal = "0.18"
 
-# Audio decoding
+# Audio codecs
 flac-codec = "=1.3.2"
+opus-rs = "=0.1.23"
 
 # Concurrency
 crossbeam = "0.8"
