@@ -1,33 +1,18 @@
-// ABOUTME: server role: streams a WAV file to whatever Sendspin device(s) connect
+// ABOUTME: Example server that streams a WAV file to connected Sendspin devices
+// ABOUTME: Handles both dial-in clients and clients discovered/dialed over mDNS
 //
 // Usage:
 //   cargo run --example play_wav -- path/to/clip.wav
 //   cargo run --example play_wav -- --dial ws://192.168.1.42:8928/sendspin clip.wav
 //   cargo run --example play_wav -- --bind 0.0.0.0:8927 --no-advertise clip.wav
 //
-// Real Sendspin hardware splits into two connection topologies, and this
-// tool drives both concurrently:
-//   - Clients that dial in: accepted via ServerListener, discoverable via
-//     this tool's own `_sendspin-server._tcp.local.` mDNS advertisement.
-//   - Clients that only run their own embedded WebSocket server and never
-//     dial out — this is the primary topology for real embedded hardware
-//     (e.g. ESPHome's `sendspin:` component / Home Assistant Voice PE, via
-//     sendspin-cpp), confirmed by reading esphome/esphome's sendspin_hub.cpp:
-//     its setup() only ever calls start_server(), never an outbound connect.
-//     These advertise themselves as `_sendspin._tcp.local.`; this tool
-//     discovers and dials them automatically by default via ClientManager,
-//     which also retries with backoff on disconnect and re-dials if a
-//     device reappears at a new address — a reboot or WiFi drop mid-test
-//     doesn't need this tool restarted. Giving --dial switches discovery
-//     off (isolating the test to just the address(es) you named, dialed
-//     once with no retry) unless you also pass --also-discover.
-//
-// Waits for at least one client from either path, gives a short grace period
-// for additional clients to join for a multi-room sync test, then streams
-// the file to every connected client as one synchronized Group, printing
-// every client/state, client/command, and client/goodbye it receives along
-// the way — that traffic is exactly what you want to see when a real device
-// behaves unexpectedly.
+// Streams the file to every connected client as one synchronized group, and
+// prints the client/state, client/command, and client/goodbye messages it
+// receives. Handles both connection directions: clients that dial in
+// (accepted via ServerListener, discoverable through this tool's mDNS
+// advertisement) and clients that only run their own embedded server
+// (discovered and dialed via ClientManager). `--dial` targets specific
+// clients and disables discovery unless `--also-discover` is given.
 //
 // Only plain PCM WAV (fmt tag 1) is supported. Re-encode anything else first,
 // e.g.: ffmpeg -i in.mp3 -ar 48000 -ac 2 -acodec pcm_s16le out.wav

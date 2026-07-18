@@ -1,29 +1,27 @@
-// ABOUTME: Shared test helper for retrying flaky integration tests.
-// ABOUTME: Not a test binary itself — `tests/common/` (mod.rs, not
-// ABOUTME: common.rs) is the standard way to share code between
-// ABOUTME: integration test files without cargo compiling it as its own test.
+// ABOUTME: Shared test helper for retrying flaky mDNS-multicast integration tests
 
-/// Re-run an async test body up to `attempts` times, succeeding as soon as
-/// one attempt doesn't panic and only failing (re-raising the *last*
-/// attempt's panic) if every attempt does.
+/// Re-run an async test body up to `attempts` times, succeeding as soon as one
+/// attempt doesn't panic and only failing (re-raising the last attempt's panic)
+/// if every attempt does.
 ///
-/// Use this for tests whose correctness genuinely depends on real mDNS
-/// multicast timing — they're exercising real network behavior, and on a
-/// LAN shared with other concurrently-running test binaries (and possibly
-/// real Sendspin hardware, see tests/dial_discovery.rs's discovery of an
-/// actual Home Assistant Voice PE mid-test-run) occasional packet loss or
-/// scheduling delay is expected, not a signal that the code under test is
-/// wrong. Retrying absorbs that environmental noise; it does not mask a test
-/// that fails the *same way* every time, since it still fails after
-/// `attempts` tries.
+/// Intended for tests that depend on real mDNS multicast timing, where
+/// occasional packet loss or scheduling delay on a shared LAN is environmental
+/// noise rather than a real failure. A test that fails the same way every time
+/// still fails after `attempts` tries.
 ///
-/// `test_fn` must be a zero-argument async function (not a closure capturing
-/// local state) so each retry gets a fresh, independent attempt —
-/// `tokio::spawn` both isolates a panicking attempt from tearing down the
-/// whole test process and gives us a `JoinError` to detect that panic.
-// Each integration test file that does `mod common;` compiles its own copy
-// of this module, and no single test file uses both helpers — hence the
-// `allow`, rather than genuinely dead code.
+/// `test_fn` must be a zero-argument async function so each retry gets a fresh
+/// attempt; `tokio::spawn` isolates a panicking attempt and yields a `JoinError`
+/// to detect it.
+/// Whether real-network tests (which use live mDNS multicast) are enabled, via
+/// the `SENDSPIN_NET_TESTS` environment variable. Off by default so an ordinary
+/// `cargo test` run doesn't depend on multicast being available.
+#[allow(dead_code)]
+pub fn net_tests_enabled() -> bool {
+    std::env::var_os("SENDSPIN_NET_TESTS").is_some()
+}
+
+// Each integration test file that does `mod common;` compiles its own copy, and
+// no single file uses both helpers — hence the allow.
 #[allow(dead_code)]
 pub async fn retry_flaky<F, Fut>(attempts: u32, test_fn: F)
 where

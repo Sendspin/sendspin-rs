@@ -9,6 +9,10 @@ use std::time::Duration;
 
 #[test]
 fn advertised_service_resolves_with_expected_port_and_path() {
+    if !common::net_tests_enabled() {
+        eprintln!("skipping: set SENDSPIN_NET_TESTS=1 to run mDNS multicast tests");
+        return;
+    }
     // Real mDNS multicast timing (see tests/common/mod.rs) — retry rather
     // than let one transient hiccup fail CI.
     common::retry_flaky_sync(

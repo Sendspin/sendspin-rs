@@ -27,7 +27,7 @@ use tokio_tungstenite::{accept_async, accept_hdr_async, WebSocketStream};
 /// [`Self::accept`] drives the full handshake before returning, so it serves
 /// one inbound connection at a time — a slow handshake blocks the next
 /// `accept()`. `tokio::spawn` a task per accepted connection if you need to
-/// keep accepting while driving existing ones (see `examples/minimal_server.rs`).
+/// keep accepting while driving existing ones.
 pub struct ServerListener {
     tcp: TcpListener,
     server_id: String,

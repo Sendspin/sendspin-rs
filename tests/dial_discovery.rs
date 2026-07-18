@@ -50,6 +50,10 @@ async fn run_fake_embedded_client(port: u16) -> Message {
 
 #[tokio::test]
 async fn discovers_and_dials_a_self_advertising_client() {
+    if !common::net_tests_enabled() {
+        eprintln!("skipping: set SENDSPIN_NET_TESTS=1 to run mDNS multicast tests");
+        return;
+    }
     // Real mDNS multicast timing (see tests/common/mod.rs) — retry rather
     // than let one transient hiccup fail CI.
     common::retry_flaky(3, discovers_and_dials_a_self_advertising_client_impl).await;

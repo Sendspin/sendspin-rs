@@ -12,13 +12,9 @@ use mdns_sd::{Receiver, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInf
 /// see `examples/server_initiated_metadata.rs`).
 const SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 
-/// Service type clients that run their own embedded server advertise for
-/// *themselves*. Real hardware needs this far more often than you'd expect:
-/// e.g. ESPHome's `sendspin:` component (as shipped on Home Assistant Voice
-/// PE, via the `sendspin-cpp` library) only ever starts its own embedded
-/// WebSocket server — nothing on the device initiates an outbound
-/// connection, so a real server must discover and dial *it*. Matches
-/// aiosendspin's `SendspinServer._start_mdns_discovery`.
+/// Service type that clients which only run their own embedded server (e.g.
+/// ESPHome's `sendspin:` component) advertise for themselves, to be discovered
+/// and dialed by a server.
 const CLIENT_SERVICE_TYPE: &str = "_sendspin._tcp.local.";
 
 /// A live mDNS advertisement. Unregisters and shuts down its background
@@ -122,20 +118,11 @@ impl Drop for ClientBrowser {
     }
 }
 
-/// Build a WebSocket URL from a resolved client service, or `None` if it's
-/// missing a usable address or a well-formed `path` TXT property. Mirrors
-/// aiosendspin's `_get_first_valid_ip`/`_handle_service_added`.
-///
-/// `get_addresses_v4()` returns a `HashSet` — unordered, so picking "the
-/// first" element without imposing our own order means a multi-homed host
-/// (e.g. one with both a loopback and a LAN address, as any dev machine
-/// running this crate's own test suite is) can resolve to a *different*
-/// address on repeated, otherwise-identical resolutions of the exact same
-/// service. [`crate::server::ClientManager`] treats an address change as
-/// "the device moved, reconnect" — without sorting here first, that logic
-/// was observed thrashing (reconnecting in a loop) against a service whose
-/// address set never actually changed, purely from `HashSet` iteration-order
-/// noise between resolutions.
+/// Build a WebSocket URL from a resolved client service, or `None` if it has
+/// no usable address or well-formed `path` TXT property. Addresses are sorted
+/// before selection: the resolver returns them unordered, and [`ClientBrowser`]
+/// callers treat an address change as "device moved, reconnect", so a stable
+/// choice avoids reconnect thrashing on multi-homed hosts.
 fn resolve_client_url(info: &ResolvedService) -> Option<String> {
     let mut addrs: Vec<_> = info
         .get_addresses_v4()

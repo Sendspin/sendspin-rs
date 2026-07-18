@@ -1,8 +1,5 @@
-// ABOUTME: Multi-client synchronized playback group — every member receives
-// ABOUTME: the identical audio bytes tagged with the identical timestamp, so
-// ABOUTME: each client's own independent clock-sync offset is all that's
-// ABOUTME: needed for sample-accurate multi-room sync (v1-scoped equivalent
-// ABOUTME: of aiosendspin's SendspinGroup + PushStream).
+// ABOUTME: Multi-client synchronized playback group
+// ABOUTME: Every member receives identical audio bytes with identical timestamps, so each client's clock-sync offset alone yields sample-accurate multi-room sync
 
 use crate::error::Error;
 use crate::protocol::messages::{PlayerCommand, StreamPlayerConfig};
