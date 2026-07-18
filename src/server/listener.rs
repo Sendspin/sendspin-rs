@@ -2,6 +2,7 @@
 // ABOUTME: state machine (client/hello -> server/hello) on every peer that connects.
 
 use crate::error::Error;
+use crate::protocol::messages::ConnectionReason;
 use crate::server::connection::ServerConnection;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use std::net::SocketAddr;
@@ -137,10 +138,13 @@ impl ServerListener {
 
     async fn handshake_and_drive(&self, tcp_stream: TcpStream) -> Result<ServerConnection, Error> {
         let ws = self.handshake_ws(tcp_stream).await?;
+        // Inbound: the client initiated the connection, so the server is
+        // simply present/available — announce Discovery rather than Playback.
         ServerConnection::drive(
             ws,
             &self.server_id,
             &self.server_name,
+            ConnectionReason::Discovery,
             Arc::clone(&self.clock),
         )
         .await

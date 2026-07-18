@@ -24,7 +24,7 @@ mod manager;
 pub use binary::encode_audio_frame;
 pub use connection::{ServerConnection, ServerConnectionGuard, ServerSender};
 pub use dial::dial_client;
-pub use discovery::{Advertisement, ClientBrowser};
+pub use discovery::{Advertisement, ClientBrowser, Discovered};
 pub use group::{Group, DEFAULT_SEND_AHEAD_US};
 pub use listener::ServerListener;
 pub use manager::{ClientEvent, ClientManager};

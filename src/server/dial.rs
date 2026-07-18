@@ -3,6 +3,7 @@
 // ABOUTME: themselves) — discovered via discovery::ClientBrowser, dialed here.
 
 use crate::error::Error;
+use crate::protocol::messages::ConnectionReason;
 use crate::server::connection::ServerConnection;
 use crate::sync::raw_clock::Clock;
 use std::sync::Arc;
@@ -28,5 +29,13 @@ pub async fn dial_client(
     let (ws, _response) = connect_async(url)
         .await
         .map_err(|e| Error::Connection(format!("dial to {url} failed: {e}")))?;
-    ServerConnection::drive(ws, server_id, server_name, clock).await
+    // The server dialed out to stream to this client, so announce Playback.
+    ServerConnection::drive(
+        ws,
+        server_id,
+        server_name,
+        ConnectionReason::Playback,
+        clock,
+    )
+    .await
 }

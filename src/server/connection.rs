@@ -281,6 +281,7 @@ impl ServerConnection {
         ws_stream: WebSocketStream<S>,
         server_id: &str,
         server_name: &str,
+        connection_reason: ConnectionReason,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, Error>
     where
@@ -340,7 +341,7 @@ impl ServerConnection {
             name: server_name.to_string(),
             version: 1,
             active_roles: active_roles.clone(),
-            connection_reason: ConnectionReason::Discovery,
+            connection_reason,
         });
         let json =
             serde_json::to_string(&server_hello).map_err(|e| Error::Protocol(e.to_string()))?;
