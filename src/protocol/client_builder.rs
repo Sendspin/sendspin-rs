@@ -50,6 +50,12 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             Some(PlayerV1Support {
                 supported_formats: vec![
                     AudioFormatSpec {
+                        codec: "opus".to_string(),
+                        channels: 2,
+                        sample_rate: 48000,
+                        bit_depth: 16,
+                    },
+                    AudioFormatSpec {
                         codec: "pcm".to_string(),
                         channels: 2,
                         sample_rate: 48000,

@@ -2,8 +2,8 @@
 // ABOUTME: Connects to server, receives audio, and plays it back
 
 use base64::prelude::*;
-use clap::Parser;
-use sendspin::audio::decode::{Decoder, FlacDecoder, PcmDecoder, PcmEndian};
+use clap::{Parser, ValueEnum};
+use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
     AudioFormatSpec, Message, PlayerCommand, PlayerCommandType, PlayerFormatRequest, PlayerState,
@@ -108,6 +108,13 @@ fn env_bool(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum CodecChoice {
+    Pcm,
+    Opus,
+    Flac,
+}
+
 /// Sendspin audio player
 #[derive(Parser, Debug)]
 #[command(name = "player")]
@@ -124,6 +131,10 @@ struct Args {
     /// Player ID (optional, generates random UUID if not provided)
     #[arg(short = 'i', long = "id")]
     id: Option<String>,
+
+    /// Restrict negotiation to one codec (pcm, opus, or flac)
+    #[arg(long, value_enum)]
+    codec: Option<CodecChoice>,
 
     /// List all available audio output devices and exit
     #[arg(long = "list-audio-devices")]
@@ -169,11 +180,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let required_lead_time_ms = 500;
     let min_buffer_ms = 500;
 
-    // Advertise FLAC ahead of PCM so servers that support it send the
-    // bandwidth-friendly lossless stream; PCM remains the fallback.
-    let supported_formats = [("flac", 24), ("flac", 16), ("pcm", 24), ("pcm", 16)]
-        .into_iter()
-        .map(|(codec, bit_depth)| AudioFormatSpec {
+    // Advertise all supported codecs by default, preferring FLAC, then Opus,
+    // then PCM. The --codec flag restricts negotiation when a specific decoder
+    // needs exercising.
+    let formats: &[(&str, u8)] = match args.codec {
+        Some(CodecChoice::Pcm) => &[("pcm", 24), ("pcm", 16)],
+        Some(CodecChoice::Opus) => &[("opus", 16)],
+        Some(CodecChoice::Flac) => &[("flac", 24), ("flac", 16)],
+        None => &[
+            ("flac", 24),
+            ("flac", 16),
+            ("opus", 16),
+            ("pcm", 24),
+            ("pcm", 16),
+        ],
+    };
+    let supported_formats = formats
+        .iter()
+        .map(|&(codec, bit_depth)| AudioFormatSpec {
             codec: codec.to_string(),
             channels: 2,
             sample_rate: 48000,
@@ -280,9 +304,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Validate codec before proceeding
                             let codec = match player_config.codec.as_str() {
                                 "pcm" => Codec::Pcm,
+                                "opus" => Codec::Opus,
                                 "flac" => Codec::Flac,
                                 other => {
-                                    eprintln!("ERROR: Unsupported codec '{}' - only 'pcm' and 'flac' are supported!", other);
+                                    eprintln!("ERROR: Unsupported codec '{}' - only 'pcm', 'opus', and 'flac' are supported!", other);
                                     eprintln!("Server is sending compressed audio that we can't decode!");
                                     continue;
                                 }
@@ -310,6 +335,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // PCM decoder is created on the first chunk,
                                 // after endianness is locked in.
                                 Codec::Pcm => None,
+                                Codec::Opus => match OpusDecoder::new(
+                                    player_config.sample_rate,
+                                    player_config.channels,
+                                ) {
+                                    Ok(opus) => Some(Box::new(opus)),
+                                    Err(e) => {
+                                        eprintln!("ERROR: Invalid Opus stream format: {}", e);
+                                        continue;
+                                    }
+                                },
                                 Codec::Flac => {
                                     let flac = match codec_header.as_deref() {
                                         Some(header) => match FlacDecoder::with_header(header) {
@@ -323,8 +358,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     };
                                     Some(Box::new(flac))
                                 }
-                                // `codec` was narrowed to Pcm/Flac when parsing
-                                // player_config.codec above.
+                                // `codec` was narrowed to Pcm/Opus/Flac when
+                                // parsing player_config.codec above.
                                 _ => unreachable!(),
                             };
 
