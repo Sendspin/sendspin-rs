@@ -211,3 +211,38 @@ fn test_controller_role_not_present_by_default() {
         .supported_roles()
         .contains(&"controller@v1".to_string()));
 }
+
+#[test]
+fn test_color_role_added_to_supported_roles() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .color()
+        .build();
+
+    assert_eq!(builder.supported_roles(), &["color@v1"]);
+    assert!(builder.player_v1_support().is_none());
+}
+
+#[test]
+fn test_color_role_not_present_by_default() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .build();
+
+    assert!(!builder.supported_roles().contains(&"color@v1".to_string()));
+}
+
+#[test]
+fn test_color_role_combines_with_other_roles() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("test".to_string())
+        .name("Test Client".to_string())
+        .metadata()
+        .color()
+        .build();
+
+    assert_eq!(builder.supported_roles(), &["metadata@v1", "color@v1"]);
+    assert!(builder.player_v1_support().is_none());
+}

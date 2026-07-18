@@ -1,11 +1,11 @@
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
-    ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
-    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest, PlayerState,
-    PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig, SpectrumScale,
-    StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig, VisualizerDataType,
-    VisualizerFormatRequest, VisualizerV1Support,
+    ColorState, ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo,
+    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest,
+    PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig,
+    SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig,
+    VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
 };
 
 // =============================================================================
@@ -406,6 +406,136 @@ fn test_server_state_controller_seek_max_ms_absent_is_none() {
         }
         _ => panic!("Expected ServerState"),
     }
+}
+
+#[test]
+fn test_server_state_color_deserialization() {
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "color": {
+                "timestamp": 1234567890,
+                "background_dark": [18, 24, 32],
+                "background_light": [240, 244, 248],
+                "primary": [200, 60, 40],
+                "accent": [40, 120, 200],
+                "on_dark": [235, 235, 235],
+                "on_light": [30, 30, 30]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let color = state.color.expect("Expected color state");
+            assert_eq!(color.timestamp, 1_234_567_890);
+            assert_eq!(color.background_dark, Some([18, 24, 32]));
+            assert_eq!(color.background_light, Some([240, 244, 248]));
+            assert_eq!(color.primary, Some([200, 60, 40]));
+            assert_eq!(color.accent, Some([40, 120, 200]));
+            assert_eq!(color.on_dark, Some([235, 235, 235]));
+            assert_eq!(color.on_light, Some([30, 30, 30]));
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_server_state_color_sparse_fields_are_none() {
+    // The server sends only the palette entries it has; all color fields
+    // besides timestamp are optional.
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "color": {
+                "timestamp": 1234567890,
+                "primary": [200, 60, 40]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            let color = state.color.expect("Expected color state");
+            assert_eq!(color.primary, Some([200, 60, 40]));
+            assert_eq!(color.background_dark, None);
+            assert_eq!(color.background_light, None);
+            assert_eq!(color.accent, None);
+            assert_eq!(color.on_dark, None);
+            assert_eq!(color.on_light, None);
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_server_state_color_null_clears_role_state() {
+    // A whole role object set to null clears all of that role's state; it
+    // must at minimum deserialize without error.
+    let json = r#"{
+        "type": "server/state",
+        "payload": {
+            "color": null
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    match message {
+        Message::ServerState(state) => {
+            assert!(state.color.is_none());
+        }
+        _ => panic!("Expected ServerState"),
+    }
+}
+
+#[test]
+fn test_color_state_serialization_skips_absent_fields() {
+    let color = ColorState {
+        timestamp: 42,
+        background_dark: Some([0, 0, 0]),
+        background_light: None,
+        primary: None,
+        accent: None,
+        on_dark: None,
+        on_light: None,
+    };
+
+    let json = serde_json::to_string(&color).unwrap();
+
+    assert!(json.contains("\"timestamp\":42"));
+    assert!(json.contains("\"background_dark\":[0,0,0]"));
+    assert!(!json.contains("background_light"));
+    assert!(!json.contains("primary"));
+    assert!(!json.contains("accent"));
+    assert!(!json.contains("on_dark"));
+    assert!(!json.contains("on_light"));
+}
+
+#[test]
+fn test_color_component_out_of_range_rejected() {
+    // RGB components are 0-255; 256 does not fit in a u8.
+    let json = r#"{
+        "timestamp": 42,
+        "primary": [256, 0, 0]
+    }"#;
+
+    assert!(serde_json::from_str::<ColorState>(json).is_err());
+}
+
+#[test]
+fn test_color_wrong_component_count_rejected() {
+    // Colors are exactly [R, G, B].
+    let json = r#"{
+        "timestamp": 42,
+        "primary": [10, 20]
+    }"#;
+
+    assert!(serde_json::from_str::<ColorState>(json).is_err());
 }
 
 // =============================================================================

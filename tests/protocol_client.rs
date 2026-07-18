@@ -1298,6 +1298,7 @@ async fn test_message_router_forwards_text_messages() {
         sendspin::protocol::messages::ServerState {
             metadata: None,
             controller: None,
+            color: None,
         },
     ))
     .unwrap();

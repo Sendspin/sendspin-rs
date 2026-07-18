@@ -31,6 +31,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     initial_player_state: Option<PlayerState>,
     metadata: bool,
     controller: bool,
+    color: bool,
 }
 
 impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
@@ -41,7 +42,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             || raw.artwork_v1_support.is_some()
             || raw.visualizer_v1_support.is_some()
             || raw.metadata
-            || raw.controller;
+            || raw.controller
+            || raw.color;
 
         // Default to player@v1 if no roles were explicitly configured
         let player_v1_support = if has_explicit_role {
@@ -87,6 +89,9 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
         if raw.controller {
             supported_roles.push("controller@v1".to_string());
+        }
+        if raw.color {
+            supported_roles.push("color@v1".to_string());
         }
 
         ProtocolClientBuilder {
@@ -137,6 +142,8 @@ pub struct ProtocolClientBuilderFields {
     metadata: bool,
     #[builder(default = false, setter(transform = || true))]
     controller: bool,
+    #[builder(default = false, setter(transform = || true))]
+    color: bool,
 }
 
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
@@ -155,6 +162,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             initial_player_state: fields.initial_player_state,
             metadata: fields.metadata,
             controller: fields.controller,
+            color: fields.color,
         };
         raw.into()
     }
