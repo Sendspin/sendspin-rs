@@ -375,6 +375,51 @@ pub struct ServerState {
     /// Controller state (supported commands, volume, etc.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controller: Option<ControllerState>,
+    /// Color state (colors derived from the current audio)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<ColorState>,
+}
+
+/// An RGB color as `[R, G, B]` with components 0-255.
+pub type Rgb = [u8; 3];
+
+/// Color state from server (color role).
+///
+/// Colors may be extracted from album artwork, provided by the music source,
+/// or manually programmed by the server. All color fields are optional; the
+/// server sends only the palette entries it has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorState {
+    /// Server clock time in microseconds for when these colors are valid
+    pub timestamp: i64,
+    /// Background color suitable for dark mode. The server ensures a minimum
+    /// WCAG contrast ratio of 4.5:1 with white text and with `on_dark`
+    /// (if also present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_dark: Option<Rgb>,
+    /// Background color suitable for light mode. The server ensures a minimum
+    /// WCAG contrast ratio of 4.5:1 with black text and with `on_light`
+    /// (if also present).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background_light: Option<Rgb>,
+    /// The dominant color. Not adjusted for contrast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<Rgb>,
+    /// A secondary or complementary color. Not adjusted for contrast.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accent: Option<Rgb>,
+    /// A light color suitable for use on dark backgrounds. The server ensures
+    /// a minimum WCAG contrast ratio of 4.5:1 with `background_dark` (if also
+    /// present) and with black text, so it can also serve as an alternative
+    /// light background.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_dark: Option<Rgb>,
+    /// A dark color suitable for use on light backgrounds. The server ensures
+    /// a minimum WCAG contrast ratio of 4.5:1 with `background_light` (if also
+    /// present) and with white text, so it can also serve as an alternative
+    /// dark background.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_light: Option<Rgb>,
 }
 
 /// Metadata state from server
