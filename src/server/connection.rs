@@ -12,15 +12,34 @@ use futures_util::{
     stream::{SplitSink, SplitStream},
     SinkExt, StreamExt,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio_tungstenite::{tungstenite::Message as WsMessage, WebSocketStream};
+use tokio_tungstenite::{
+    tungstenite::{Bytes, Message as WsMessage},
+    WebSocketStream,
+};
 
 /// The only role this server negotiates in v1. See the crate-level server
 /// docs for the list of roles deferred for a later contribution
 /// (color/visualizer/artwork/controller/metadata).
 const PLAYER_ROLE: &str = "player@v1";
+
+/// Maximum audio frames a single connection may have queued but not yet
+/// written before [`ServerSender::enqueue_audio`] starts dropping frames. This
+/// bounds memory for a slow or stalled member so it can't back up the whole
+/// process — its own audio suffers, nobody else's does.
+const MAX_QUEUED_AUDIO_FRAMES: usize = 32;
+
+/// Outcome of a non-blocking [`ServerSender::enqueue_audio`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioEnqueue {
+    /// The frame was queued for the writer task.
+    Sent,
+    /// The connection's audio backlog was at capacity; the frame was dropped.
+    Evicted,
+}
 
 enum WriteCommand {
     Send {
@@ -39,6 +58,13 @@ enum WriteCommand {
     },
     Close {
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    },
+    /// Fire-and-forget audio frame — no ack, so broadcasting to a group never
+    /// blocks on any member's socket write. `queued` is decremented once the
+    /// frame leaves the sink, so the sender can bound the backlog.
+    Audio {
+        frame: Bytes,
+        queued: Arc<AtomicUsize>,
     },
 }
 
@@ -94,18 +120,53 @@ async fn writer_task<S>(
                 let _ = ack.send(result);
                 break;
             }
+            WriteCommand::Audio { frame, queued } => {
+                let result = sink.send(WsMessage::Binary(frame)).await;
+                queued.fetch_sub(1, Ordering::Relaxed);
+                if result.is_err() {
+                    break;
+                }
+            }
         }
     }
     log::debug!("Server connection writer task exiting");
 }
 
-/// Sender half of a server-role connection. Cheap to clone.
+/// Sender half of a server-role connection. Cheap to clone; all clones share
+/// the same underlying connection and audio backlog counter.
 #[derive(Debug, Clone)]
 pub struct ServerSender {
     tx: UnboundedSender<WriteCommand>,
+    audio_queued: Arc<AtomicUsize>,
 }
 
 impl ServerSender {
+    /// Enqueue one pre-encoded audio frame without waiting for it to reach the
+    /// wire — a group broadcast calls this on every member, so it must never
+    /// block on any one member's socket. `frame` is a [`Bytes`], so fanning the
+    /// same frame out to N members is N cheap refcount clones, not N copies.
+    ///
+    /// Returns [`AudioEnqueue::Evicted`] if this connection's audio backlog is
+    /// already full (a slow/stalled member), dropping the frame rather than
+    /// growing memory without bound. `Err` means the writer task is gone (the
+    /// member is dead) and the caller should stop broadcasting to it.
+    pub fn enqueue_audio(&self, frame: Bytes) -> Result<AudioEnqueue, Error> {
+        if self.audio_queued.load(Ordering::Relaxed) >= MAX_QUEUED_AUDIO_FRAMES {
+            return Ok(AudioEnqueue::Evicted);
+        }
+        self.audio_queued.fetch_add(1, Ordering::Relaxed);
+        match self.tx.send(WriteCommand::Audio {
+            frame,
+            queued: Arc::clone(&self.audio_queued),
+        }) {
+            Ok(()) => Ok(AudioEnqueue::Sent),
+            Err(_) => {
+                self.audio_queued.fetch_sub(1, Ordering::Relaxed);
+                Err(Error::WebSocket("connection closed".to_string()))
+            }
+        }
+    }
+
     async fn send_message(&self, msg: Message) -> Result<(), Error> {
         let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending message: {}", json);
@@ -360,13 +421,20 @@ impl ServerConnection {
             Self::message_router(read, message_tx, out_tx_router, clock).await;
         });
 
+        let audio_queued = Arc::new(AtomicUsize::new(0));
         Ok(Self {
             hello,
             active_roles,
             messages: message_rx,
-            sender: ServerSender { tx: out_tx.clone() },
+            sender: ServerSender {
+                tx: out_tx.clone(),
+                audio_queued: Arc::clone(&audio_queued),
+            },
             guard: ServerConnectionGuard {
-                sender: ServerSender { tx: out_tx },
+                sender: ServerSender {
+                    tx: out_tx,
+                    audio_queued,
+                },
                 router_handle: Some(router_handle),
                 writer_handle: Some(writer_handle),
             },

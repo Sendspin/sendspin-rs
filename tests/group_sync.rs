@@ -69,7 +69,7 @@ async fn two_members_receive_identical_timestamped_audio() {
         .unwrap()
         .unwrap();
 
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -89,7 +89,7 @@ async fn two_members_receive_identical_timestamped_audio() {
             codec_header: None,
         })
         .await;
-    let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]).await;
+    let sent_timestamp = group.push_audio(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
     let mut read_a = peer_a.await.unwrap();
     let mut read_b = peer_b.await.unwrap();
@@ -140,7 +140,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
         .await
         .unwrap()
         .unwrap();
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -156,7 +156,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
         })
         .await;
     // Sent before the late joiner exists — it must never see this.
-    group.push_audio(&[0xAA; 8]).await;
+    group.push_audio(&[0xAA; 8]);
 
     let mut read_a = peer_a.await.unwrap();
     assert!(matches!(
@@ -212,7 +212,7 @@ async fn a_late_joiner_gets_current_stream_start_and_only_subsequent_audio() {
 
     // The next push reaches both members with the identical timestamp/bytes
     // — the late joiner is synchronized with the one that was already there.
-    let sent_timestamp = group.push_audio(&[0xBB; 8]).await;
+    let sent_timestamp = group.push_audio(&[0xBB; 8]);
 
     let frame_a = match read_a.next().await.expect("no second chunk for A").unwrap() {
         WsMessage::Binary(b) => b,
@@ -267,7 +267,7 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
         .unwrap()
         .unwrap();
 
-    let mut group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
+    let group = Group::new(std::sync::Arc::new(sendspin::DefaultClock::default()));
     group
         .add_member(conn_a.client_id().to_string(), conn_a.sender())
         .await
@@ -295,8 +295,8 @@ async fn a_dead_member_is_pruned_without_blocking_the_survivor() {
         .await;
 
     assert_eq!(
-        group.member_ids().collect::<Vec<_>>(),
-        vec!["member-b"],
+        group.member_ids(),
+        vec!["member-b".to_string()],
         "member-a's failed send must have pruned it from the group"
     );
 

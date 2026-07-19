@@ -3,19 +3,20 @@
 
 use crate::error::Error;
 use crate::protocol::messages::{PlayerCommand, StreamPlayerConfig};
-use crate::server::connection::ServerSender;
+use crate::server::binary::encode_audio_frame;
+use crate::server::connection::{AudioEnqueue, ServerSender};
 use crate::sync::raw_clock::Clock;
 use futures_util::future::join_all;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio_tungstenite::tungstenite::Bytes;
 
-/// How far ahead of "now" (in this group's clock domain) each audio chunk's
-/// timestamp is scheduled, by default. Must comfortably exceed a client's own
-/// startup buffering latency, or it'll receive chunks whose intended playback
-/// time has already passed. v1 uses one fixed lead time for the whole group
-/// rather than negotiating per-client (see [`Group::with_send_ahead_us`]) —
-/// aiosendspin negotiates this from each client's `required_lead_time_ms`;
-/// deferred here along with per-client format negotiation.
+/// How far ahead of "now" (in this group's clock domain) the audio timeline is
+/// anchored, by default. Must comfortably exceed a client's own startup
+/// buffering latency, or it'll receive chunks whose intended playback time has
+/// already passed. v1 uses one fixed lead time for the whole group rather than
+/// negotiating per-client (see [`Group::with_send_ahead_us`]); per-client lead
+/// negotiation is deferred along with per-client format negotiation.
 pub const DEFAULT_SEND_AHEAD_US: i64 = 250_000;
 
 /// A synchronized playback group.
@@ -37,8 +38,27 @@ pub const DEFAULT_SEND_AHEAD_US: i64 = 250_000;
 pub struct Group {
     clock: Arc<dyn Clock>,
     send_ahead_us: i64,
+    state: Mutex<State>,
+}
+
+/// Mutable group state behind a single lock, so `Group`'s methods take `&self`
+/// and a slow member can never block membership changes or another member.
+struct State {
     members: HashMap<String, ServerSender>,
     stream_config: Option<StreamPlayerConfig>,
+    /// Timestamp (this group's clock domain) to stamp on the next pushed chunk.
+    /// `None` until the first push after a start/clear (re)anchors the timeline.
+    next_ts_us: Option<i64>,
+    /// Carry for the sub-microsecond part of a chunk's duration (numerator over
+    /// the sample rate), so advancing the timeline doesn't accumulate drift.
+    residue: i64,
+}
+
+impl State {
+    fn reset_timeline(&mut self) {
+        self.next_ts_us = None;
+        self.residue = 0;
+    }
 }
 
 impl Group {
@@ -50,8 +70,12 @@ impl Group {
         Self {
             clock,
             send_ahead_us: DEFAULT_SEND_AHEAD_US,
-            members: HashMap::new(),
-            stream_config: None,
+            state: Mutex::new(State {
+                members: HashMap::new(),
+                stream_config: None,
+                next_ts_us: None,
+                residue: 0,
+            }),
         }
     }
 
@@ -62,18 +86,18 @@ impl Group {
     }
 
     /// Client IDs of every current member.
-    pub fn member_ids(&self) -> impl Iterator<Item = &str> {
-        self.members.keys().map(String::as_str)
+    pub fn member_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().members.keys().cloned().collect()
     }
 
     /// Number of current members.
     pub fn len(&self) -> usize {
-        self.members.len()
+        self.state.lock().unwrap().members.len()
     }
 
     /// Whether the group has no members.
     pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
+        self.state.lock().unwrap().members.is_empty()
     }
 
     /// Add a member. If a stream is already active for this group, starts
@@ -81,86 +105,155 @@ impl Group {
     /// format) — but does not replay any audio already delivered to
     /// existing members (no late-join catch-up in v1, see the type docs).
     pub async fn add_member(
-        &mut self,
+        &self,
         client_id: impl Into<String>,
         sender: ServerSender,
     ) -> Result<(), Error> {
-        if let Some(cfg) = self.stream_config.clone() {
+        let config = self.state.lock().unwrap().stream_config.clone();
+        if let Some(cfg) = config {
             sender.send_stream_start(cfg).await?;
         }
-        self.members.insert(client_id.into(), sender);
+        self.state
+            .lock()
+            .unwrap()
+            .members
+            .insert(client_id.into(), sender);
         Ok(())
     }
 
     /// Remove a member, if present. The caller is responsible for actually
     /// disconnecting it (e.g. via [`crate::server::ServerConnection::disconnect`]) —
     /// this only stops future broadcasts from reaching it.
-    pub fn remove_member(&mut self, client_id: &str) -> Option<ServerSender> {
-        self.members.remove(client_id)
+    pub fn remove_member(&self, client_id: &str) -> Option<ServerSender> {
+        self.state.lock().unwrap().members.remove(client_id)
     }
 
     /// Start (or restart, e.g. after a format change) the shared stream for
-    /// every current member.
-    pub async fn start_stream(&mut self, config: StreamPlayerConfig) {
-        self.stream_config = Some(config.clone());
-        self.broadcast_and_prune(|sender| {
+    /// every current member, and re-anchor the audio timeline.
+    pub async fn start_stream(&self, config: StreamPlayerConfig) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.stream_config = Some(config.clone());
+            state.reset_timeline();
+        }
+        self.broadcast_control(|sender| {
             let config = config.clone();
             async move { sender.send_stream_start(config).await }
         })
         .await;
     }
 
-    /// Push one PCM chunk to every member with a single, shared timestamp —
-    /// `now + send_ahead_us` in this group's clock domain — computed once so
-    /// every member gets the identical value. Returns that timestamp.
-    pub async fn push_audio(&mut self, pcm: &[u8]) -> i64 {
-        let timestamp_us = self.clock.now_micros() + self.send_ahead_us;
-        self.broadcast_and_prune(|sender| {
-            let pcm = pcm.to_vec();
-            async move { sender.send_audio_chunk(timestamp_us, &pcm).await }
-        })
-        .await;
-        timestamp_us
+    /// Push one PCM chunk to every member, stamped with a single shared
+    /// timestamp so every member schedules it at the same instant. Returns
+    /// that timestamp.
+    ///
+    /// The timestamp comes from an anchored timeline rather than
+    /// `now + lead` per call, so pushing faster or slower than real time
+    /// doesn't shift playback: the first push after a start/clear anchors at
+    /// `now + send_ahead_us`, and each push advances the timeline by the
+    /// chunk's own duration (derived from the stream format). If pushes fall
+    /// behind — the timeline would schedule a chunk too close to now — it
+    /// re-anchors forward. Enqueue is non-blocking, so one slow member never
+    /// delays the others; a member whose connection has died is pruned.
+    pub fn push_audio(&self, pcm: &[u8]) -> i64 {
+        let mut state = self.state.lock().unwrap();
+        let now = self.clock.now_micros();
+
+        // Anchor on the first push, or re-anchor if the timeline has fallen too
+        // close to (or behind) now — otherwise chunks would be scheduled in the
+        // past. Half the lead is the low-water mark, giving hysteresis so steady
+        // real-time pacing doesn't re-anchor every push.
+        let ts = match state.next_ts_us {
+            Some(t) if t >= now + self.send_ahead_us / 2 => t,
+            _ => now + self.send_ahead_us,
+        };
+
+        // Advance the timeline by this chunk's exact duration, carrying the
+        // fractional-microsecond remainder so it doesn't drift.
+        let advanced = match &state.stream_config {
+            Some(cfg) => {
+                let bytes_per_sample = (cfg.channels as usize) * (cfg.bit_depth as usize / 8);
+                if bytes_per_sample > 0 && cfg.sample_rate > 0 {
+                    let samples = (pcm.len() / bytes_per_sample) as i64;
+                    let total = samples * 1_000_000 + state.residue;
+                    let rate = cfg.sample_rate as i64;
+                    state.residue = total % rate;
+                    Some(ts + total / rate)
+                } else {
+                    Some(ts)
+                }
+            }
+            None => Some(ts),
+        };
+        state.next_ts_us = advanced;
+
+        // Encode once; fan the same frame out to every member as cheap refcount
+        // clones. Prune members whose connection has died.
+        let frame: Bytes = encode_audio_frame(ts, pcm).into();
+        let mut dead = Vec::new();
+        for (id, sender) in state.members.iter() {
+            match sender.enqueue_audio(frame.clone()) {
+                Ok(AudioEnqueue::Sent) => {}
+                Ok(AudioEnqueue::Evicted) => {
+                    log::trace!("group member {id} audio backlog full, dropping chunk")
+                }
+                Err(_) => dead.push(id.clone()),
+            }
+        }
+        for id in dead {
+            log::warn!("dropping dead group member {id}");
+            state.members.remove(&id);
+        }
+        ts
     }
 
     /// Broadcast a player command (volume, mute, static delay) to every
     /// member.
-    pub async fn send_player_command(&mut self, command: PlayerCommand) {
-        self.broadcast_and_prune(|sender| {
+    pub async fn send_player_command(&self, command: PlayerCommand) {
+        self.broadcast_control(|sender| {
             let command = command.clone();
             async move { sender.send_player_command(command).await }
         })
         .await;
     }
 
-    /// End the shared stream for every current member.
-    pub async fn end_stream(&mut self) {
-        self.stream_config = None;
-        self.broadcast_and_prune(|sender| async move { sender.send_stream_end().await })
+    /// End the shared stream for every current member and reset the timeline.
+    pub async fn end_stream(&self) {
+        {
+            let mut state = self.state.lock().unwrap();
+            state.stream_config = None;
+            state.reset_timeline();
+        }
+        self.broadcast_control(|sender| async move { sender.send_stream_end().await })
             .await;
     }
 
-    /// Run `f` concurrently against every member — a slow member never
-    /// blocks delivery to the others — then drop any member `f` failed
-    /// against. A failed send means the connection's writer task is gone
-    /// (its channel is closed), which is permanent: there is nothing to
-    /// retry, so silently keeping a dead member around would just mean every
-    /// future broadcast pays for its failure again.
-    async fn broadcast_and_prune<F, Fut>(&mut self, f: F)
+    /// Run an awaiting control send `f` concurrently against every member — a
+    /// slow member never blocks delivery to the others — then drop any member
+    /// `f` failed against (its writer task is gone; the failure is permanent).
+    async fn broadcast_control<F, Fut>(&self, f: F)
     where
         F: Fn(ServerSender) -> Fut,
         Fut: std::future::Future<Output = Result<(), Error>>,
     {
-        let futures = self.members.iter().map(|(id, sender)| {
-            let fut = f(sender.clone());
-            let id = id.clone();
+        let members: Vec<(String, ServerSender)> = {
+            let state = self.state.lock().unwrap();
+            state
+                .members
+                .iter()
+                .map(|(id, sender)| (id.clone(), sender.clone()))
+                .collect()
+        };
+        let results = join_all(members.into_iter().map(|(id, sender)| {
+            let fut = f(sender);
             async move { (id, fut.await) }
-        });
-        let results = join_all(futures).await;
+        }))
+        .await;
+        let mut state = self.state.lock().unwrap();
         for (id, result) in results {
             if let Err(e) = result {
-                log::warn!("Dropping group member {id}: {e}");
-                self.members.remove(&id);
+                log::warn!("dropping group member {id}: {e}");
+                state.members.remove(&id);
             }
         }
     }
@@ -176,6 +269,6 @@ mod tests {
         let group = Group::new(Arc::new(DefaultClock::default()));
         assert!(group.is_empty());
         assert_eq!(group.len(), 0);
-        assert_eq!(group.member_ids().count(), 0);
+        assert_eq!(group.member_ids().len(), 0);
     }
 }
