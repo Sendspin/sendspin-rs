@@ -10,6 +10,7 @@ pub mod pool;
 /// Sync correction planner for drop/insert cadence
 pub mod sync_correction;
 /// Synced playback helper using output timestamps
+#[cfg(feature = "std")]
 pub mod synced_player;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
@@ -17,5 +18,6 @@ pub mod types;
 pub use gain::GainControl;
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
+#[cfg(feature = "std")]
 pub use synced_player::{ProcessCallback, SyncedPlayer, SyncedPlayerConfig};
 pub use types::{AudioBuffer, AudioFormat, Codec};

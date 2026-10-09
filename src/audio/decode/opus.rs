@@ -3,8 +3,12 @@
 
 use crate::audio::decode::Decoder;
 use crate::error::Error;
-use parking_lot::Mutex;
-use std::sync::Arc;
+use crate::sync_primitives::Mutex;
+use alloc::format;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
 /// Stateful Opus decoder for raw Sendspin Opus packets.
 ///
@@ -101,7 +105,7 @@ impl Decoder for OpusDecoder {
 
         let samples = output
             .into_iter()
-            .map(|sample| (sample.clamp(-1.0, 1.0) * i32::MAX as f32).round() as i32)
+            .map(|sample| libm::roundf(sample.clamp(-1.0, 1.0) * i32::MAX as f32) as i32)
             .collect::<Vec<_>>();
         Ok(Arc::from(samples.into_boxed_slice()))
     }
@@ -111,7 +115,15 @@ impl Decoder for OpusDecoder {
 mod tests {
     use super::*;
 
+    // Without opus-rs's `heap` feature (enabled by `std`) the codec state is
+    // inline (~178 KB per decoder) and unoptimized test builds overflow the
+    // default 2 MB test-thread stack. Run with RUST_MIN_STACK=8388608 or
+    // --release to exercise these without `std`.
     #[test]
+    #[cfg_attr(
+        not(feature = "std"),
+        ignore = "opus-rs without `heap` overflows the debug test stack; use RUST_MIN_STACK=8388608"
+    )]
     fn decodes_opus_rs_packet() {
         let mut encoder =
             opus_rs::OpusEncoder::new(48_000, 2, opus_rs::Application::Audio).unwrap();
@@ -126,6 +138,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "std"),
+        ignore = "opus-rs without `heap` overflows the debug test stack; use RUST_MIN_STACK=8388608"
+    )]
     fn rejects_invalid_stream_parameters() {
         assert!(OpusDecoder::new(44_100, 2).is_err());
         assert!(OpusDecoder::new(48_000, 6).is_err());

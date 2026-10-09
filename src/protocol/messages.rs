@@ -1,6 +1,8 @@
 // ABOUTME: Protocol message type definitions and serialization
 // ABOUTME: Supports all Sendspin protocol messages per spec
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Top-level protocol message envelope

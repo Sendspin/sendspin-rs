@@ -14,6 +14,7 @@ pub(crate) fn should_log_sample(count: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::should_log_sample;
+    use alloc::vec::Vec;
 
     #[test]
     fn samples_first_few_ten_and_every_hundred() {
