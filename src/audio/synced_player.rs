@@ -366,6 +366,549 @@ const STARTUP_GENTLE_WINDOW: Duration = Duration::from_secs(20);
 /// Speed-correction cap during [`STARTUP_GENTLE_WINDOW`]: 0.5%, under 9 cents.
 const STARTUP_MAX_SPEED_CORRECTION: f64 = 0.005;
 
+/// Observe delay before planning each callback; call `start` when audio begins.
+/// Observations may precede playback, but startup deadlines begin at `start`.
+struct StartupCorrectionState {
+    planner: CorrectionPlanner,
+    startup_planner: CorrectionPlanner,
+    error_filter: SyncErrorFilter,
+    engage_gate: EngageGate,
+    delay_settle: OutputDelaySettle,
+    started_at: Option<Instant>,
+    /// Padding noise is one-sided: anchoring to a high sample bakes that error
+    /// into the timeline. Use the generation's floor, replaced on settling.
+    min_playback_delta_us: u64,
+}
+
+struct CorrectionDecision {
+    error_us: i64,
+    ungated: CorrectionSchedule,
+    gated: CorrectionSchedule,
+    schedule: CorrectionSchedule,
+    output_delay_transient: bool,
+    clock_warmup_suppressed: bool,
+}
+
+impl StartupCorrectionState {
+    fn new() -> Self {
+        Self {
+            planner: CorrectionPlanner::new(),
+            startup_planner: CorrectionPlanner::with_max_speed_correction(
+                STARTUP_MAX_SPEED_CORRECTION,
+            ),
+            error_filter: SyncErrorFilter::new(),
+            engage_gate: EngageGate::new(),
+            delay_settle: OutputDelaySettle::new(),
+            started_at: None,
+            min_playback_delta_us: u64::MAX,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn reset_measurements(&mut self) {
+        self.error_filter.reset();
+        self.engage_gate.reset();
+    }
+
+    fn start(&mut self, now: Instant) {
+        self.started_at = Some(now);
+    }
+
+    fn observe_output_delay(&mut self, now: Instant, delta_us: u64) -> Option<u64> {
+        self.min_playback_delta_us = self.min_playback_delta_us.min(delta_us);
+        let was_settled = self.delay_settle.is_settled();
+        self.delay_settle.update(now, delta_us);
+        let floor = self
+            .delay_settle
+            .settled_floor_us()
+            .filter(|_| !was_settled);
+        if let Some(floor) = floor {
+            // A stable interval replaces the transient floor and its error history.
+            self.min_playback_delta_us = floor;
+            self.reset_measurements();
+        }
+        floor
+    }
+
+    fn plan(
+        &mut self,
+        now: Instant,
+        raw_error_us: i64,
+        sample_rate: u32,
+        currently_correcting: bool,
+        clock_ready: bool,
+    ) -> CorrectionDecision {
+        let error_us = self.error_filter.update(raw_error_us);
+        let elapsed = self.started_at.map(|at| now.duration_since(at));
+        let planner = if elapsed.is_some_and(|age| age < STARTUP_GENTLE_WINDOW) {
+            &self.startup_planner
+        } else {
+            &self.planner
+        };
+        let ungated = planner.plan(error_us, sample_rate, currently_correcting);
+        let gated =
+            self.engage_gate
+                .admit(ungated, currently_correcting, self.error_filter.is_warm());
+        let output_delay_transient = !self.delay_settle.is_settled()
+            && elapsed.is_some_and(|age| age < OUTPUT_DELAY_SETTLE_MAX);
+        let clock_warmup_suppressed = !output_delay_transient && !clock_ready && !gated.reanchor;
+        let schedule = if output_delay_transient || clock_warmup_suppressed {
+            CorrectionSchedule::default()
+        } else {
+            gated
+        };
+        CorrectionDecision {
+            error_us,
+            ungated,
+            gated,
+            schedule,
+            output_delay_transient,
+            clock_warmup_suppressed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_correction_tests {
+    use super::*;
+
+    fn tick(
+        state: &mut StartupCorrectionState,
+        now: Instant,
+        delta_us: u64,
+        error_us: i64,
+        schedule: &mut CorrectionSchedule,
+        clock_ready: bool,
+    ) -> CorrectionDecision {
+        state.observe_output_delay(now, delta_us);
+        let decision = state.plan(now, error_us, 48_000, schedule.is_correcting(), clock_ready);
+        *schedule = decision.schedule;
+        decision
+    }
+
+    #[test]
+    fn cold_start_overshoot_plateau_relaxes_without_correction() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        let mut settled = false;
+        let mut saw_transient_gated_correction = false;
+        for ms in (0..=7000).step_by(10) {
+            let delta = match ms {
+                0..=499 => 30_000 + ms * 160,
+                500..=1499 => 110_000,
+                1500..=3999 => 110_000 - (ms - 1500) * 32,
+                _ => 30_000,
+            };
+            let decision = tick(
+                &mut state,
+                start + Duration::from_millis(ms),
+                delta,
+                delta as i64 - 30_000,
+                &mut schedule,
+                true,
+            );
+            assert!(!decision.schedule.is_correcting(), "at {ms}ms");
+            saw_transient_gated_correction |=
+                decision.output_delay_transient && decision.gated.is_correcting();
+            if ms < 4000 {
+                assert!(!state.delay_settle.is_settled(), "at {ms}ms");
+            }
+            settled |= state.delay_settle.is_settled();
+        }
+        assert!(settled);
+        assert!(saw_transient_gated_correction);
+        assert_eq!(state.min_playback_delta_us, 30_000);
+    }
+
+    #[test]
+    fn settling_discards_negative_transient_and_requires_fresh_evidence() {
+        for real_error in [0, 40_000, -40_000] {
+            let start = Instant::now();
+            let mut state = StartupCorrectionState::new();
+            state.start(start);
+            let mut schedule = CorrectionSchedule::default();
+            for ms in (0..2500).step_by(10) {
+                tick(
+                    &mut state,
+                    start + Duration::from_millis(ms),
+                    50_000,
+                    -200_000,
+                    &mut schedule,
+                    true,
+                );
+                assert!(!schedule.is_correcting());
+            }
+            assert!(state.engage_gate.pending_plans() > 0);
+            let settled_at = start + Duration::from_millis(2500);
+            assert_eq!(state.observe_output_delay(settled_at, 50_000), Some(50_000));
+            assert_eq!(state.engage_gate.pending_plans(), 0);
+            assert!(!state.error_filter.is_warm());
+            let first = state.plan(settled_at, real_error, 48_000, false, true);
+            assert_eq!(first.error_us, real_error);
+            assert!(!first.schedule.is_correcting());
+            let mut first_correction = None;
+            for callback in 2..=150 {
+                let decision = tick(
+                    &mut state,
+                    settled_at + Duration::from_millis(callback * 10),
+                    50_000,
+                    real_error,
+                    &mut schedule,
+                    true,
+                );
+                assert_eq!(decision.error_us, real_error);
+                if decision.schedule.is_correcting() {
+                    first_correction.get_or_insert(callback);
+                }
+            }
+            if real_error == 0 {
+                assert_eq!(first_correction, None);
+            } else {
+                assert_eq!(
+                    first_correction,
+                    Some(
+                        crate::audio::sync_correction::SYNC_ERROR_WINDOW
+                            .max(crate::audio::sync_correction::ENGAGE_STREAK_PLANS as usize,)
+                            as u64
+                    ),
+                );
+                assert_eq!(schedule.drop_every_n_frames > 0, real_error > 0);
+                assert_eq!(schedule.insert_every_n_frames > 0, real_error < 0);
+            }
+        }
+    }
+
+    #[test]
+    fn suppression_and_speed_cap_expire_at_exact_deadlines_or_late_callbacks() {
+        for late_ms in [0, 137] {
+            let start = Instant::now();
+            let mut state = StartupCorrectionState::new();
+            state.start(start);
+            let mut schedule = CorrectionSchedule::default();
+            for ms in (0..10_000).step_by(10) {
+                let decision = tick(
+                    &mut state,
+                    start + Duration::from_millis(ms),
+                    30_000 + ms * 20,
+                    100_000,
+                    &mut schedule,
+                    true,
+                );
+                assert!(decision.output_delay_transient);
+                assert!(!schedule.is_correcting());
+            }
+            let before = state.plan(
+                start + OUTPUT_DELAY_SETTLE_MAX - Duration::from_nanos(1),
+                100_000,
+                48_000,
+                false,
+                true,
+            );
+            assert!(before.output_delay_transient);
+            assert!(!before.schedule.is_correcting());
+            let deadline = tick(
+                &mut state,
+                start + OUTPUT_DELAY_SETTLE_MAX + Duration::from_millis(late_ms),
+                240_000,
+                100_000,
+                &mut schedule,
+                true,
+            );
+            assert!(!deadline.output_delay_transient);
+            assert_eq!(schedule.drop_every_n_frames, 200);
+            for ms in (10_150..20_000).step_by(10) {
+                let decision = tick(
+                    &mut state,
+                    start + Duration::from_millis(ms),
+                    250_000 + (ms - 10_150) * 20,
+                    100_000,
+                    &mut schedule,
+                    true,
+                );
+                assert!(!decision.output_delay_transient);
+                assert_eq!(schedule.drop_every_n_frames, 200);
+                assert!(!state.delay_settle.is_settled());
+            }
+            let before_cap = state.plan(
+                start + STARTUP_GENTLE_WINDOW - Duration::from_nanos(1),
+                100_000,
+                48_000,
+                true,
+                true,
+            );
+            assert_eq!(before_cap.schedule.drop_every_n_frames, 200);
+            tick(
+                &mut state,
+                start + STARTUP_GENTLE_WINDOW + Duration::from_millis(late_ms),
+                300_000,
+                100_000,
+                &mut schedule,
+                true,
+            );
+            assert_eq!(schedule.drop_every_n_frames, 25);
+        }
+    }
+
+    #[test]
+    fn generation_reset_restarts_floor_filter_gate_and_deadlines() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        for ms in (0..=4000).step_by(10) {
+            tick(
+                &mut state,
+                start + Duration::from_millis(ms),
+                10_000,
+                -100_000,
+                &mut schedule,
+                true,
+            );
+        }
+        assert!(state.delay_settle.is_settled());
+        assert!(schedule.is_correcting());
+        state.engage_gate.admit(
+            CorrectionSchedule {
+                drop_every_n_frames: 200,
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+        assert_eq!(state.engage_gate.pending_plans(), 1);
+        state.reset();
+        assert_eq!(state.engage_gate.pending_plans(), 0);
+        schedule = CorrectionSchedule::default();
+        assert_eq!(state.started_at, None);
+        assert_eq!(state.min_playback_delta_us, u64::MAX);
+        assert!(!state.delay_settle.is_settled());
+        assert!(!state.error_filter.is_warm());
+        let restart = start + Duration::from_secs(30);
+        state.start(restart);
+        let first = tick(&mut state, restart, 80_000, 100_000, &mut schedule, true);
+        assert_eq!(first.error_us, 100_000);
+        assert_eq!(first.gated, CorrectionSchedule::default());
+        assert!(first.output_delay_transient);
+        assert_eq!(state.min_playback_delta_us, 80_000);
+        for ms in (10..=4000).step_by(10) {
+            tick(
+                &mut state,
+                restart + Duration::from_millis(ms),
+                80_000,
+                100_000,
+                &mut schedule,
+                true,
+            );
+        }
+        assert_eq!(schedule.drop_every_n_frames, 200);
+    }
+
+    #[test]
+    fn measurement_reset_preserves_startup_timing_and_delay_floor() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        for ms in (0..=4000).step_by(10) {
+            tick(
+                &mut state,
+                start + Duration::from_millis(ms),
+                50_000,
+                100_000,
+                &mut schedule,
+                true,
+            );
+        }
+        assert!(schedule.is_correcting());
+        state.engage_gate.admit(
+            CorrectionSchedule {
+                drop_every_n_frames: 200,
+                ..Default::default()
+            },
+            false,
+            false,
+        );
+        assert_eq!(state.engage_gate.pending_plans(), 1);
+        state.reset_measurements();
+        assert_eq!(state.engage_gate.pending_plans(), 0);
+        assert_eq!(state.started_at, Some(start));
+        assert_eq!(state.min_playback_delta_us, 50_000);
+        assert!(state.delay_settle.is_settled());
+        assert!(!state.error_filter.is_warm());
+        let decision = state.plan(
+            start + Duration::from_secs(4),
+            -100_000,
+            48_000,
+            false,
+            true,
+        );
+        assert_eq!(decision.error_us, -100_000);
+        assert!(!decision.gated.is_correcting());
+    }
+
+    #[test]
+    fn settled_edges_replace_upward_floor_and_reset_measurements_only_once() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        assert_eq!(state.observe_output_delay(start, 5_000), None);
+        let mut transitions = Vec::new();
+        for ms in (10..=4000).step_by(10) {
+            if let Some(floor) =
+                state.observe_output_delay(start + Duration::from_millis(ms), 50_000)
+            {
+                transitions.push(floor);
+            }
+        }
+        assert_eq!(transitions, vec![50_000]);
+        assert_eq!(state.min_playback_delta_us, 50_000);
+        for callback in 1..=150 {
+            let now = start + Duration::from_millis(4000 + callback * 10);
+            assert_eq!(state.observe_output_delay(now, 50_000), None);
+            state.plan(now, -100_000, 48_000, false, true);
+        }
+        assert!(state.error_filter.is_warm());
+        assert!(state.engage_gate.pending_plans() > 0);
+        let mut saw_unsettled = false;
+        let mut second_transition = None;
+        for ms in (5510..=9000).step_by(10) {
+            let now = start + Duration::from_millis(ms);
+            let floor = state.observe_output_delay(now, 90_000);
+            saw_unsettled |= !state.delay_settle.is_settled();
+            if floor.is_some() {
+                second_transition = Some(now);
+                assert_eq!(floor, Some(90_000));
+                assert!(!state.error_filter.is_warm());
+                assert_eq!(state.engage_gate.pending_plans(), 0);
+                assert_eq!(state.started_at, Some(start));
+                assert_eq!(state.min_playback_delta_us, 90_000);
+                break;
+            }
+        }
+        assert!(saw_unsettled);
+        let settled_at = second_transition.expect("higher delay settles again");
+        for callback in 1..=150 {
+            let now = settled_at + Duration::from_millis(callback * 10);
+            assert_eq!(state.observe_output_delay(now, 90_000), None);
+            let decision = state.plan(now, 100_000, 48_000, false, true);
+            assert_eq!(decision.error_us, 100_000);
+        }
+        assert!(state.error_filter.is_warm());
+        assert!(state.engage_gate.pending_plans() > 0);
+        assert_eq!(state.started_at, Some(start));
+    }
+
+    #[test]
+    fn pre_start_observations_settle_delay_but_deadlines_use_actual_start() {
+        let observed_at = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        for ms in (0..=3000).step_by(10) {
+            state.observe_output_delay(observed_at + Duration::from_millis(ms), 50_000);
+        }
+        assert!(state.delay_settle.is_settled());
+        assert_eq!(state.started_at, None);
+        assert!(!state.error_filter.is_warm());
+        assert_eq!(state.engage_gate.pending_plans(), 0);
+        let start = observed_at + Duration::from_secs(30);
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        for ms in (0..10_000).step_by(10) {
+            let decision = tick(
+                &mut state,
+                start + Duration::from_millis(ms),
+                50_000 + ms * 20,
+                100_000,
+                &mut schedule,
+                true,
+            );
+            assert!(decision.output_delay_transient);
+            assert!(!schedule.is_correcting());
+        }
+        let deadline = state.plan(
+            start + OUTPUT_DELAY_SETTLE_MAX,
+            100_000,
+            48_000,
+            false,
+            true,
+        );
+        assert!(!deadline.output_delay_transient);
+        assert_eq!(deadline.schedule.drop_every_n_frames, 200);
+        let before_cap = state.plan(
+            start + STARTUP_GENTLE_WINDOW - Duration::from_nanos(1),
+            100_000,
+            48_000,
+            true,
+            true,
+        );
+        assert_eq!(before_cap.schedule.drop_every_n_frames, 200);
+        let after_cap = state.plan(start + STARTUP_GENTLE_WINDOW, 100_000, 48_000, true, true);
+        assert_eq!(after_cap.schedule.drop_every_n_frames, 25);
+    }
+
+    #[test]
+    fn clock_readiness_cannot_bypass_output_settling_but_allows_gross_reanchor() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let initial = state.plan(start, 600_000, 48_000, false, true);
+        assert!(initial.gated.reanchor);
+        assert!(!initial.schedule.is_correcting());
+        let mut schedule = CorrectionSchedule::default();
+        let mut saw_clock_suppression = false;
+        for ms in (0..=4000).step_by(10) {
+            let decision = tick(
+                &mut state,
+                start + Duration::from_millis(ms),
+                50_000,
+                100_000,
+                &mut schedule,
+                false,
+            );
+            assert!(!schedule.is_correcting());
+            if decision.gated.is_correcting() && !decision.output_delay_transient {
+                assert!(state.error_filter.is_warm());
+                assert!(decision.clock_warmup_suppressed);
+                saw_clock_suppression = true;
+            }
+        }
+        assert!(state.delay_settle.is_settled());
+        assert!(saw_clock_suppression);
+        state.reset_measurements();
+        assert!(!state.error_filter.is_warm());
+        assert_eq!(state.engage_gate.pending_plans(), 0);
+        let evidence_needed = crate::audio::sync_correction::SYNC_ERROR_WINDOW
+            .max(crate::audio::sync_correction::ENGAGE_STREAK_PLANS as usize);
+        for callback in 1..=evidence_needed {
+            let decision = tick(
+                &mut state,
+                start + Duration::from_millis(4000 + callback as u64 * 10),
+                50_000,
+                -100_000,
+                &mut schedule,
+                true,
+            );
+            assert_eq!(decision.error_us, -100_000);
+            assert!(!decision.clock_warmup_suppressed);
+            assert_eq!(schedule.is_correcting(), callback == evidence_needed);
+        }
+        assert!(schedule.insert_every_n_frames > 0);
+        state.reset_measurements();
+        let gross = state.plan(
+            start + Duration::from_secs(6),
+            600_000,
+            48_000,
+            false,
+            false,
+        );
+        assert!(gross.schedule.reanchor);
+    }
+}
+
 /// Queue depth required to log recovery after a low-queue warning. Kept above
 /// [`QUEUE_LOW_WATER_US`] so a queue hovering at one boundary cannot flood the
 /// log with low/recovered pairs.
@@ -751,11 +1294,7 @@ impl SyncedPlayer {
         let CallbackOutputs { error } = outputs;
         let channels = format.channels as usize;
         let sample_rate = format.sample_rate;
-        let planner = CorrectionPlanner::new();
-        let startup_planner =
-            CorrectionPlanner::with_max_speed_correction(STARTUP_MAX_SPEED_CORRECTION);
-        let mut error_filter = SyncErrorFilter::new();
-        let mut engage_gate = EngageGate::new();
+        let mut correction = StartupCorrectionState::new();
         let mut last_frame = vec![i32::EQUILIBRIUM; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
@@ -763,19 +1302,10 @@ impl SyncedPlayer {
         let mut started = false;
         let mut handoff_warned = false;
         let mut sync_settle_logged = false;
-        // Output-delay settling after stream start; see OutputDelaySettle.
-        let mut delay_settle = OutputDelaySettle::new();
-        let mut started_at: Option<Instant> = None;
+
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
-        // Running minimum of the presentation-latency snapshot, reset per
-        // generation. Reanchors anchor against this floor rather than one
-        // wake's reading: padding noise is one-sided (see SyncErrorFilter),
-        // so a single sample may run a whole period high, and anchoring to it
-        // bakes that period into the timeline until corrections audibly
-        // unwind it. A stale floor after a latency-regime shift costs at most
-        // one period of realignment — no worse than the shift itself.
-        let mut min_playback_delta_us = u64::MAX;
+
         let mut last_generation = 0u64;
         let mut stats = CallbackStats::default();
         let initial_gain = cb_config.gain_control.gain();
@@ -871,11 +1401,7 @@ impl SyncedPlayer {
                         schedule = CorrectionSchedule::default();
                         insert_counter = 0;
                         drop_counter = 0;
-                        error_filter.reset();
-                        engage_gate.reset();
-                        min_playback_delta_us = u64::MAX;
-                        delay_settle.reset();
-                        started_at = None;
+                        correction.reset();
                         stats.reset_for_generation();
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
@@ -919,19 +1445,11 @@ impl SyncedPlayer {
                         }
                     }
                     last_playback_delta_us = Some(playback_delta_us);
-                    min_playback_delta_us = min_playback_delta_us.min(playback_delta_us);
-                    let delay_was_settled = delay_settle.is_settled();
-                    delay_settle.update(callback_instant, playback_delta_us);
-                    if let Some(floor_us) = delay_settle
-                        .settled_floor_us()
-                        .filter(|_| !delay_was_settled)
+                    // Observe delay even while emitting pre-start silence; start the grace
+                    // periods only at actual playback, then plan corrections below.
+                    if let Some(floor_us) =
+                        correction.observe_output_delay(callback_instant, playback_delta_us)
                     {
-                        // Each new stable interval supersedes the transient's
-                        // measurements. Anchor to its floor, not a callback
-                        // sample that may flap upward by an engine period.
-                        min_playback_delta_us = floor_us;
-                        error_filter.reset();
-                        engage_gate.reset();
                         log::debug!(
                             "Output delay settled at {:.1}ms; corrections enabled: callback={}, suppressed_during_transient={}, generation={}",
                             us_to_ms(floor_us),
@@ -974,8 +1492,7 @@ impl SyncedPlayer {
                             sync_settle_logged = true;
                             // Warm-up measurements track the converging clock
                             // estimate, not playback; start the filter fresh.
-                            error_filter.reset();
-                            engage_gate.reset();
+                            correction.reset_measurements();
                             log::debug!(
                                 "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
                                 stats.callbacks,
@@ -991,7 +1508,7 @@ impl SyncedPlayer {
                             // floor already includes this callback's sample,
                             // so it is never u64::MAX here.
                             let anchor_instant = callback_instant
-                                + Duration::from_micros(min_playback_delta_us);
+                                + Duration::from_micros(correction.min_playback_delta_us);
                             let handoff_instant = if started {
                                 anchor_instant
                             } else {
@@ -1024,8 +1541,7 @@ impl SyncedPlayer {
                                         // bump the generation); prior
                                         // measurements describe the old
                                         // timeline.
-                                        error_filter.reset();
-                                        engage_gate.reset();
+                                        correction.reset_measurements();
                                         log::debug!(
                                             "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
                                         );
@@ -1089,7 +1605,7 @@ impl SyncedPlayer {
                             }
                             if !started {
                                 started = true;
-                                started_at = Some(callback_instant);
+                                correction.start(callback_instant);
                                 log::debug!(
                                     "Audio playback started: callback={}, cursor={}µs, queued={:.1}ms, buffers={}, silent_callbacks_before_start={}, sync_lock_misses={}",
                                     stats.callbacks,
@@ -1110,33 +1626,19 @@ impl SyncedPlayer {
                                     .duration_since(playback_instant)
                                     .as_micros() as i64)
                             };
-                            // A single reading can sit a whole engine period
-                            // above true alignment while the FIFO plays
-                            // gaplessly (see SyncErrorFilter); plan against
-                            // the window floor, never one wake's snapshot.
-                            let error_us = error_filter.update(raw_error_us);
-                            let in_startup_window = started_at.is_some_and(|at| {
-                                callback_instant.duration_since(at) < STARTUP_GENTLE_WINDOW
-                            });
-                            let active_planner = if in_startup_window {
-                                &startup_planner
-                            } else {
-                                &planner
-                            };
-                            let planned_schedule = active_planner.plan(
-                                error_us,
+                            // Callback delay noise can sit above gapless alignment.
+                            // Plan against the error window's floor, not one snapshot.
+                            let decision = correction.plan(
+                                callback_instant,
+                                raw_error_us,
                                 sample_rate,
                                 schedule.is_correcting(),
+                                sync_settled,
                             );
-                            // Corrections mutate audible frames: engage only
-                            // on sustained evidence over a warm filter (see
-                            // EngageGate).
-                            let gated_schedule = engage_gate.admit(
-                                planned_schedule,
-                                schedule.is_correcting(),
-                                error_filter.is_warm(),
-                            );
-                            if gated_schedule != planned_schedule {
+                            let error_us = decision.error_us;
+                            let ungated_schedule = decision.ungated;
+                            let gated_schedule = decision.gated;
+                            if gated_schedule != ungated_schedule {
                                 stats.gate_suppressed_corrections += 1;
                                 if trace_logging
                                     && should_log_sample(stats.gate_suppressed_corrections)
@@ -1151,26 +1653,10 @@ impl SyncedPlayer {
                                     );
                                 }
                             }
-                            let planned_schedule = gated_schedule;
-                            // While the sync estimate is still converging,
-                            // measured error is mostly movement of the
-                            // estimate itself; correcting for it chases
-                            // filter noise audibly. Trust the server's audio
-                            // until settled, honoring only gross reanchors.
-                            // A cold output stream reports a delay that
-                            // overshoots and then relaxes over several
-                            // seconds while the audio plays gaplessly.
-                            // Correcting against it would speed playback up
-                            // and then slow it down (an audible warble) for
-                            // an error that resolves itself, so hold
-                            // corrections until the delay has settled or the
-                            // grace period runs out.
-                            let output_delay_transient = !delay_settle.is_settled()
-                                && started_at.is_some_and(|at| {
-                                    callback_instant.duration_since(at) < OUTPUT_DELAY_SETTLE_MAX
-                                });
-                            let new_schedule = if output_delay_transient {
-                                if planned_schedule.is_correcting() {
+                            // Settling output delay and a converging clock can mimic drift.
+                            // Log the same suppression policy that selected the schedule.
+                            if decision.output_delay_transient {
+                                if gated_schedule.is_correcting() {
                                     stats.delay_transient_suppressed_corrections += 1;
                                     if trace_logging
                                         && should_log_sample(
@@ -1188,11 +1674,8 @@ impl SyncedPlayer {
                                         );
                                     }
                                 }
-                                CorrectionSchedule::default()
-                            } else if sync_settled || planned_schedule.reanchor {
-                                planned_schedule
-                            } else {
-                                if planned_schedule.is_correcting() {
+                            } else if decision.clock_warmup_suppressed {
+                                if gated_schedule.is_correcting() {
                                     stats.warmup_suppressed_corrections += 1;
                                     if trace_logging
                                         && should_log_sample(
@@ -1209,8 +1692,8 @@ impl SyncedPlayer {
                                         );
                                     }
                                 }
-                                CorrectionSchedule::default()
-                            };
+                            }
+                            let new_schedule = decision.schedule;
                             if new_schedule != schedule {
                                 if new_schedule.is_correcting() != schedule.is_correcting() {
                                     if new_schedule.is_correcting() {
@@ -1279,7 +1762,7 @@ impl SyncedPlayer {
                                 // derived from the delta floor, not this
                                 // wake's reading (see min_playback_delta_us).
                                 let anchor_instant = callback_instant
-                                    + Duration::from_micros(min_playback_delta_us);
+                                    + Duration::from_micros(correction.min_playback_delta_us);
                                 let client_micros = sync.instant_to_client_micros(anchor_instant)
                                     + delay_us as i64;
                                 if let Some(server_time) =
@@ -1298,8 +1781,7 @@ impl SyncedPlayer {
                                 stats.correction_updates = 0;
                                 // The cursor just jumped; prior measurements
                                 // describe the old timeline.
-                                error_filter.reset();
-                                engage_gate.reset();
+                                correction.reset_measurements();
                             }
                         } else if schedule.is_correcting() {
                             // Conversions went dark (the implausible-drift
@@ -1314,8 +1796,7 @@ impl SyncedPlayer {
                             insert_counter = 0;
                             drop_counter = 0;
                             stats.correction_updates = 0;
-                            error_filter.reset();
-                            engage_gate.reset();
+                            correction.reset_measurements();
                         }
                     }
 

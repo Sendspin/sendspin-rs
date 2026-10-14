@@ -245,6 +245,11 @@ impl EngageGate {
         self.streak = 0;
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_plans(&self) -> u32 {
+        self.streak
+    }
+
     /// Admit or suppress a planned schedule.
     ///
     /// `currently_correcting` is whether a correction episode is already
