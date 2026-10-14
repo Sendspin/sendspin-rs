@@ -11,7 +11,7 @@ use crate::log_sampling::should_log_sample;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
-use cpal::{Sample, I24};
+use cpal::{Sample, I24, U24};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -2029,6 +2029,7 @@ impl SyncedPlayer {
             SampleFormat::I64 => output_stream!(i64),
             SampleFormat::U8 => output_stream!(u8),
             SampleFormat::U16 => output_stream!(u16),
+            SampleFormat::U24 => output_stream!(U24),
             SampleFormat::U32 => output_stream!(u32),
             SampleFormat::U64 => output_stream!(u64),
             _ => Err(Error::Output(format!(
