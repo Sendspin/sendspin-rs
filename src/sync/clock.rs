@@ -1,8 +1,13 @@
 // ABOUTME: Clock synchronization implementation
 // ABOUTME: Drift-aware time sync with RTT estimation and server/client time conversion
 
-use super::raw_clock::{Clock, DefaultClock};
-use std::sync::Arc;
+use super::raw_clock::Clock;
+#[cfg(feature = "std")]
+use super::raw_clock::DefaultClock;
+use alloc::sync::Arc;
+use core::cmp::Ordering;
+use core::fmt;
+#[cfg(feature = "std")]
 use std::time::{Duration, Instant};
 
 const ADAPTIVE_FORGETTING_CUTOFF: f64 = 0.75;
@@ -179,14 +184,14 @@ impl TimeFilter {
         // Accept only drift <= threshold; reject NaN/incomparable values.
         matches!(
             self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            Some(Ordering::Less | Ordering::Equal)
         )
     }
 
     fn drift_has_sufficient_snr(drift: f64, drift_covariance: f64) -> bool {
         if !matches!(
             drift_covariance.partial_cmp(&0.0),
-            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            Some(Ordering::Greater | Ordering::Equal)
         ) {
             return false;
         }
@@ -218,14 +223,14 @@ impl TimeFilter {
         let effective_drift = self.effective_drift()?;
         let dt = (client_time - self.current.last_update) as f64;
         let offset = self.current.offset + effective_drift * dt;
-        Some(client_time + offset.round() as i64)
+        Some(client_time + libm::round(offset) as i64)
     }
 
     fn compute_client_time(&self, server_time: i64) -> Option<i64> {
         let effective_drift = self.effective_drift()?;
         let numerator = server_time as f64 - self.current.offset
             + effective_drift * self.current.last_update as f64;
-        Some((numerator / (1.0 + effective_drift)).round() as i64)
+        Some(libm::round(numerator / (1.0 + effective_drift)) as i64)
     }
 
     fn is_synchronized(&self) -> bool {
@@ -258,19 +263,20 @@ pub enum SyncQuality {
 pub struct ClockSync {
     /// Last known RTT in microseconds
     rtt_micros: Option<i64>,
-    /// When we computed this (for staleness detection)
-    last_update: Option<Instant>,
+    /// Clock micros ([`Clock::now_micros`]) at the last accepted sample
+    /// (for staleness detection)
+    last_update_micros: Option<i64>,
     /// Drift-aware time filter
     filter: TimeFilter,
     /// Raw monotonic clock used for timestamps
     clock: Arc<dyn Clock>,
 }
 
-impl std::fmt::Debug for ClockSync {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for ClockSync {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClockSync")
             .field("rtt_micros", &self.rtt_micros)
-            .field("last_update", &self.last_update)
+            .field("last_update_micros", &self.last_update_micros)
             .field("filter", &self.filter)
             .finish()
     }
@@ -281,7 +287,7 @@ impl ClockSync {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             rtt_micros: None,
-            last_update: None,
+            last_update_micros: None,
             filter: TimeFilter::new(0.01, 1.001),
             clock,
         }
@@ -325,7 +331,7 @@ impl ClockSync {
 
         // NTP offset = ((t2 - t1) + (t3 - t4)) / 2
         // Use f64 division to avoid systematic ±0.5µs bias from integer truncation.
-        let measurement = (((t2 - t1) as f64 + (t3 - t4) as f64) / 2.0).round() as i64;
+        let measurement = libm::round(((t2 - t1) as f64 + (t3 - t4) as f64) / 2.0) as i64;
         // Floor max_error at 1µs so the Kalman filter always sees
         // nonzero measurement variance. RTT = 0 is legitimate on
         // localhost; without this floor, repeated zero-variance
@@ -335,7 +341,7 @@ impl ClockSync {
         let was_synced = self.filter.is_synchronized();
         let was_blocked = self.filter.conversions_blocked();
         self.filter.update(measurement, max_error, t4);
-        self.last_update = Some(Instant::now());
+        self.last_update_micros = Some(self.clock.now_micros());
         log::trace!(
             "Clock sync sample: offset={:.0}µs, rtt={}µs, drift={:.6}, synchronized={}",
             self.filter.offset,
@@ -382,12 +388,14 @@ impl ClockSync {
     }
 
     /// Convert server loop microseconds to local Instant
+    #[cfg(feature = "std")]
     pub fn server_to_local_instant(&self, server_micros: i64) -> Option<Instant> {
         let client_micros = self.server_to_client_micros(server_micros)?;
         self.client_micros_to_instant(client_micros)
     }
 
     /// Convert server loop microseconds to local Instant, compensating for output latency
+    #[cfg(feature = "std")]
     pub fn server_to_local_instant_with_latency(
         &self,
         server_micros: i64,
@@ -397,11 +405,13 @@ impl ClockSync {
         instant.checked_sub(Duration::from_micros(output_latency_micros))
     }
 
+    #[cfg(feature = "std")]
     fn client_micros_to_instant(&self, client_micros: i64) -> Option<Instant> {
         self.clock.micros_to_instant(client_micros)
     }
 
     /// Convert a local Instant to client clock microseconds.
+    #[cfg(feature = "std")]
     pub fn instant_to_client_micros(&self, instant: Instant) -> i64 {
         self.clock.instant_to_micros(instant)
     }
@@ -415,16 +425,18 @@ impl ClockSync {
         }
     }
 
+    /// Threshold after which a sync is considered stale.
+    const STALE_AFTER_MICROS: i64 = 5_000_000;
+
     /// Check if sync is stale (>5 seconds since last update).
     ///
-    /// Uses `Instant::now()` (not the injected [`Clock`]) because staleness
-    /// is a wall-clock concept — we're measuring real elapsed time since the
-    /// last successful sync round, regardless of which timebase the filter
-    /// operates on. This means `is_stale()` always reflects real time even
-    /// when a mock clock is injected for testing.
+    /// Elapsed time is measured on the injected [`Clock`] (the same raw
+    /// monotonic timebase the filter runs on), so this works without `std`.
+    /// A mock clock that does not advance will therefore never report a
+    /// previously updated sync as stale.
     pub fn is_stale(&self) -> bool {
-        match self.last_update {
-            Some(last) => last.elapsed() > Duration::from_secs(5),
+        match self.last_update_micros {
+            Some(last) => self.clock.now_micros() - last > Self::STALE_AFTER_MICROS,
             None => true,
         }
     }
@@ -443,6 +455,7 @@ impl ClockSync {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for ClockSync {
     fn default() -> Self {
         Self::new(Arc::new(DefaultClock::new()))

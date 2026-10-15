@@ -1,9 +1,9 @@
 // ABOUTME: Lock-free volume/mute control for SyncedPlayer
 // ABOUTME: Uses atomics for zero-latency gain changes from any thread
 
-use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
-use std::sync::Arc;
+use alloc::sync::Arc;
+use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 /// Packed atomics for [`GainControl`], shared via a single `Arc`.
 struct GainState {
@@ -25,7 +25,7 @@ pub struct GainControl {
 fn volume_to_gain(volume: u8) -> (u8, f32) {
     let clamped = volume.min(100);
     let vol = f32::from(clamped) / 100.0;
-    (clamped, vol.powf(1.5))
+    (clamped, libm::powf(vol, 1.5))
 }
 
 impl GainControl {
@@ -262,6 +262,7 @@ impl GainRamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     // Expected gain values are precomputed literals, NOT calls to `volume_to_gain()`.
     // This is intentional: using the function under test as its own oracle is

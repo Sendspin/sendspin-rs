@@ -7,4 +7,8 @@ pub mod clock;
 pub mod raw_clock;
 
 pub use clock::{ClockSync, SyncQuality};
-pub use raw_clock::{Clock, DefaultClock};
+pub use raw_clock::Clock;
+#[cfg(feature = "std")]
+pub use raw_clock::DefaultClock;
+#[cfg(feature = "embassy")]
+pub use raw_clock::EmbassyClock;

@@ -1,7 +1,8 @@
 // ABOUTME: Core audio type definitions
 // ABOUTME: AudioFormat, AudioBuffer for zero-copy audio data
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// Sample type for audio data.
 ///

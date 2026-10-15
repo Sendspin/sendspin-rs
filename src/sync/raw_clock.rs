@@ -1,6 +1,7 @@
 // ABOUTME: Clock trait and raw monotonic clock implementation
 // ABOUTME: Provides NTP-slew-immune time source for accurate clock synchronization
 
+#[cfg(feature = "std")]
 use std::time::{Duration, Instant};
 
 /// A monotonic time source for clock synchronization.
@@ -40,6 +41,9 @@ pub trait Clock: Send + Sync + 'static {
     ///
     /// Returns `None` if the requested time is so far in the past that it
     /// precedes `Instant`'s internal epoch (before process start).
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
     fn micros_to_instant(&self, micros: i64) -> Option<Instant> {
         let now_micros = self.now_micros();
         let now_instant = Instant::now();
@@ -61,6 +65,9 @@ pub trait Clock: Send + Sync + 'static {
     /// [`micros_to_instant`](Clock::micros_to_instant) for details).
     /// Sub-microsecond truncation from `Duration::as_micros()` introduces
     /// a consistent -0 to -1µs bias, which the Kalman filter absorbs trivially.
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
     fn instant_to_micros(&self, instant: Instant) -> i64 {
         let now_micros = self.now_micros();
         let now_instant = Instant::now();
@@ -80,6 +87,9 @@ pub trait Clock: Send + Sync + 'static {
 /// | Linux | `CLOCK_MONOTONIC_RAW` | Yes |
 /// | macOS | `mach_absolute_time` (via `Instant`) | Yes |
 /// | Windows | `QueryPerformanceCounter` (via `Instant`) | Yes |
+///
+/// Only available with the `std` feature.
+#[cfg(feature = "std")]
 pub struct DefaultClock {
     /// `Instant` captured at construction, used as the epoch for non-Linux
     /// platforms where we derive microseconds from `Instant` arithmetic.
@@ -89,6 +99,7 @@ pub struct DefaultClock {
     epoch: Instant,
 }
 
+#[cfg(feature = "std")]
 impl DefaultClock {
     /// Create a new default clock.
     pub fn new() -> Self {
@@ -98,18 +109,21 @@ impl DefaultClock {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for DefaultClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "std")]
 impl std::fmt::Debug for DefaultClock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DefaultClock").finish()
     }
 }
 
+#[cfg(feature = "std")]
 impl Clock for DefaultClock {
     #[cfg(target_os = "linux")]
     fn now_micros(&self) -> i64 {
@@ -155,5 +169,30 @@ impl Clock for DefaultClock {
         // years of uptime. Use try_from to be explicit rather than silently
         // truncating.
         i64::try_from(Instant::now().duration_since(self.epoch).as_micros()).unwrap_or(i64::MAX)
+    }
+}
+
+/// Clock backed by [`embassy_time::Instant`] for embedded (no_std) targets.
+///
+/// Requires the `embassy` feature and an `embassy-time` driver provided by
+/// the target HAL at link time. `embassy_time::Instant` is a monotonic tick
+/// counter from the hardware timer, so it is not NTP-conditioned.
+#[cfg(feature = "embassy")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmbassyClock;
+
+#[cfg(feature = "embassy")]
+impl EmbassyClock {
+    /// Create a new embassy-backed clock.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl Clock for EmbassyClock {
+    fn now_micros(&self) -> i64 {
+        // Saturate rather than wrap: i64::MAX µs is ~292,277 years of uptime.
+        i64::try_from(embassy_time::Instant::now().as_micros()).unwrap_or(i64::MAX)
     }
 }

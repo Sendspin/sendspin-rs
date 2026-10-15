@@ -3,8 +3,10 @@
 
 use crate::audio::decode::Decoder;
 use crate::error::Error;
-use cpal::Sample;
-use std::sync::Arc;
+use alloc::format;
+use alloc::string::ToString;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// PCM endianness
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,7 +67,8 @@ impl Decoder for PcmDecoder {
                     .iter()
                     .map(|c| {
                         let i16_val = i16::from_le_bytes([c[0], c[1]]);
-                        i32::from_sample(i16_val)
+                        // Same scaling as cpal's `i32::from_sample(i16)`.
+                        (i16_val as i32) << 16
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
@@ -77,7 +80,7 @@ impl Decoder for PcmDecoder {
                     .iter()
                     .map(|c| {
                         let i16_val = i16::from_be_bytes([c[0], c[1]]);
-                        i32::from_sample(i16_val)
+                        (i16_val as i32) << 16
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
@@ -89,7 +92,8 @@ impl Decoder for PcmDecoder {
                     .iter()
                     .map(|c| {
                         let extended = i32::from_i24_le([c[0], c[1], c[2]]);
-                        i32::from_sample(cpal::I24::new_unchecked(extended))
+                        // Same scaling as cpal's `i32::from_sample(I24)`.
+                        extended << 8
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))
@@ -101,7 +105,7 @@ impl Decoder for PcmDecoder {
                     .iter()
                     .map(|c| {
                         let extended = i32::from_i24_be([c[0], c[1], c[2]]);
-                        i32::from_sample(cpal::I24::new_unchecked(extended))
+                        extended << 8
                     })
                     .collect();
                 Ok(Arc::from(samples.into_boxed_slice()))

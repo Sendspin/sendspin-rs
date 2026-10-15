@@ -1,9 +1,9 @@
 // ABOUTME: Buffer pool for reusing audio sample buffers
 // ABOUTME: Eliminates allocations in the audio hot path
 
-use cpal::Sample;
-use crossbeam::queue::ArrayQueue;
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use crossbeam_queue::ArrayQueue;
 
 /// Buffer pool for reusing audio sample buffers
 pub struct BufferPool {
@@ -20,10 +20,13 @@ impl BufferPool {
     pub fn new(pool_size: usize, buffer_capacity: usize) -> Self {
         let pool = Arc::new(ArrayQueue::new(pool_size));
 
-        // Pre-allocate buffers
+        // Pre-allocate buffers. `resize` (rather than `vec![0; n]`) writes
+        // every element so the pages are touched up front, not in the audio
+        // callback.
+        #[allow(clippy::slow_vector_initialization)]
         for _ in 0..pool_size {
             let mut buf = Vec::with_capacity(buffer_capacity);
-            buf.resize(buffer_capacity, i32::EQUILIBRIUM);
+            buf.resize(buffer_capacity, 0);
             buf.clear(); // Clear so len() is 0 but capacity is preserved
             let _ = pool.push(buf);
         }

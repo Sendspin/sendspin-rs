@@ -8,48 +8,79 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sendspin/sendspin-rs"
 
 [features]
-default = []
+default = ["std"]
+# Core (no_std + alloc): error types, protocol messages, clock sync, audio
+# types/pool/gain/sync-correction and the PCM/Opus decoders.
+alloc = ["serde/alloc", "serde_json/alloc"]
+# Full library: WebSocket client/listener/manager, cpal playback, FLAC,
+# `DefaultClock`.
+std = [
+    "alloc",
+    "serde/std",
+    "serde_json/std",
+    "thiserror/std",
+    "log/std",
+    "opus-rs/std",
+    "opus-rs/heap",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:cpal",
+    "dep:flac-codec",
+    "dep:parking_lot",
+    "dep:typed-builder",
+    "dep:libc",
+]
+# `EmbassyClock`: a `Clock` backed by `embassy_time::Instant` for no_std targets.
+embassy = ["alloc", "dep:embassy-time"]
 native-tls = [
+    "std",
     "tokio-tungstenite/native-tls",
     "dep:tokio-native-tls",
     "dep:native-tls",
 ]
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.52", features = ["full"] }
-tokio-tungstenite = "0.29"
+# Async runtime (std only)
+tokio = { version = "1.52", features = ["full"], optional = true }
+tokio-tungstenite = { version = "0.29", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }
 native-tls = { version = "0.2", optional = true }
-futures-util = "0.3"
+futures-util = { version = "0.3", optional = true }
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false }
 
 # Error handling
-thiserror = "2.0"
+thiserror = { version = "2.0", default-features = false }
 
 # Utilities
 log = "0.4"
-uuid = { version = "1.23", features = ["v4", "serde"] }
+# Float math usable without std (`round`, `powf`); with std, results are
+# identical for `round` and within an ulp for `powf`.
+libm = "0.2"
 
-# Audio output
-cpal = "0.18"
+# Audio output (std only)
+cpal = { version = "0.18", optional = true }
 
 # Audio codecs
-flac-codec = "=1.3.2"
-opus-rs = "=0.1.23"
+flac-codec = { version = "=1.3.2", optional = true }
+opus-rs = { version = "0.1.37", default-features = false, features = ["libm"] }
 
 # Concurrency
-crossbeam = "0.8"
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
-# Fast mutexes
-parking_lot = "0.12"
-typed-builder = "0.23.2"
+# Mutexes: parking_lot with std, spin without
+parking_lot = { version = "0.12", optional = true }
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+typed-builder = { version = "0.23.2", optional = true }
+
+# Embedded time source
+embassy-time = { version = "0.5", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # `realtime` promotes cpal's WASAPI event-loop thread via MMCSS ("Pro Audio"),
@@ -60,9 +91,10 @@ libc = "0.2"
 # real-time (and cpal has no macOS audio_thread_priority dependency, so the
 # feature would be inert), while Linux promotion needs the dbus/RtKit variant
 # (realtime-dbus) plus a system libdbus build dependency.
-cpal = { version = "0.18", features = ["realtime"] }
+cpal = { version = "0.18", features = ["realtime"], optional = true }
 
 [dev-dependencies]
+uuid = { version = "1.23", features = ["v4", "serde"] }
 tokio-test = "0.4"
 base64 = "0.22"
 env_logger = "0.11"
@@ -77,3 +109,71 @@ codegen-units = 1
 [[example]]
 name = "secure_socket"
 required-features = ["native-tls"]
+
+[[example]]
+name = "basic_client"
+required-features = ["std"]
+
+[[example]]
+name = "controller_only"
+required-features = ["std"]
+
+[[example]]
+name = "minimal_test"
+required-features = ["std"]
+
+[[example]]
+name = "player"
+required-features = ["std"]
+
+[[example]]
+name = "server_initiated_metadata"
+required-features = ["std"]
+
+[[test]]
+name = "binary_frames"
+required-features = ["std"]
+
+[[test]]
+name = "buffer_pool"
+required-features = ["std"]
+
+[[test]]
+name = "clock_sync"
+required-features = ["std"]
+
+[[test]]
+name = "connection_manager"
+required-features = ["std"]
+
+[[test]]
+name = "flac_conformance"
+required-features = ["std"]
+
+[[test]]
+name = "pcm_decoder"
+required-features = ["std"]
+
+[[test]]
+name = "protocol_client"
+required-features = ["std"]
+
+[[test]]
+name = "protocol_client_builder"
+required-features = ["std"]
+
+[[test]]
+name = "protocol_listener"
+required-features = ["std"]
+
+[[test]]
+name = "protocol_messages"
+required-features = ["std"]
+
+[[test]]
+name = "raw_clock"
+required-features = ["std"]
+
+[[test]]
+name = "sync_correction"
+required-features = ["std"]

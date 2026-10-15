@@ -2,18 +2,20 @@
 // ABOUTME: PCM, Opus, and FLAC decoders
 
 /// FLAC decoder implementation
+#[cfg(feature = "std")]
 pub mod flac;
 /// Opus decoder implementation
 pub mod opus;
 /// PCM decoder implementation
 pub mod pcm;
 
+#[cfg(feature = "std")]
 pub use flac::FlacDecoder;
 pub use opus::OpusDecoder;
 pub use pcm::{PcmDecoder, PcmEndian};
 
 use crate::error::Error;
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 /// Decoder trait for audio codecs
 pub trait Decoder {

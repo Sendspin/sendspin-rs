@@ -106,7 +106,7 @@ impl CorrectionPlanner {
             };
         }
 
-        let interval_frames = (sample_rate_f / corrections_per_sec).round() as u32;
+        let interval_frames = libm::round(sample_rate_f / corrections_per_sec) as u32;
 
         if error_us > 0 {
             CorrectionSchedule {
@@ -380,6 +380,7 @@ impl Default for OutputDelaySettle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn test_no_correction_within_engage_threshold() {
