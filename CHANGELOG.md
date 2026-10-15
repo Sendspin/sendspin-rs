@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8](https://github.com/Sendspin/sendspin-rs/compare/v0.3.7...v0.3.8) - 2026-10-15
+
+### Fixed
+
+- *(audio)* support unsigned 24-bit output ([#107](https://github.com/Sendspin/sendspin-rs/pull/107))
+- hold sync corrections while a cold output stream's delay settles ([#103](https://github.com/Sendspin/sendspin-rs/pull/103))
+
+### Other
+
+- cover startup synchronization correction transitions ([#106](https://github.com/Sendspin/sendspin-rs/pull/106))
+
 ### Fixed
 
 - Stop a freshly opened output stream from being corrected at up to 4% speed
