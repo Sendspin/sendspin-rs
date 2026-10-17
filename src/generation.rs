@@ -15,6 +15,11 @@ impl StreamGeneration {
     pub(crate) fn checked_advance(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
     }
+
+    #[cfg(test)]
+    pub(crate) const fn max_for_test() -> Self {
+        Self(u64::MAX)
+    }
 }
 
 /// Identifies a local playback queue reset.
