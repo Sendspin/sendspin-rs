@@ -1,0 +1,7 @@
+error[E0308]: mismatched types
+ --> tests/ui/generation_assignment_mismatch.rs:8:43
+  |
+8 |     let _wrong: PlaybackResetGeneration = stream;
+  |                 -----------------------   ^^^^^^ expected `PlaybackResetGeneration`, found `StreamGeneration`
+  |                 |
+  |                 expected due to this

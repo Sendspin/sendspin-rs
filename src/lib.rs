@@ -17,6 +17,7 @@ pub mod protocol;
 /// Clock synchronization utilities
 pub mod sync;
 
+pub(crate) mod generation;
 pub(crate) mod log_sampling;
 
 pub use audio::GainControl;

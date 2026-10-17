@@ -178,7 +178,7 @@ impl SyncErrorFilter {
         }
     }
 
-    /// Discard all samples, e.g. after a reanchor or generation change made
+    /// Discard all samples, e.g. after a reanchor or playback reset made
     /// prior measurements meaningless.
     pub fn reset(&mut self) {
         self.len = 0;
@@ -322,7 +322,7 @@ impl OutputDelaySettle {
         }
     }
 
-    /// Forget all history, e.g. when a new stream generation starts.
+    /// Forget retained delay measurements.
     pub fn reset(&mut self) {
         *self = Self::new();
     }
