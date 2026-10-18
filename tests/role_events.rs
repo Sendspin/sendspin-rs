@@ -680,6 +680,110 @@ async fn urgent_clear_volume_end_and_malformed_input_preserve_new_media() {
 }
 
 #[tokio::test]
+async fn preparation_worker_blocked_before_decode_does_not_block_urgent_controls() {
+    let f = fixture().await;
+    let split = f.client.split();
+    let (output, mut effects) = RecordedOutput::new();
+    let mut session = split.player.attach(
+        output.clone(),
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
+    let mut controls = session.controls();
+    f.server_tx
+        .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
+        .unwrap();
+    f.server_tx.send(audio(11, &[1, 2])).unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(5), session.recv())
+            .await
+            .unwrap(),
+        Some(PlayerEvent::Start(_))
+    ));
+    let work = match timeout(Duration::from_secs(5), session.recv())
+        .await
+        .unwrap()
+    {
+        Some(PlayerEvent::Audio(work)) => work,
+        other => panic!("expected audio work, got {other:?}"),
+    };
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        let samples = PcmDecoder::new(16).decode(work.data()).unwrap();
+        work.commit(AudioBuffer {
+            timestamp: 11,
+            samples,
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            },
+        })
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("preparation worker did not enter");
+
+    f.server_tx
+        .send(
+            serde_json::to_string(&Message::StreamClear(StreamClear { roles: None }))
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    f.server_tx
+        .send(
+            serde_json::to_string(&Message::ServerCommand(ServerCommand {
+                player: Some(PlayerCommand {
+                    command: PlayerCommandType::Volume,
+                    volume: Some(42),
+                    mute: None,
+                    static_delay_ms: None,
+                }),
+            }))
+            .unwrap()
+            .into(),
+        )
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if effects.borrow().clear_count >= 1 && effects.borrow().volume == 42 {
+                break;
+            }
+            effects.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("urgent controls did not apply while preparation was blocked");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if controls.borrow().volume == 42 {
+                break;
+            }
+            controls.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("controls watch did not publish volume 42");
+
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(sendspin::audio::CommitRejected::Obsolete)
+    );
+    assert!(output.commits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_held_work() {
     let mut f = fixture().await;
     let t1 = match timeout(Duration::from_secs(5), f.observed.recv())

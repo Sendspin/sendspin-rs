@@ -9,16 +9,15 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 ## Features
 
 - **Zero-copy audio pipeline** - Minimal allocations, maximum performance
-- **Lock-free concurrency** - No contention on audio thread
+- **Responsive concurrency** - Urgent controls are handled independently of audio preparation
 - **Async I/O** - Efficient WebSocket handling with Tokio
 - **Type-safe protocol** - Leverage Rust's type system for correctness
 
-## Performance Targets
+## Performance Notes
 
-- Audio latency: <10ms end-to-end jitter
-- CPU usage: <2% on modern hardware (4-core)
-- Memory: <20MB stable
-- Thread synchronization: Lock-free audio pipeline
+Latency depends on callback work, scheduling, queueing, device buffering, and audio
+already submitted to the hardware. The library does not promise a fixed hardware
+latency or a 10 ms end-to-end guarantee.
 
 ## Current Status
 
@@ -108,6 +107,20 @@ fn attach_player<O: PlayerOutput>(
 - For lazy playback, use `attach_lazy`; `begin_output_install` returns an `OutputInstallPermit` that installs `PlaybackControl`. See [`examples/player/main.rs`](examples/player/main.rs) for the lazy worker lifecycle.
 - Eager and lazy attachment require a Tokio runtime. Keep output callbacks short, synchronous, nonblocking, and nonreentrant.
 - Drop unused receivers to disable their delivery, and retain the connection guard until shutdown.
+
+## Receiving API migration
+
+| Previous approach | Current approach |
+| --- | --- |
+| Read audio chunks from `connection.audio` (`UnboundedReceiver`), with role configuration and controls in `messages` | Attach `connection.player` to a `PlayerOutput` or use `attach_lazy` for a worker-created output |
+| Role controls and boundaries handled in the message loop | `PlayerSession` applies urgent controls independently and yields ordered `Start`, audio work, `Clear`, and `End` events |
+| Read raw artwork/visualizer chunks from their receivers | Attach `connection.artwork` and `connection.visualizer` to their respective output traits |
+| Separate messages, raw-data bookkeeping, and decoder lifetime managed in application code | Attach the role endpoint, prepare each item on an owning worker, and commit the returned `AudioWork`; this avoids stale enqueue work during session transitions |
+| Unused role receivers retained | Drop unused endpoints; retain the connection guard until shutdown |
+
+Callbacks are synchronous, short, nonblocking, serialized, and nonreentrant. `Clear` continues a stream; player `End` calls the player output's `clear()` and does not close the session. Artwork and visualizer `End` call their outputs' custom `end()` behavior. Format-only starts preserve buffered media, while unsupported sample rates or channel counts are rejected rather than resampled. `AudioWork::commit` reports `FormatMismatch` for one item and keeps the player session open; all other role output failures are terminal and require a new connection. There is no fixed hardware-latency or 10 ms guarantee.
+
+For the complete migration, lazy output release/reinstall workflow, output error policy, and verification map, see [docs/role-sessions.md](docs/role-sessions.md).
 
 ## Architecture
 

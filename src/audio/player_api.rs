@@ -911,6 +911,61 @@ impl LazyPlayerSession {
     /// Receipt-time admission is detached first, so queued and outstanding old work is
     /// rejected or skipped. The output is cleared before the result is returned; a clear
     /// failure is the retained terminal failure and prevents reinstall.
+    ///
+    /// The output-owning worker must acknowledge dropping its device before the application
+    /// advertises an external source. The session remains open and retains controls and the
+    /// current boundary for a later installation; the worker retains the latest start/configuration.
+    ///
+    /// ```rust,no_run
+    /// use sendspin::audio::{LazyPlayerSession, PlaybackControl};
+    /// use sendspin::{protocol::messages::PlayerState, WsSender};
+    ///
+    /// async fn handoff(
+    ///     session: &mut LazyPlayerSession,
+    ///     sender: &WsSender,
+    ///     worker: &mut OutputWorker,
+    /// ) -> Result<(), Box<dyn std::error::Error>> {
+    ///     session.release_output().map_err(|error| format!("{error:?}"))?;
+    ///     worker.drop_device_and_ack().await;
+    ///     sender.enter_external_source().await?;
+    ///
+    ///     // The caller supplies the latest protocol state and reads any OS/device state
+    ///     // through its platform APIs before constructing this value.
+    ///     let initial_state = worker.read_player_state().await?;
+    ///     let controls = session.controls().borrow().clone();
+    ///     sender.exit_external_source(Some(with_session_controls(initial_state, controls))).await?;
+    ///     let permit = session
+    ///         .begin_output_install()
+    ///         .map_err(|error| format!("{error:?}"))?;
+    ///     let output = worker.create_output().await?;
+    ///     permit.install(output).map_err(|error| format!("{error:?}"))?;
+    ///     Ok(())
+    /// }
+    ///
+    /// fn with_session_controls(
+    ///     initial_state: PlayerState,
+    ///     controls: sendspin::audio::AppliedControls,
+    /// ) -> PlayerState {
+    ///     PlayerState {
+    ///         volume: Some(controls.volume),
+    ///         muted: Some(controls.muted),
+    ///         static_delay_ms: Some(controls.static_delay_ms),
+    ///         ..initial_state
+    ///     }
+    /// }
+    ///
+    /// struct OutputWorker;
+    /// impl OutputWorker {
+    ///     async fn drop_device_and_ack(&mut self) {}
+    ///     async fn read_player_state(&mut self) -> Result<PlayerState, Box<dyn std::error::Error>> {
+    ///         Ok(PlayerState::default())
+    ///     }
+    ///     async fn create_output(&mut self) -> Result<PlaybackControl, Box<dyn std::error::Error>> {
+    ///         todo!()
+    ///     }
+    /// }
+    ///
+    /// ```
     pub fn release_output(&mut self) -> Result<(), OutputError> {
         let coordinator = &self.coordinator;
         match coordinator.release() {
@@ -1032,6 +1087,8 @@ mod tests {
     use crate::audio::{AudioFormat, Codec};
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     #[derive(Clone)]
     struct FakeOutput {
@@ -1269,6 +1326,97 @@ mod tests {
             session.coordinator.admission().admit(),
             Admission::Closed
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handoff_waits_for_device_drop() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let installed = output();
+        session.install_for_test(installed).unwrap();
+
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(old_work) = session.recv().await.unwrap() else {
+            panic!("audio event")
+        };
+        session.release_output().unwrap();
+        assert_eq!(old_work.commit(buffer()), Err(CommitRejected::Obsolete));
+
+        let (drop_ack_tx, drop_ack_rx) = tokio::sync::oneshot::channel();
+        let advertised = Arc::new(AtomicUsize::new(0));
+        let created = Arc::new(AtomicUsize::new(0));
+        let advertised_by_handoff = Arc::clone(&advertised);
+        let mut handoff = Box::pin(async move {
+            drop_ack_rx.await.expect("device-drop acknowledgement");
+            advertised_by_handoff.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(handoff.as_mut().now_or_never().is_none());
+        assert_eq!(advertised.load(Ordering::SeqCst), 0);
+        assert_eq!(created.load(Ordering::SeqCst), 0);
+
+        drop_ack_tx.send(()).unwrap();
+        handoff.await;
+        let replacement = output();
+        created.fetch_add(1, Ordering::SeqCst);
+        let replacement_controls = Arc::clone(&replacement.controls);
+        let permit = session.begin_output_install().unwrap();
+        permit.install_for_test(replacement).unwrap();
+
+        assert_eq!(advertised.load(Ordering::SeqCst), 1);
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        assert_eq!(*replacement_controls.lock(), controls());
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(new_work) = session.recv().await.unwrap() else {
+            panic!("audio event")
+        };
+        new_work.commit(buffer()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_output_creation_does_not_block_controls_or_end() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        producer.audio(chunk()).unwrap();
+        let old_work = match session.recv().await {
+            Some(PlayerEvent::Audio(work)) => work,
+            other => panic!("expected audio work, got {other:?}"),
+        };
+        let permit = session.begin_output_install().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let created = Arc::new(AtomicUsize::new(0));
+        let created_by_worker = Arc::clone(&created);
+        let install = std::thread::spawn(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            created_by_worker.fetch_add(1, Ordering::SeqCst);
+            permit.install_for_test(output())
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("output factory did not block before creation");
+        assert_eq!(created.load(Ordering::SeqCst), 0);
+
+        let mut control_watch = session.controls();
+        producer.set_volume(42);
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if control_watch.borrow().volume == 42 {
+                    break;
+                }
+                control_watch.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("controls were not published without an output");
+        producer.end().unwrap();
+        assert_eq!(old_work.commit(buffer()), Err(CommitRejected::Obsolete));
+        assert_eq!(created.load(Ordering::SeqCst), 0);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(install.join().unwrap(), Ok(()));
+        assert_eq!(created.load(Ordering::SeqCst), 1);
+        session.shutdown().await;
     }
 
     #[tokio::test]

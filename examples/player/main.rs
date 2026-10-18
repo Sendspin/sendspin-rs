@@ -359,8 +359,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use sendspin::audio::{AudioBuffer, OutputError, PlayerOutput};
+    use sendspin::protocol::messages::{
+        ConnectionReason, PlayerCommand, PlayerCommandType, ServerCommand, ServerHello,
+    };
     use std::sync::{Arc, Mutex};
+    use tokio::io::duplex;
     use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
 
     fn controls(volume: u8) -> AppliedControls {
         AppliedControls {
@@ -383,7 +390,8 @@ mod tests {
 
     #[tokio::test]
     async fn reporter_cancels_stalled_send_and_joins() {
-        let (_controls_tx, controls_rx) = watch::channel(controls(1));
+        let (controls_tx, controls_rx) = watch::channel(controls(1));
+        let mut controls_observer = controls_rx.clone();
         let (stop_tx, stop_rx) = watch::channel(false);
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
@@ -402,11 +410,154 @@ mod tests {
             .await
             .expect("reporter did not start within 5 seconds")
             .expect("reporter start signal dropped");
+        controls_tx.send(controls(42)).unwrap();
+        timeout(Duration::from_secs(5), controls_observer.changed())
+            .await
+            .expect("control update was blocked by stalled report")
+            .expect("control watch closed");
+        assert_eq!(controls_observer.borrow().volume, 42);
         stop_tx.send(true).unwrap();
         timeout(Duration::from_secs(5), task)
             .await
             .expect("reporter did not stop within 5 seconds")
             .expect("reporter task panicked");
+    }
+
+    #[derive(Clone)]
+    struct FakeOutput {
+        volumes: Arc<Mutex<Vec<u8>>>,
+        volume_changed: Arc<tokio::sync::Notify>,
+    }
+
+    impl PlayerOutput for FakeOutput {
+        fn commit(&self, _buffer: AudioBuffer) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn clear(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn set_volume(&self, volume: u8) -> Result<(), OutputError> {
+            self.volumes.lock().unwrap().push(volume);
+            self.volume_changed.notify_waiters();
+            Ok(())
+        }
+
+        fn set_mute(&self, _muted: bool) -> Result<(), OutputError> {
+            Ok(())
+        }
+
+        fn set_static_delay(&self, _delay_ms: u16) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_reporter_does_not_block_session_control() {
+        let (server_io, client_io) = duplex(16 * 1024);
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+        let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+        let server_task = tokio::spawn(async move {
+            let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_))) = server.next().await
+            else {
+                panic!("client hello was not received")
+            };
+            server
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&Message::ServerHello(ServerHello {
+                        server_id: "test-server".into(),
+                        name: "test-server".into(),
+                        version: 1,
+                        active_roles: vec!["player@v1".into()],
+                        connection_reason: ConnectionReason::Playback,
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            entered_rx.await.unwrap();
+            server
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&Message::ServerCommand(ServerCommand {
+                        player: Some(PlayerCommand {
+                            command: PlayerCommandType::Volume,
+                            volume: Some(42),
+                            mute: None,
+                            static_delay_ms: None,
+                        }),
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while server.next().await.is_some() {}
+        });
+
+        let client = ProtocolClientBuilder::builder()
+            .client_id("test-player".to_string())
+            .name("test-player".to_string())
+            .player_v1_support(PlayerV1Support {
+                supported_formats: vec![],
+                buffer_capacity: 1,
+                supported_commands: vec!["volume".into()],
+            })
+            .initial_player_state(state())
+            .build()
+            .accept(client_ws);
+        let client = timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client handshake timed out")
+            .expect("client handshake failed");
+        let conn = client.split();
+
+        let output = FakeOutput {
+            volumes: Arc::new(Mutex::new(Vec::new())),
+            volume_changed: Arc::new(tokio::sync::Notify::new()),
+        };
+        let volumes = output.volumes.clone();
+        let volume_changed = output.volume_changed.clone();
+        let session = conn.player.attach(output, controls(1));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut observed = session.controls();
+        let controls_rx = session.controls();
+        let reporter = tokio::spawn(report_player_state(
+            controls_rx,
+            state(),
+            stop_rx,
+            move |_| {
+                if let Some(sender) = entered_tx.lock().unwrap().take() {
+                    let _ = sender.send(());
+                }
+                std::future::pending::<Result<(), ()>>()
+            },
+        ));
+
+        timeout(Duration::from_secs(5), volume_changed.notified())
+            .await
+            .expect("volume command did not reach fake output");
+        timeout(Duration::from_secs(5), observed.changed())
+            .await
+            .expect("session controls did not change")
+            .expect("session controls watch closed");
+        assert_eq!(observed.borrow().volume, 42);
+        assert!(volumes.lock().unwrap().contains(&42));
+
+        stop_tx.send(true).unwrap();
+        timeout(Duration::from_secs(5), reporter)
+            .await
+            .expect("reporter did not stop")
+            .expect("reporter task panicked");
+        session.shutdown().await;
+        drop(conn.guard);
+        timeout(Duration::from_secs(5), server_task)
+            .await
+            .expect("server task did not stop")
+            .expect("server task panicked");
     }
 
     #[tokio::test]
