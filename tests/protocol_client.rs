@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::audio::{AppliedControls, AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::error::Error;
+use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
     ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
     ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand,
@@ -1252,9 +1253,19 @@ async fn test_message_router_forwards_binary_audio() {
         },
     );
 
-    // Audio chunk: type 4, 8-byte big-endian timestamp, then payload.
+    // Audio chunk: type byte, 8-byte big-endian timestamp, then payload.
     let audio_frame: Vec<u8> = vec![
-        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A, 0xDE, 0xAD,
+        binary_types::PLAYER_AUDIO,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x2A,
+        0xDE,
+        0xAD,
     ];
     server_tx
         .send(WsMessage::Binary(audio_frame.into()))
@@ -1287,7 +1298,19 @@ async fn test_message_router_forwards_binary_artwork() {
     assert!(matches!(artwork.recv().await, Some(ArtworkEvent::Start(_))));
 
     let artwork_frame: Vec<u8> = vec![
-        0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xD8, 0xFF, 0xE0,
+        binary_types::ARTWORK_CHANNEL_2,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0x64,
+        0xFF,
+        0xD8,
+        0xFF,
+        0xE0,
     ];
     server_tx
         .send(WsMessage::Binary(artwork_frame.into()))
@@ -1322,9 +1345,13 @@ async fn test_message_router_forwards_binary_visualizer() {
     ));
 
     for (type_id, timestamp, expected) in [
-        (0x10, 200_i64, vec![0x01, 0x02, 0x03]),
-        (0x11, 0_i64, vec![0x01]),
-        (0x13, 0_i64, vec![0x02, 0x03]),
+        (
+            binary_types::VISUALIZER_LOUDNESS,
+            200_i64,
+            vec![0x01, 0x02, 0x03],
+        ),
+        (binary_types::VISUALIZER_BEAT, 0_i64, vec![0x01]),
+        (binary_types::VISUALIZER_SPECTRUM, 0_i64, vec![0x02, 0x03]),
     ] {
         server_tx
             .send(WsMessage::Binary(

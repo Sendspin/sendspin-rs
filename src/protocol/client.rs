@@ -500,7 +500,7 @@ impl Controller {
     }
 }
 
-/// Binary message type IDs per Sendspin spec
+/// Binary message type IDs per Sendspin spec.
 pub mod binary_types {
     /// Player audio chunk (types 4-7, we use 4)
     pub const PLAYER_AUDIO: u8 = 0x04;
@@ -1231,5 +1231,121 @@ impl ProtocolClient {
             server_hello: self.server_hello,
             guard: self.guard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::AppliedControls;
+    use crate::sync::raw_clock::Clock;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    struct FakeClock(AtomicI64);
+
+    impl FakeClock {
+        fn new(now: i64) -> Self {
+            Self(AtomicI64::new(now))
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now_micros(&self) -> i64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn router_consumes_server_time_after_all_endpoints_are_dropped() {
+        let (left, right) = duplex(4096);
+        let mut server = WebSocketStream::from_raw_socket(left, Role::Server, None).await;
+        let client = WebSocketStream::from_raw_socket(right, Role::Client, None).await;
+        let (_, read) = client.split();
+        let (mut sinks, player, artwork, visualizer, messages) =
+            crate::protocol::routing::ReceiveSinks::channel(AppliedControls {
+                volume: 100,
+                muted: false,
+                static_delay_ms: 0,
+            });
+        drop(player);
+        drop(artwork);
+        drop(visualizer);
+        drop(messages);
+
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
+        let stream_state = Arc::new(StreamState::default());
+        let router_clock_sync = Arc::clone(&clock_sync);
+        let mut router = tokio::spawn(async move {
+            ProtocolClient::message_router(
+                read,
+                &mut sinks,
+                router_clock_sync,
+                clock,
+                stream_state,
+            )
+            .await;
+        });
+
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&Message::StreamStart(StreamStart {
+                    player: Some(crate::protocol::messages::StreamPlayerConfig {
+                        codec: "pcm".into(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    }),
+                    artwork: None,
+                    visualizer: None,
+                }))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut audio = vec![binary_types::PLAYER_AUDIO];
+        audio.extend_from_slice(&42_i64.to_be_bytes());
+        audio.extend_from_slice(&[0, 0x10, 0, 0xf0]);
+        server.send(WsMessage::Binary(audio.into())).await.unwrap();
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&Message::ServerCommand(
+                    crate::protocol::messages::ServerCommand { player: None },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let server_time = Message::ServerTime(crate::protocol::messages::ServerTime {
+            client_transmitted: 1_000,
+            server_received: 2_000,
+            server_transmitted: 3_000,
+        });
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&server_time).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        server.send(WsMessage::Close(None)).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), &mut router).await {
+            Ok(result) => {
+                result.expect("router task panicked while processing dropped destinations")
+            }
+            Err(_) => {
+                router.abort();
+                panic!(
+                    "router did not terminate after all destinations were dropped and peer close"
+                );
+            }
+        }
+        assert_eq!(clock_sync.lock().rtt_micros(), Some(1_000));
     }
 }
