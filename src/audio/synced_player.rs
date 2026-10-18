@@ -339,6 +339,11 @@ impl PlaybackQueue {
         self.queued_frames(channels) as u64 * 1_000_000 / sample_rate.max(1) as u64
     }
 
+    fn enqueue(&mut self, buffer: AudioBuffer) {
+        self.push(buffer);
+        self.enqueue_count += 1;
+    }
+
     fn buffer_count(&self) -> usize {
         self.queue.len() + usize::from(self.current.is_some())
     }
@@ -986,6 +991,133 @@ pub struct SyncedPlayer {
     static_delay_us: Arc<AtomicU64>,
 }
 
+/// Device-independent control handle for session-owned playback.
+#[derive(Clone)]
+pub struct PlaybackControl {
+    format: AudioFormat,
+    queue: Arc<Mutex<PlaybackQueue>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    gain: GainControl,
+    static_delay_us: Arc<AtomicU64>,
+}
+
+impl SyncedPlayer {
+    /// Creates a cloneable, device-independent control handle for this player.
+    ///
+    /// Calls through the returned handle are synchronous, short, and safe to use from
+    /// a session control driver. Cloning the handle is cheap; it does not create or
+    /// move the audio stream.
+    pub fn control(&self) -> PlaybackControl {
+        PlaybackControl {
+            format: self.format.clone(),
+            queue: Arc::clone(&self.queue),
+            last_error: Arc::clone(&self.last_error),
+            gain: self.gain.clone(),
+            static_delay_us: Arc::clone(&self.static_delay_us),
+        }
+    }
+
+    /// Create a control handle without requiring an output device.
+    #[cfg(test)]
+    pub(crate) fn control_for_test(format: AudioFormat) -> PlaybackControl {
+        PlaybackControl {
+            format,
+            queue: Arc::new(Mutex::new(PlaybackQueue::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            gain: GainControl::new(0, false),
+            static_delay_us: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl PlaybackControl {
+    /// Returns the format accepted by this control handle.
+    pub fn format(&self) -> &AudioFormat {
+        &self.format
+    }
+
+    /// Commits a decoded buffer to the playback queue.
+    ///
+    /// Sample rate and channel count must match this control's format; mismatches
+    /// return [`crate::audio::OutputError::FormatMismatch`] without poisoning the
+    /// session. An existing audio-callback failure is returned as `Failed` and is
+    /// retained; `clear` and all setters report that same failure.
+    pub fn commit(&self, buffer: AudioBuffer) -> Result<(), crate::audio::OutputError> {
+        if self.format.sample_rate != buffer.format.sample_rate
+            || self.format.channels != buffer.format.channels
+        {
+            return Err(crate::audio::OutputError::FormatMismatch {
+                expected: self.format.clone(),
+                actual: buffer.format.clone(),
+            });
+        }
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.queue.lock().enqueue(buffer);
+        Ok(())
+    }
+
+    /// Clears queued audio.
+    pub fn clear(&self) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.queue.lock().clear();
+        Ok(())
+    }
+
+    /// Sets the software output volume.
+    pub fn set_volume(&self, volume: u8) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.gain.set_volume(volume);
+        Ok(())
+    }
+
+    /// Sets whether the software output is muted.
+    pub fn set_mute(&self, muted: bool) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.gain.set_mute(muted);
+        Ok(())
+    }
+
+    /// Sets the static playback delay in milliseconds.
+    pub fn set_static_delay(&self, delay_ms: u16) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.static_delay_us
+            .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+        let mut queue = self.queue.lock();
+        if queue.initialized {
+            queue.force_reanchor = true;
+        }
+        Ok(())
+    }
+}
+
+impl crate::audio::PlayerOutput for PlaybackControl {
+    fn commit(&self, buffer: AudioBuffer) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::commit(self, buffer)
+    }
+    fn clear(&self) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::clear(self)
+    }
+    fn set_volume(&self, volume: u8) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_volume(self, volume)
+    }
+    fn set_mute(&self, muted: bool) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_mute(self, muted)
+    }
+    fn set_static_delay(&self, delay_ms: u16) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_static_delay(self, delay_ms)
+    }
+}
+
 impl SyncedPlayer {
     /// Create a new synced player using the provided clock sync and optional device.
     ///
@@ -1127,8 +1259,7 @@ impl SyncedPlayer {
         // enqueues.
         let trace_fields = {
             let mut queue = self.queue.lock();
-            queue.push(buffer);
-            queue.enqueue_count += 1;
+            queue.enqueue(buffer);
             if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
                 Some((
                     queue.enqueue_count,
@@ -2042,7 +2173,7 @@ mod tests {
         static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
         SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
     };
-    use crate::audio::{AudioBuffer, AudioFormat, Codec};
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, OutputError};
     use crate::error::Error;
     use crate::sync::{ClockSync, DefaultClock};
     use cpal::Sample;
@@ -2066,6 +2197,72 @@ mod tests {
             channels: 1,
             ..test_format()
         }
+    }
+
+    fn control_buffer(format: AudioFormat, timestamp: i64) -> AudioBuffer {
+        AudioBuffer {
+            timestamp,
+            samples: Arc::from(vec![0_i32; format.channels as usize * 48].into_boxed_slice()),
+            format,
+        }
+    }
+
+    #[test]
+    fn playback_control_commit_and_clear_reset_queue_state() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        control
+            .commit(control_buffer(test_format(), 1_000))
+            .unwrap();
+        {
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 1);
+            let generation = queue.playback_reset_generation;
+            drop(queue);
+            control.clear().unwrap();
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 0);
+            assert_ne!(queue.playback_reset_generation, generation);
+            assert!(queue.queue.is_empty());
+            assert!(!queue.initialized);
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_sample_rate_and_channel_mismatches_but_ignores_codec() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        let mut wrong_rate = test_format();
+        wrong_rate.sample_rate = 44_100;
+        assert!(matches!(
+            control.commit(control_buffer(wrong_rate, 0)),
+            Err(OutputError::FormatMismatch { .. })
+        ));
+        let mut wrong_channels = test_format();
+        wrong_channels.channels = 1;
+        assert!(matches!(
+            control.commit(control_buffer(wrong_channels, 0)),
+            Err(OutputError::FormatMismatch { .. })
+        ));
+        let mut different_codec = test_format();
+        different_codec.codec = Codec::Opus;
+        control.commit(control_buffer(different_codec, 0)).unwrap();
+    }
+
+    #[test]
+    fn playback_control_retains_callback_error_across_operations() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        *control.last_error.lock() = Some("callback failed".into());
+        let expected = |result: Result<(), OutputError>| {
+            assert_eq!(result, Err(OutputError::Failed("callback failed".into())));
+        };
+        expected(control.commit(control_buffer(test_format(), 0)));
+        expected(control.clear());
+        expected(control.set_volume(50));
+        expected(control.set_mute(true));
+        expected(control.set_static_delay(10));
+        assert_eq!(
+            control.last_error.lock().as_deref(),
+            Some("callback failed")
+        );
     }
 
     #[test]

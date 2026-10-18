@@ -19,6 +19,9 @@ pub mod sync;
 
 pub(crate) mod generation;
 pub(crate) mod log_sampling;
+mod role_core;
+/// Artwork and visualizer stream roles.
+pub mod roles;
 
 pub use audio::GainControl;
 pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};

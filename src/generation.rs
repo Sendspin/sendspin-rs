@@ -2,11 +2,9 @@
 
 /// Identifies the stream boundary that invalidates queued or in-flight work.
 /// Advancement is checked: wrapping could admit work from an older boundary.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StreamGeneration(u64);
 
-#[allow(dead_code)]
 impl StreamGeneration {
     pub(crate) const fn initial() -> Self {
         Self(0)
@@ -27,6 +25,25 @@ impl StreamGeneration {
 /// from [`StreamGeneration`] even when their values coincide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlaybackResetGeneration(u64);
+
+/// Identifies one installed output lifetime within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputIncarnation(u64);
+
+impl OutputIncarnation {
+    pub(crate) const fn initial() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn checked_advance(self) -> Option<Self> {
+        self.0.checked_add(1).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn max_for_test() -> Self {
+        Self(u64::MAX)
+    }
+}
 
 impl PlaybackResetGeneration {
     pub(crate) const fn initial() -> Self {

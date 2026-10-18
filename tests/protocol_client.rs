@@ -1,15 +1,59 @@
 use futures_util::{SinkExt, StreamExt};
+use sendspin::audio::{AppliedControls, AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::error::Error;
 use sendspin::protocol::messages::{
     ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
-    ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message,
-    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, StreamArtworkChannelConfig,
-    StreamArtworkConfig, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
-    VisualizerDataType, VisualizerFormatRequest,
+    ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand,
+    PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode,
+    ServerCommand, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd,
+    StreamPlayerConfig, StreamRequestFormat, StreamStart, VisualizerDataType,
+    VisualizerFormatRequest,
 };
+use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
 use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
+
+#[derive(Clone, Default)]
+struct TestOutput;
+impl PlayerOutput for TestOutput {
+    fn commit(&self, _: AudioBuffer) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_volume(&self, _: u8) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_mute(&self, _: bool) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_static_delay(&self, _: u16) -> Result<(), OutputError> {
+        Ok(())
+    }
+}
+impl ArtworkOutput for TestOutput {
+    type Prepared = Vec<u8>;
+    fn commit(&self, _: u8, _: Self::Prepared) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn end(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+}
+impl VisualizerOutput for TestOutput {
+    type Prepared = Vec<u8>;
+    fn commit(&self, _: Self::Prepared) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn end(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+}
 
 /// Start a local WebSocket server that performs the sendspin handshake
 /// and returns the listener address and a channel to receive messages
@@ -130,25 +174,6 @@ async fn discard_initial_state(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Str
         .await
         .expect("timed out waiting for initial state")
         .expect("channel closed");
-}
-
-/// Drain forwarded protocol messages until one matches `want`. The router
-/// settles stream state *before* forwarding `stream/start` / `stream/end`, so
-/// observing the awaited message here guarantees the request-format gate has
-/// settled too.
-async fn await_message(
-    messages: &mut tokio::sync::mpsc::UnboundedReceiver<Message>,
-    want: impl Fn(&Message) -> bool,
-) {
-    loop {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), messages.recv())
-            .await
-            .expect("timed out waiting for message")
-            .expect("messages channel closed");
-        if want(&msg) {
-            return;
-        }
-    }
 }
 
 async fn recv_stream_request_format(
@@ -352,12 +377,20 @@ async fn test_sender_emits_stream_request_format() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut player = conn.player.attach(
+        TestOutput,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
 
     discard_initial_state(&mut rx).await;
 
     server_tx.send(player_stream_start()).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+    assert!(matches!(player.recv().await, Some(PlayerEvent::Start(_))));
 
     conn.sender
         .request_player_format(PlayerFormatRequest {
@@ -390,12 +423,13 @@ async fn test_sender_emits_artwork_stream_request_format() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut artwork = conn.artwork.attach(TestOutput);
 
     discard_initial_state(&mut rx).await;
 
     server_tx.send(artwork_stream_start()).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+    assert!(matches!(artwork.recv().await, Some(ArtworkEvent::Start(_))));
 
     conn.sender
         .request_artwork_format(ArtworkFormatRequest {
@@ -501,7 +535,8 @@ async fn test_sender_visualizer_request_requires_active_stream() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut visualizer = conn.visualizer.attach(TestOutput);
     discard_initial_state(&mut rx).await;
 
     let request = VisualizerFormatRequest {
@@ -523,7 +558,10 @@ async fn test_sender_visualizer_request_requires_active_stream() {
     );
 
     server_tx.send(visualizer_stream_start()).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+    assert!(matches!(
+        visualizer.recv().await,
+        Some(VisualizerEvent::Start(_))
+    ));
 
     conn.sender
         .request_visualizer_format(request)
@@ -548,15 +586,23 @@ async fn test_sender_rejects_player_request_after_stream_end() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut player = conn.player.attach(
+        TestOutput,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
 
     discard_initial_state(&mut rx).await;
 
     server_tx.send(player_stream_start()).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+    assert!(matches!(player.recv().await, Some(PlayerEvent::Start(_))));
 
     server_tx.send(stream_end(None)).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamEnd(_))).await;
+    assert!(matches!(player.recv().await, Some(PlayerEvent::End)));
 
     let result = conn
         .sender
@@ -590,12 +636,20 @@ async fn test_sender_rejects_artwork_request_without_artwork_stream() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut player = conn.player.attach(
+        TestOutput,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
 
     discard_initial_state(&mut rx).await;
 
     server_tx.send(player_stream_start()).unwrap();
-    await_message(&mut conn.messages, |m| matches!(m, Message::StreamStart(_))).await;
+    assert!(matches!(player.recv().await, Some(PlayerEvent::Start(_))));
 
     let result = conn
         .sender
@@ -1169,7 +1223,7 @@ async fn test_clock_sync_getter_returns_shared_handle() {
 
 #[tokio::test]
 async fn test_message_router_forwards_binary_audio() {
-    // End-to-end: a binary audio frame routes into `conn.audio`.
+    // End-to-end: a binary audio frame routes into a player session.
     let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
@@ -1188,7 +1242,15 @@ async fn test_message_router_forwards_binary_audio() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut session = conn.player.attach(
+        TestOutput,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
 
     // Audio chunk: type 4, 8-byte big-endian timestamp, then payload.
     let audio_frame: Vec<u8> = vec![
@@ -1198,12 +1260,13 @@ async fn test_message_router_forwards_binary_audio() {
         .send(WsMessage::Binary(audio_frame.into()))
         .unwrap();
 
-    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.audio.recv())
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), session.recv())
         .await
-        .expect("timed out waiting for audio chunk")
-        .expect("audio channel closed");
-    assert_eq!(chunk.timestamp, 42);
-    assert_eq!(&*chunk.data, &[0xDE, 0xAD]);
+        .expect("timed out waiting for audio event")
+        .expect("player session closed");
+    assert!(
+        matches!(event, PlayerEvent::Audio(work) if work.timestamp() == 42 && work.data() == [0xDE, 0xAD])
+    );
 }
 
 #[tokio::test]
@@ -1218,23 +1281,25 @@ async fn test_message_router_forwards_binary_artwork() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut artwork = conn.artwork.attach(TestOutput);
+    server_tx.send(artwork_stream_start()).unwrap();
+    assert!(matches!(artwork.recv().await, Some(ArtworkEvent::Start(_))));
 
-    // Artwork channel 2: type 0x0A, 8-byte big-endian timestamp, then payload.
     let artwork_frame: Vec<u8> = vec![
         0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xD8, 0xFF, 0xE0,
     ];
     server_tx
         .send(WsMessage::Binary(artwork_frame.into()))
         .unwrap();
-
-    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.artwork.recv())
-        .await
-        .expect("timed out waiting for artwork chunk")
-        .expect("artwork channel closed");
-    assert_eq!(chunk.channel, 2);
-    assert_eq!(chunk.timestamp, 100);
-    assert_eq!(&*chunk.data, &[0xFF, 0xD8, 0xFF, 0xE0]);
+    let work = match artwork.recv().await {
+        Some(ArtworkEvent::Data(work)) => work,
+        _ => panic!("expected artwork data"),
+    };
+    assert_eq!(work.timestamp(), 100);
+    assert_eq!(work.channel(), 2);
+    assert_eq!(work.data(), &[0xFF, 0xD8, 0xFF, 0xE0]);
+    work.commit(vec![1]).unwrap();
 }
 
 #[tokio::test]
@@ -1248,37 +1313,114 @@ async fn test_message_router_forwards_binary_visualizer() {
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
+    let conn = client.split();
+    let mut visualizer = conn.visualizer.attach(TestOutput);
+    server_tx.send(visualizer_stream_start()).unwrap();
+    assert!(matches!(
+        visualizer.recv().await,
+        Some(VisualizerEvent::Start(_))
+    ));
 
-    // Visualizer: type 0x10, 8-byte big-endian timestamp, then FFT data.
-    let vis_frame: Vec<u8> = vec![
-        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC8, 0x01, 0x02, 0x03,
-    ];
-    server_tx.send(WsMessage::Binary(vis_frame.into())).unwrap();
-
-    let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.visualizer.recv())
-        .await
-        .expect("timed out waiting for visualizer chunk")
-        .expect("visualizer channel closed");
-    assert_eq!(chunk.type_id, 0x10);
-    assert_eq!(chunk.timestamp, 200);
-    assert_eq!(&*chunk.data, &[0x01, 0x02, 0x03]);
-
-    for (type_id, expected) in [(0x11, vec![0x01]), (0x13, vec![0x02, 0x03])] {
+    for (type_id, timestamp, expected) in [
+        (0x10, 200_i64, vec![0x01, 0x02, 0x03]),
+        (0x11, 0_i64, vec![0x01]),
+        (0x13, 0_i64, vec![0x02, 0x03]),
+    ] {
         server_tx
             .send(WsMessage::Binary(
-                [vec![type_id], vec![0; 8], expected.clone()]
-                    .concat()
-                    .into(),
+                [
+                    vec![type_id],
+                    timestamp.to_be_bytes().to_vec(),
+                    expected.clone(),
+                ]
+                .concat()
+                .into(),
             ))
             .unwrap();
-        let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), conn.visualizer.recv())
-            .await
-            .expect("timed out waiting for visualizer chunk")
-            .expect("visualizer channel closed");
-        assert_eq!(chunk.type_id, type_id);
-        assert_eq!(&*chunk.data, expected.as_slice());
+        let work = match visualizer.recv().await {
+            Some(VisualizerEvent::Data(work)) => work,
+            _ => panic!("expected visualizer data"),
+        };
+        assert_eq!(work.type_id(), type_id);
+        assert_eq!(work.timestamp(), timestamp);
+        assert_eq!(work.data(), expected.as_slice());
+        work.commit(vec![type_id]).unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_public_websocket_clear_commands_and_fallback() {
+    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .player_v1_support(PlayerV1Support {
+            supported_formats: vec![AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 24,
+            }],
+            buffer_capacity: 1024,
+            supported_commands: vec!["volume".to_string()],
+        })
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+    let mut player = conn.player.attach(
+        TestOutput,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
+    discard_initial_state(&mut rx).await;
+    server_tx.send(player_stream_start()).unwrap();
+    assert!(matches!(player.recv().await, Some(PlayerEvent::Start(_))));
+
+    server_tx
+        .send(text_message(&Message::StreamClear(StreamClear {
+            roles: Some(vec!["player".to_string()]),
+        })))
+        .unwrap();
+    assert!(matches!(player.recv().await, Some(PlayerEvent::Clear)));
+
+    server_tx
+        .send(text_message(&Message::ServerCommand(ServerCommand {
+            player: Some(PlayerCommand {
+                command: PlayerCommandType::Volume,
+                volume: Some(73),
+                mute: None,
+                static_delay_ms: None,
+            }),
+        })))
+        .unwrap();
+    let mut controls = player.controls();
+    controls.changed().await.unwrap();
+    assert_eq!(controls.borrow().volume, 73);
+
+    let invalid = Message::ServerCommand(ServerCommand {
+        player: Some(PlayerCommand {
+            command: PlayerCommandType::Volume,
+            volume: None,
+            mute: None,
+            static_delay_ms: None,
+        }),
+    });
+    server_tx.send(text_message(&invalid)).unwrap();
+    let fallback = tokio::time::timeout(std::time::Duration::from_secs(2), conn.messages.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        fallback,
+        Message::ServerCommand(ServerCommand {
+            player: Some(PlayerCommand { volume: None, .. })
+        })
+    ));
 }
 
 #[tokio::test]

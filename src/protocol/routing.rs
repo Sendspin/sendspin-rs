@@ -1,13 +1,14 @@
-#![allow(dead_code)]
-
 //! Dispatches role messages into typed, generation-stamped events for role sinks.
 
-use crate::generation::StreamGeneration;
-use crate::protocol::client::{ArtworkChunk, AudioChunk, VisualizerChunk};
-use crate::protocol::messages::{
-    Message, PlayerCommandType, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
-    StreamStart, StreamVisualizerConfig,
-};
+use crate::audio::player_api::{PlayerProducer, PlayerReceiver};
+use crate::audio::AppliedControls;
+use crate::protocol::client::BinaryFrame;
+use crate::protocol::messages::{Message, PlayerCommandType, ServerCommand};
+#[cfg(test)]
+use crate::protocol::messages::{StreamClear, StreamStart};
+use crate::role_core::ProducerError;
+use crate::roles::{ArtworkProducer, ArtworkReceiver, VisualizerProducer, VisualizerReceiver};
+use tokio::sync::mpsc::UnboundedSender;
 
 const ROLE_PLAYER: &str = "player";
 const ROLE_ARTWORK: &str = "artwork";
@@ -18,219 +19,6 @@ pub(crate) enum Role {
     Player,
     Artwork,
     Visualizer,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RoleGeneration {
-    pub(crate) player: StreamGeneration,
-    pub(crate) artwork: StreamGeneration,
-    pub(crate) visualizer: StreamGeneration,
-}
-
-impl Default for RoleGeneration {
-    fn default() -> Self {
-        Self {
-            player: StreamGeneration::initial(),
-            artwork: StreamGeneration::initial(),
-            visualizer: StreamGeneration::initial(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct CommandedControls {
-    pub(crate) volume: Option<u8>,
-    pub(crate) muted: Option<bool>,
-    pub(crate) static_delay_ms: Option<u16>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum RoleEvent {
-    PlayerStart {
-        config: StreamPlayerConfig,
-        generation: StreamGeneration,
-    },
-    ArtworkStart {
-        config: StreamArtworkConfig,
-        generation: StreamGeneration,
-    },
-    VisualizerStart {
-        config: StreamVisualizerConfig,
-        generation: StreamGeneration,
-    },
-    PlayerAudio {
-        chunk: AudioChunk,
-        generation: StreamGeneration,
-    },
-    ArtworkData {
-        chunk: ArtworkChunk,
-        generation: StreamGeneration,
-    },
-    VisualizerData {
-        chunk: VisualizerChunk,
-        generation: StreamGeneration,
-    },
-    Clear {
-        role: Role,
-        generation: StreamGeneration,
-    },
-    End {
-        role: Role,
-        generation: StreamGeneration,
-    },
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RoutingState {
-    generations: RoleGeneration,
-    /// Raw command fields are retained until the session normalizes them.
-    controls: CommandedControls,
-    closed: bool,
-    exhausted: bool,
-}
-
-impl RoutingState {
-    #[cfg(test)]
-    fn with_max_generation(role: Role) -> Self {
-        let mut state = Self::default();
-        match role {
-            Role::Player => state.generations.player = StreamGeneration::max_for_test(),
-            Role::Artwork => state.generations.artwork = StreamGeneration::max_for_test(),
-            Role::Visualizer => state.generations.visualizer = StreamGeneration::max_for_test(),
-        }
-        state
-    }
-
-    pub(crate) fn generation(&self, role: Role) -> StreamGeneration {
-        match role {
-            Role::Player => self.generations.player,
-            Role::Artwork => self.generations.artwork,
-            Role::Visualizer => self.generations.visualizer,
-        }
-    }
-
-    fn advance(&mut self, role: Role) -> Result<StreamGeneration, RoutingError> {
-        if self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        let generation = self.generation(role).checked_advance().ok_or_else(|| {
-            self.exhausted = true;
-            RoutingError::GenerationExhausted
-        })?;
-        match role {
-            Role::Player => self.generations.player = generation,
-            Role::Artwork => self.generations.artwork = generation,
-            Role::Visualizer => self.generations.visualizer = generation,
-        }
-        Ok(generation)
-    }
-
-    pub(crate) fn stream_start(
-        &mut self,
-        start: StreamStart,
-    ) -> Result<Vec<RoleEvent>, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        let mut events = Vec::new();
-        if let (Some(config), generation) = (start.player, self.generation(Role::Player)) {
-            events.push(RoleEvent::PlayerStart { config, generation });
-        }
-        if let (Some(config), generation) = (start.artwork, self.generation(Role::Artwork)) {
-            events.push(RoleEvent::ArtworkStart { config, generation });
-        }
-        if let (Some(config), generation) = (start.visualizer, self.generation(Role::Visualizer)) {
-            events.push(RoleEvent::VisualizerStart { config, generation });
-        }
-        Ok(events)
-    }
-
-    pub(crate) fn audio(&self, chunk: AudioChunk) -> Result<RoleEvent, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        Ok(RoleEvent::PlayerAudio {
-            chunk,
-            generation: self.generation(Role::Player),
-        })
-    }
-
-    pub(crate) fn artwork(&self, chunk: ArtworkChunk) -> Result<RoleEvent, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        Ok(RoleEvent::ArtworkData {
-            chunk,
-            generation: self.generation(Role::Artwork),
-        })
-    }
-
-    pub(crate) fn visualizer(&self, chunk: VisualizerChunk) -> Result<RoleEvent, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        Ok(RoleEvent::VisualizerData {
-            chunk,
-            generation: self.generation(Role::Visualizer),
-        })
-    }
-
-    pub(crate) fn clear(&mut self, clear: StreamClear) -> Result<Vec<RoleEvent>, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        let named_artwork = clear
-            .roles
-            .as_deref()
-            .is_some_and(|roles| roles.iter().any(|role| role == ROLE_ARTWORK));
-        if named_artwork {
-            log::debug!("Ignoring explicit artwork stream clear");
-        }
-        // Artwork clears use an empty image payload, not stream invalidation.
-        let mut targets = role_targets(clear.roles.as_deref());
-        targets.retain(|role| matches!(role, Role::Player | Role::Visualizer));
-        self.boundary(targets, false)
-    }
-
-    pub(crate) fn end(&mut self, end: StreamEnd) -> Result<Vec<RoleEvent>, RoutingError> {
-        if self.closed || self.exhausted {
-            return Err(RoutingError::Closed);
-        }
-        let targets = role_targets(end.roles.as_deref());
-        self.boundary(targets, true)
-    }
-
-    fn boundary(&mut self, targets: Vec<Role>, end: bool) -> Result<Vec<RoleEvent>, RoutingError> {
-        let mut events = Vec::new();
-        for role in targets {
-            let generation = self.advance(role)?;
-            events.push(if end {
-                RoleEvent::End { role, generation }
-            } else {
-                RoleEvent::Clear { role, generation }
-            });
-        }
-        Ok(events)
-    }
-
-    fn merge_command(&mut self, command: &crate::protocol::messages::PlayerCommand) {
-        match command.command {
-            PlayerCommandType::Volume if command.volume.is_some() => {
-                self.controls.volume = command.volume;
-            }
-            PlayerCommandType::Mute if command.mute.is_some() => {
-                self.controls.muted = command.mute;
-            }
-            PlayerCommandType::SetStaticDelay if command.static_delay_ms.is_some() => {
-                self.controls.static_delay_ms = command.static_delay_ms;
-            }
-            _ => {}
-        }
-    }
-
-    pub(crate) fn close(&mut self) {
-        self.closed = true;
-    }
 }
 
 pub(crate) fn role_targets(roles: Option<&[String]>) -> Vec<Role> {
@@ -255,45 +43,743 @@ pub(crate) fn role_targets(roles: Option<&[String]>) -> Vec<Role> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutingError {
-    Closed,
     GenerationExhausted,
 }
 
-pub(crate) fn dispatch(
-    state: &mut RoutingState,
-    message: Message,
-) -> Result<Vec<RoleEvent>, RoutingError> {
-    match message {
-        Message::StreamStart(start) => state.stream_start(start),
-        Message::StreamClear(clear) => state.clear(clear),
-        Message::StreamEnd(end) => state.end(end),
-        Message::ServerCommand(command) => {
-            if state.closed || state.exhausted {
-                return Err(RoutingError::Closed);
+/// Owns the role and message destinations used by the receiving path.
+pub(crate) struct ReceiveSinks {
+    controls: AppliedControls,
+    player: PlayerProducer,
+    artwork: ArtworkProducer,
+    visualizer: VisualizerProducer,
+    messages: UnboundedSender<Message>,
+    player_open: bool,
+    artwork_open: bool,
+    visualizer_open: bool,
+    messages_open: bool,
+}
+
+impl ReceiveSinks {
+    pub(crate) fn channel(
+        initial_controls: AppliedControls,
+    ) -> (
+        Self,
+        PlayerReceiver,
+        ArtworkReceiver,
+        VisualizerReceiver,
+        tokio::sync::mpsc::UnboundedReceiver<Message>,
+    ) {
+        let controls = initial_controls.clone();
+        let (player, player_producer) = PlayerReceiver::channel(initial_controls);
+        let (artwork, artwork_producer) = ArtworkReceiver::channel();
+        let (visualizer, visualizer_producer) = VisualizerReceiver::channel();
+        let (messages, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                controls,
+                player: player_producer,
+                artwork: artwork_producer,
+                visualizer: visualizer_producer,
+                messages,
+                player_open: true,
+                artwork_open: true,
+                visualizer_open: true,
+                messages_open: true,
+            },
+            player,
+            artwork,
+            visualizer,
+            message_rx,
+        )
+    }
+
+    pub(crate) fn close(&self) {
+        self.player.close();
+        self.artwork.close();
+        self.visualizer.close();
+    }
+
+    fn producer_error(error: ProducerError, destination: &str, open: &mut bool) -> bool {
+        match error {
+            ProducerError::ReceiverClosed => {
+                *open = false;
+                log::debug!("{} receiver closed; disabling destination", destination);
+                false
             }
-            if let Some(player) = command.player.as_ref() {
-                state.merge_command(player);
+            ProducerError::GenerationExhausted => {
+                log::error!(
+                    "{} generation exhausted; stopping message router",
+                    destination
+                );
+                true
             }
-            Ok(Vec::new())
         }
-        _ => Ok(Vec::new()),
+    }
+
+    pub(crate) fn dispatch_binary(&mut self, frame: BinaryFrame) -> Result<(), RoutingError> {
+        match frame {
+            BinaryFrame::Audio(chunk) if self.player_open => {
+                if let Err(error) = self.player.audio(chunk) {
+                    if Self::producer_error(error, "Player", &mut self.player_open) {
+                        self.close();
+                        return Err(RoutingError::GenerationExhausted);
+                    }
+                }
+            }
+            BinaryFrame::Artwork(chunk) if self.artwork_open => {
+                if let Err(error) = self.artwork.data(chunk) {
+                    if Self::producer_error(error, "Artwork", &mut self.artwork_open) {
+                        self.close();
+                        return Err(RoutingError::GenerationExhausted);
+                    }
+                }
+            }
+            BinaryFrame::Visualizer(chunk) if self.visualizer_open => {
+                if let Err(error) = self.visualizer.data(chunk) {
+                    if Self::producer_error(error, "Visualizer", &mut self.visualizer_open) {
+                        self.close();
+                        return Err(RoutingError::GenerationExhausted);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn forward_message(&mut self, message: Message) {
+        if self.messages_open && self.messages.send(message).is_err() {
+            self.messages_open = false;
+            log::debug!("Message receiver closed; disabling message destination");
+        }
+    }
+
+    pub(crate) fn dispatch_message(&mut self, message: Message) -> Result<(), RoutingError> {
+        match message {
+            Message::StreamStart(start) => {
+                if let Some(config) = start.player {
+                    if self.player_open {
+                        if let Err(error) = self.player.start(config) {
+                            if Self::producer_error(error, "Player", &mut self.player_open) {
+                                self.close();
+                                return Err(RoutingError::GenerationExhausted);
+                            }
+                        }
+                    }
+                }
+                if let Some(config) = start.artwork {
+                    if self.artwork_open {
+                        if let Err(error) = self.artwork.start(config) {
+                            if Self::producer_error(error, "Artwork", &mut self.artwork_open) {
+                                self.close();
+                                return Err(RoutingError::GenerationExhausted);
+                            }
+                        }
+                    }
+                }
+                if let Some(config) = start.visualizer {
+                    if self.visualizer_open {
+                        if let Err(error) = self.visualizer.start(config) {
+                            if Self::producer_error(error, "Visualizer", &mut self.visualizer_open)
+                            {
+                                self.close();
+                                return Err(RoutingError::GenerationExhausted);
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Message::StreamClear(clear) => {
+                let explicit_artwork = clear
+                    .roles
+                    .as_deref()
+                    .is_some_and(|roles| roles.iter().any(|role| role == ROLE_ARTWORK));
+                if explicit_artwork {
+                    log::debug!("Ignoring explicit artwork clear; artwork has no clear operation");
+                }
+                for role in role_targets(clear.roles.as_deref()) {
+                    match role {
+                        Role::Player if self.player_open => {
+                            if let Err(error) = self.player.clear() {
+                                if Self::producer_error(error, "Player", &mut self.player_open) {
+                                    self.close();
+                                    return Err(RoutingError::GenerationExhausted);
+                                }
+                            }
+                        }
+                        Role::Visualizer if self.visualizer_open => {
+                            if let Err(error) = self.visualizer.clear() {
+                                if Self::producer_error(
+                                    error,
+                                    "Visualizer",
+                                    &mut self.visualizer_open,
+                                ) {
+                                    self.close();
+                                    return Err(RoutingError::GenerationExhausted);
+                                }
+                            }
+                        }
+                        Role::Artwork => {}
+                        Role::Player | Role::Visualizer => {}
+                    }
+                }
+                Ok(())
+            }
+            Message::StreamEnd(end) => {
+                for role in role_targets(end.roles.as_deref()) {
+                    match role {
+                        Role::Player if self.player_open => {
+                            if let Err(error) = self.player.end() {
+                                if Self::producer_error(error, "Player", &mut self.player_open) {
+                                    self.close();
+                                    return Err(RoutingError::GenerationExhausted);
+                                }
+                            }
+                        }
+                        Role::Artwork if self.artwork_open => {
+                            if let Err(error) = self.artwork.end() {
+                                if Self::producer_error(error, "Artwork", &mut self.artwork_open) {
+                                    self.close();
+                                    return Err(RoutingError::GenerationExhausted);
+                                }
+                            }
+                        }
+                        Role::Visualizer if self.visualizer_open => {
+                            if let Err(error) = self.visualizer.end() {
+                                if Self::producer_error(
+                                    error,
+                                    "Visualizer",
+                                    &mut self.visualizer_open,
+                                ) {
+                                    self.close();
+                                    return Err(RoutingError::GenerationExhausted);
+                                }
+                            }
+                        }
+                        Role::Player | Role::Artwork | Role::Visualizer => {}
+                    }
+                }
+                Ok(())
+            }
+            Message::ServerCommand(command) => {
+                let Some(player) = command.player else {
+                    self.forward_message(Message::ServerCommand(command));
+                    return Ok(());
+                };
+                let valid = match player.command {
+                    PlayerCommandType::Volume if player.volume.is_some() => {
+                        self.controls.volume = player.volume.unwrap();
+                        true
+                    }
+                    PlayerCommandType::Mute if player.mute.is_some() => {
+                        self.controls.muted = player.mute.unwrap();
+                        true
+                    }
+                    PlayerCommandType::SetStaticDelay if player.static_delay_ms.is_some() => {
+                        self.controls.static_delay_ms = player.static_delay_ms.unwrap();
+                        true
+                    }
+                    _ => false,
+                };
+                if valid {
+                    match player.command {
+                        PlayerCommandType::Volume => self.player.set_volume(self.controls.volume),
+                        PlayerCommandType::Mute => self.player.set_mute(self.controls.muted),
+                        PlayerCommandType::SetStaticDelay => {
+                            self.player.set_static_delay(self.controls.static_delay_ms)
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.forward_message(Message::ServerCommand(ServerCommand {
+                        player: Some(player),
+                    }));
+                }
+                Ok(())
+            }
+            other => {
+                self.forward_message(other);
+                Ok(())
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::messages::{PlayerCommand, StreamPlayerConfig};
+    use crate::audio::{AudioBuffer, OutputError, PlayerOutput};
+    use crate::protocol::client::{ArtworkChunk, AudioChunk, VisualizerChunk};
+    use crate::protocol::messages::{
+        PlayerCommand, StreamArtworkChannelConfig, StreamArtworkConfig, StreamPlayerConfig,
+        StreamVisualizerConfig,
+    };
+    use crate::roles::{ArtworkOutput, VisualizerOutput};
+    use futures_util::FutureExt;
     use std::sync::Arc;
 
-    fn player_config() -> StreamPlayerConfig {
+    #[derive(Clone, Default)]
+    struct FakePlayer;
+    impl PlayerOutput for FakePlayer {
+        fn commit(&self, _: AudioBuffer) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn set_volume(&self, _: u8) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn set_mute(&self, _: bool) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn set_static_delay(&self, _: u16) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
+    #[derive(Clone, Default)]
+    struct FakeArtwork;
+    impl ArtworkOutput for FakeArtwork {
+        type Prepared = Vec<u8>;
+        fn commit(&self, _: u8, _: Self::Prepared) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn end(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
+    #[derive(Clone, Default)]
+    struct FakeVisualizer;
+    impl VisualizerOutput for FakeVisualizer {
+        type Prepared = Vec<u8>;
+        fn commit(&self, _: Self::Prepared) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn clear(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn end(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
+
+    fn controls() -> AppliedControls {
+        AppliedControls {
+            volume: 50,
+            muted: false,
+            static_delay_ms: 0,
+        }
+    }
+    fn audio(timestamp: i64, data: &[u8]) -> AudioChunk {
+        AudioChunk {
+            timestamp,
+            data: Arc::from(data),
+        }
+    }
+    fn artwork(channel: u8, timestamp: i64, data: &[u8]) -> ArtworkChunk {
+        ArtworkChunk {
+            channel,
+            timestamp,
+            data: Arc::from(data),
+        }
+    }
+    fn visualizer(timestamp: i64, data: &[u8]) -> VisualizerChunk {
+        VisualizerChunk {
+            type_id: 16,
+            timestamp,
+            data: Arc::from(data),
+        }
+    }
+    fn session_player_config(codec: &str) -> StreamPlayerConfig {
         StreamPlayerConfig {
-            codec: "pcm".into(),
+            codec: codec.into(),
             sample_rate: 48_000,
             channels: 2,
             bit_depth: 16,
             codec_header: None,
         }
+    }
+    fn artwork_config() -> StreamArtworkConfig {
+        StreamArtworkConfig {
+            channels: vec![StreamArtworkChannelConfig {
+                source: crate::protocol::messages::ArtworkSource::Album,
+                format: crate::protocol::messages::ImageFormat::Png,
+                width: 10,
+                height: 10,
+            }],
+        }
+    }
+    fn visualizer_config() -> StreamVisualizerConfig {
+        StreamVisualizerConfig {
+            types: vec![crate::protocol::messages::VisualizerDataType::Loudness],
+            rate_max: 10,
+            tracks_downbeats: None,
+            spectrum: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_exhaustion_terminates_router_and_closes_all_sinks() {
+        let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, _) =
+            ReceiveSinks::channel(controls());
+        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut artwork = artwork_receiver.attach(FakeArtwork);
+        let mut visualizer = visualizer_receiver.attach(FakeVisualizer);
+        sinks.player.set_generation_max_for_test();
+        assert_eq!(
+            sinks.dispatch_message(Message::StreamClear(StreamClear {
+                roles: Some(vec![ROLE_PLAYER.into()]),
+            })),
+            Err(RoutingError::GenerationExhausted)
+        );
+        assert!(player.recv().await.is_none());
+        assert!(artwork.recv().await.is_none());
+        assert!(visualizer.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_preserve_encoded_audio_and_config_fifo() {
+        let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
+        let mut session = receiver.attach(FakePlayer, controls());
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: None,
+                visualizer: None,
+            }))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(1, &[1, 2, 3])))
+            .unwrap();
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("opus")),
+                artwork: None,
+                visualizer: None,
+            }))
+            .unwrap();
+        assert!(
+            matches!(session.recv().await, Some(crate::audio::PlayerEvent::Start(c)) if c.codec == "pcm")
+        );
+        assert!(
+            matches!(session.recv().await, Some(crate::audio::PlayerEvent::Audio(w)) if w.timestamp() == 1 && w.data() == [1, 2, 3])
+        );
+        assert!(
+            matches!(session.recv().await, Some(crate::audio::PlayerEvent::Start(c)) if c.codec == "opus")
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_clear_is_urgent_and_valid_command_is_not_forwarded() {
+        let (mut sinks, receiver, _, _, mut messages) = ReceiveSinks::channel(controls());
+        let mut session = receiver.attach(FakePlayer, controls());
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(1, &[9])))
+            .unwrap();
+        sinks
+            .dispatch_message(Message::StreamClear(StreamClear {
+                roles: Some(vec!["player".into()]),
+            }))
+            .unwrap();
+        let mut controls_rx = session.controls();
+        sinks
+            .dispatch_message(Message::ServerCommand(ServerCommand {
+                player: Some(PlayerCommand {
+                    command: PlayerCommandType::Volume,
+                    volume: Some(80),
+                    mute: Some(true),
+                    static_delay_ms: Some(99),
+                }),
+            }))
+            .unwrap();
+        assert!(messages.try_recv().is_err());
+        assert!(matches!(
+            session.recv().await,
+            Some(crate::audio::PlayerEvent::Clear)
+        ));
+        assert!(session.recv().now_or_never().is_none());
+        controls_rx.changed().await.unwrap();
+        assert_eq!(controls_rx.borrow().volume, 80);
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_release_detached_dispatch_reinstall_accepts_fresh_audio() {
+        let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
+        let mut session = receiver.attach_lazy(controls());
+        let format = crate::audio::AudioFormat {
+            codec: crate::audio::Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        };
+        session
+            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
+                format.clone(),
+            ))
+            .unwrap();
+        session.release_output().unwrap();
+        assert_eq!(
+            sinks.dispatch_binary(BinaryFrame::Audio(audio(1, &[1]))),
+            Ok(())
+        );
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: None,
+                visualizer: None,
+            }))
+            .unwrap();
+        session
+            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
+                format.clone(),
+            ))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(2, &[2])))
+            .unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(crate::audio::PlayerEvent::Start(_))
+        ));
+        let crate::audio::PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            work.commit(crate::audio::AudioBuffer {
+                timestamp: 2,
+                samples: std::sync::Arc::from(vec![0, 0]),
+                format
+            }),
+            Ok(())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_sinks_admission_snapshot_keeps_fresh_audio_after_reinstall() {
+        let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
+        let mut session = receiver.attach_lazy(controls());
+        let format = crate::audio::AudioFormat {
+            codec: crate::audio::Codec::Pcm,
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        };
+        session
+            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
+                format.clone(),
+            ))
+            .unwrap();
+        session.release_output().unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(7, &[7])))
+            .unwrap();
+        session
+            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
+                format.clone(),
+            ))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(8, &[8])))
+            .unwrap();
+        let work = loop {
+            match session.recv().await {
+                Some(crate::audio::PlayerEvent::Audio(work)) => break work,
+                _ => continue,
+            }
+        };
+        assert_eq!(work.timestamp(), 8);
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_keep_artwork_and_visualizer_independent() {
+        let (mut sinks, _, artwork_receiver, visualizer_receiver, _) =
+            ReceiveSinks::channel(controls());
+        let mut artwork_session = artwork_receiver.attach(FakeArtwork);
+        let mut visualizer_session = visualizer_receiver.attach(FakeVisualizer);
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: None,
+                artwork: Some(artwork_config()),
+                visualizer: Some(visualizer_config()),
+            }))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Artwork(artwork(2, 3, &[4, 5])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Visualizer(visualizer(6, &[7, 8])))
+            .unwrap();
+        assert!(matches!(
+            artwork_session.recv().await,
+            Some(crate::roles::ArtworkEvent::Start(_))
+        ));
+        assert!(
+            matches!(artwork_session.recv().await, Some(crate::roles::ArtworkEvent::Data(w)) if w.channel() == 2 && w.data() == [4, 5])
+        );
+        assert!(matches!(
+            visualizer_session.recv().await,
+            Some(crate::roles::VisualizerEvent::Start(_))
+        ));
+        assert!(
+            matches!(visualizer_session.recv().await, Some(crate::roles::VisualizerEvent::Data(w)) if w.timestamp() == 6 && w.data() == [7, 8])
+        );
+        sinks.close();
+        assert!(artwork_session.recv().await.is_none());
+        assert!(visualizer_session.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_forward_fallback_messages_once() {
+        let (mut sinks, _, _, _, mut messages) = ReceiveSinks::channel(controls());
+        let message = Message::ServerCommand(ServerCommand { player: None });
+        sinks.dispatch_message(message).unwrap();
+        assert!(matches!(
+            messages.recv().await,
+            Some(Message::ServerCommand(ServerCommand { player: None }))
+        ));
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_player_backlog_does_not_block_boundaries_controls_or_fallback() {
+        let (mut sinks, receiver, _, _, mut messages) = ReceiveSinks::channel(controls());
+        let mut session = receiver.attach(FakePlayer, controls());
+        let mut controls_rx = session.controls();
+        for timestamp in 0..65 {
+            sinks
+                .dispatch_binary(BinaryFrame::Audio(audio(timestamp, &[timestamp as u8])))
+                .unwrap();
+        }
+        sinks
+            .dispatch_message(Message::StreamClear(StreamClear {
+                roles: Some(vec!["player".into()]),
+            }))
+            .unwrap();
+        sinks
+            .dispatch_message(Message::ServerCommand(ServerCommand {
+                player: Some(PlayerCommand {
+                    command: PlayerCommandType::Volume,
+                    volume: Some(77),
+                    mute: None,
+                    static_delay_ms: None,
+                }),
+            }))
+            .unwrap();
+        controls_rx.changed().await.unwrap();
+        sinks
+            .dispatch_message(Message::ServerCommand(ServerCommand { player: None }))
+            .unwrap();
+
+        assert!(matches!(
+            session.recv().await,
+            Some(crate::audio::PlayerEvent::Clear)
+        ));
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(65, &[65])))
+            .unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(crate::audio::PlayerEvent::Audio(work)) if work.timestamp() == 65
+        ));
+        assert_eq!(session.controls().borrow().volume, 77);
+        assert!(matches!(
+            messages.recv().await,
+            Some(Message::ServerCommand(ServerCommand { player: None }))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_artwork_does_not_suppress_player_or_visualizer_start() {
+        let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, _) =
+            ReceiveSinks::channel(controls());
+        drop(artwork_receiver);
+        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut visualizer = visualizer_receiver.attach(FakeVisualizer);
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: Some(artwork_config()),
+                visualizer: Some(visualizer_config()),
+            }))
+            .unwrap();
+        assert!(matches!(
+            player.recv().await,
+            Some(crate::audio::PlayerEvent::Start(_))
+        ));
+        assert!(matches!(
+            visualizer.recv().await,
+            Some(crate::roles::VisualizerEvent::Start(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_messages_do_not_suppress_player_audio() {
+        let (mut sinks, player_receiver, _, _, messages) = ReceiveSinks::channel(controls());
+        drop(messages);
+        let mut player = player_receiver.attach(FakePlayer, controls());
+        sinks
+            .dispatch_message(Message::ServerState(
+                crate::protocol::messages::ServerState {
+                    metadata: None,
+                    controller: None,
+                    color: None,
+                },
+            ))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(9, &[1, 2])))
+            .unwrap();
+        assert!(matches!(
+            player.recv().await,
+            Some(crate::audio::PlayerEvent::Audio(work))
+                if work.timestamp() == 9 && work.data() == [1, 2]
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropped_player_does_not_suppress_artwork_or_visualizer() {
+        let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, _) =
+            ReceiveSinks::channel(controls());
+        drop(player_receiver);
+        let mut artwork_session = artwork_receiver.attach(FakeArtwork);
+        let mut visualizer_session = visualizer_receiver.attach(FakeVisualizer);
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: Some(artwork_config()),
+                visualizer: Some(visualizer_config()),
+            }))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Artwork(super::tests::artwork(1, 10, &[3, 4])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Visualizer(super::tests::visualizer(
+                11,
+                &[5, 6],
+            )))
+            .unwrap();
+        assert!(matches!(
+            artwork_session.recv().await,
+            Some(crate::roles::ArtworkEvent::Start(_))
+        ));
+        assert!(matches!(
+            artwork_session.recv().await,
+            Some(crate::roles::ArtworkEvent::Data(work))
+                if work.channel() == 1 && work.timestamp() == 10 && work.data() == [3, 4]
+        ));
+        assert!(matches!(
+            visualizer_session.recv().await,
+            Some(crate::roles::VisualizerEvent::Start(_))
+        ));
+        assert!(matches!(
+            visualizer_session.recv().await,
+            Some(crate::roles::VisualizerEvent::Data(work))
+                if work.timestamp() == 11 && work.data() == [5, 6]
+        ));
     }
 
     #[test]
@@ -303,234 +789,9 @@ mod tests {
             vec![Role::Player, Role::Artwork, Role::Visualizer]
         );
         assert_eq!(
-            role_targets(Some(&["player".into(), "unknown".into()])),
+            role_targets(Some(&["player".into(), "unknown".into(), "player".into()])),
             vec![Role::Player]
         );
-        let mut state = RoutingState::default();
-        assert!(dispatch(
-            &mut state,
-            Message::StreamEnd(StreamEnd {
-                roles: Some(vec!["unknown".into()])
-            })
-        )
-        .unwrap()
-        .is_empty());
         assert!(role_targets(Some(&[])).is_empty());
-    }
-
-    #[test]
-    fn clear_and_end_targets_follow_role_rules() {
-        let mut state = RoutingState::default();
-        assert!(state
-            .clear(StreamClear { roles: None })
-            .unwrap()
-            .iter()
-            .all(|event| !matches!(
-                event,
-                RoleEvent::Clear {
-                    role: Role::Artwork,
-                    ..
-                }
-            )));
-        assert_eq!(state.end(StreamEnd { roles: None }).unwrap().len(), 3);
-        assert!(state
-            .clear(StreamClear {
-                roles: Some(vec![ROLE_ARTWORK.into()])
-            })
-            .unwrap()
-            .is_empty());
-    }
-
-    #[test]
-    fn starts_stamp_current_generation_and_boundaries_advance_once() {
-        let mut state = RoutingState::default();
-        let events = state.stream_start(StreamStart {
-            player: Some(player_config()),
-            artwork: None,
-            visualizer: None,
-        });
-        let events = events.unwrap();
-        assert!(
-            matches!(events.as_slice(), [RoleEvent::PlayerStart { generation, .. }] if *generation == StreamGeneration::initial())
-        );
-        let first = state
-            .clear(StreamClear {
-                roles: Some(vec!["player".into(), "player".into()]),
-            })
-            .unwrap();
-        assert!(
-            matches!(first.as_slice(), [RoleEvent::Clear { generation, .. }] if *generation == StreamGeneration::initial().checked_advance().unwrap())
-        );
-        assert_eq!(
-            state.generation(Role::Player),
-            StreamGeneration::initial().checked_advance().unwrap()
-        );
-    }
-
-    #[test]
-    fn valid_commands_merge_only_the_named_wire_field() {
-        let mut state = RoutingState::default();
-        state.merge_command(&PlayerCommand {
-            command: PlayerCommandType::Volume,
-            volume: Some(80),
-            mute: Some(true),
-            static_delay_ms: Some(12),
-        });
-        assert_eq!(state.controls.volume, Some(80));
-        assert_eq!(state.controls.muted, None);
-        assert_eq!(state.controls.static_delay_ms, None);
-        state.merge_command(&PlayerCommand {
-            command: PlayerCommandType::Mute,
-            volume: Some(20),
-            mute: Some(true),
-            static_delay_ms: Some(25),
-        });
-        assert_eq!(state.controls.muted, Some(true));
-        state.merge_command(&PlayerCommand {
-            command: PlayerCommandType::SetStaticDelay,
-            volume: None,
-            mute: None,
-            static_delay_ms: Some(25),
-        });
-        assert_eq!(state.controls.static_delay_ms, Some(25));
-        state.merge_command(&PlayerCommand {
-            command: PlayerCommandType::SetStaticDelay,
-            volume: None,
-            mute: None,
-            static_delay_ms: None,
-        });
-        state.merge_command(&PlayerCommand {
-            command: PlayerCommandType::Unknown,
-            volume: Some(1),
-            mute: Some(false),
-            static_delay_ms: Some(1),
-        });
-        assert_eq!(state.controls.static_delay_ms, Some(25));
-        assert_eq!(state.controls.muted, Some(true));
-    }
-
-    #[test]
-    fn empty_unknown_and_other_messages_do_not_change_state() {
-        let mut state = RoutingState::default();
-        let before = state.clone();
-        assert!(dispatch(
-            &mut state,
-            Message::StreamClear(StreamClear {
-                roles: Some(vec![])
-            })
-        )
-        .unwrap()
-        .is_empty());
-        assert!(dispatch(
-            &mut state,
-            Message::ServerCommand(crate::protocol::messages::ServerCommand { player: None })
-        )
-        .unwrap()
-        .is_empty());
-        assert!(dispatch(
-            &mut state,
-            Message::ServerState(crate::protocol::messages::ServerState {
-                metadata: None,
-                controller: None,
-                color: None
-            })
-        )
-        .unwrap()
-        .is_empty());
-        assert_eq!(state.generations, before.generations);
-        assert_eq!(state.controls, before.controls);
-    }
-
-    #[test]
-    fn exhausted_state_rejects_start_boundary_command_and_data() {
-        let mut state = RoutingState::with_max_generation(Role::Player);
-        assert!(matches!(
-            dispatch(
-                &mut state,
-                Message::StreamClear(StreamClear {
-                    roles: Some(vec![ROLE_PLAYER.into()])
-                })
-            ),
-            Err(RoutingError::GenerationExhausted)
-        ));
-        assert!(matches!(
-            dispatch(
-                &mut state,
-                Message::StreamStart(StreamStart {
-                    player: Some(player_config()),
-                    artwork: None,
-                    visualizer: None
-                })
-            ),
-            Err(RoutingError::Closed)
-        ));
-        assert!(matches!(
-            dispatch(
-                &mut state,
-                Message::ServerCommand(crate::protocol::messages::ServerCommand { player: None })
-            ),
-            Err(RoutingError::Closed)
-        ));
-        assert!(state
-            .audio(AudioChunk {
-                timestamp: 1,
-                data: Arc::from([1u8].as_slice())
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn terminal_close_rejects_all_events_without_mutating_generations() {
-        let mut state = RoutingState::default();
-        state.close();
-        let before = state.generations;
-        let start = StreamStart {
-            player: Some(player_config()),
-            artwork: None,
-            visualizer: None,
-        };
-        assert!(matches!(
-            dispatch(&mut state, Message::StreamStart(start)),
-            Err(RoutingError::Closed)
-        ));
-        assert!(matches!(
-            dispatch(
-                &mut state,
-                Message::StreamClear(StreamClear { roles: None })
-            ),
-            Err(RoutingError::Closed)
-        ));
-        assert!(matches!(
-            dispatch(&mut state, Message::StreamEnd(StreamEnd { roles: None })),
-            Err(RoutingError::Closed)
-        ));
-        assert!(matches!(
-            dispatch(
-                &mut state,
-                Message::ServerCommand(crate::protocol::messages::ServerCommand { player: None })
-            ),
-            Err(RoutingError::Closed)
-        ));
-        assert!(state
-            .audio(AudioChunk {
-                timestamp: 1,
-                data: Arc::from([1u8].as_slice())
-            })
-            .is_err());
-        assert!(state
-            .artwork(ArtworkChunk {
-                channel: 0,
-                timestamp: 1,
-                data: Arc::from([1u8].as_slice())
-            })
-            .is_err());
-        assert!(state
-            .visualizer(VisualizerChunk {
-                type_id: 0x10,
-                timestamp: 1,
-                data: Arc::from([1u8].as_slice())
-            })
-            .is_err());
-        assert_eq!(state.generations, before);
     }
 }

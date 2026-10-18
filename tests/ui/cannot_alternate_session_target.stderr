@@ -1,0 +1,11 @@
+error[E0599]: no method named `commit_for` found for struct `AudioWork` in the current scope
+ --> tests/ui/cannot_alternate_session_target.rs:8:18
+  |
+8 |     let _ = work.commit_for(_other, buffer);
+  |                  ^^^^^^^^^^
+  |
+help: there is a method `commit` with a similar name, but with different arguments
+ --> src/audio/player_api.rs
+  |
+  |     pub fn commit(mut self, prepared: AudioBuffer) -> Result<(), CommitRejected> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

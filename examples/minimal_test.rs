@@ -40,7 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Split client
     let conn = client.split();
     let mut message_rx = conn.messages;
-    let mut audio_rx = conn.audio;
+    drop(conn.player);
+    drop(conn.artwork);
+    drop(conn.visualizer);
     let _guard = conn.guard;
 
     println!("\nListening for ALL messages from server...\n");
@@ -50,10 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             Some(msg) = message_rx.recv() => {
                 println!("[TEXT MESSAGE] {:?}", msg);
-            }
-            Some(chunk) = audio_rx.recv() => {
-                println!("[AUDIO CHUNK] timestamp={} size={} bytes",
-                    chunk.timestamp, chunk.data.len());
             }
             else => {
                 println!("Connection closed");
