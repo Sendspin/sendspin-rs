@@ -78,3 +78,7 @@ codegen-units = 1
 [[example]]
 name = "secure_socket"
 required-features = ["native-tls"]
+
+[[example]]
+name = "player"
+test = true
