@@ -29,10 +29,11 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 - PCM decoder (16-bit and 24-bit)
 - Clock synchronization (NTP-style)
 
-**Phase 2: Audio Pipeline** 🚧 (Next)
-- Audio output (cpal integration)
-- Lock-free scheduler
-- End-to-end player
+**Current capabilities**
+- Ordered role streams with responsive playback controls
+- Dedicated player worker example with cpal output
+- Async protocol I/O
+- Typed player, artwork, and visualizer sessions
 
 
 ## Installing build dependencies
@@ -79,6 +80,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 See `examples/` directory for more examples.
+
+### Receiving a stream
+
+After connecting, split the client and attach the role receiver to the output that owns that role. Eager attachment starts the player session and keeps ordered events with the output owner:
+
+```rust,no_run
+use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
+
+fn attach_player<O: PlayerOutput>(
+    receiver: PlayerReceiver,
+    output: O,
+) -> PlayerSession<O> {
+    receiver.attach(
+        output,
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    )
+}
+```
+
+- On the async side, await `session.recv()` and match `PlayerEvent::Audio(work)` before handing `work` to the output-preparation thread. Other event variants remain available to the owning worker.
+- On that thread, prepare the audio and call `AudioWork::commit` with the prepared data. The library rejects work that has been superseded or closed; applications do not need sequence bookkeeping.
+- For lazy playback, use `attach_lazy`; `begin_output_install` returns an `OutputInstallPermit` that installs `PlaybackControl`. See [`examples/player/main.rs`](examples/player/main.rs) for the lazy worker lifecycle.
+- Eager and lazy attachment require a Tokio runtime. Keep output callbacks short, synchronous, nonblocking, and nonreentrant.
+- Drop unused receivers to disable their delivery, and retain the connection guard until shutdown.
 
 ## Architecture
 

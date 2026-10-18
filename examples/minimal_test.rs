@@ -1,5 +1,5 @@
-// ABOUTME: Minimal test to verify we receive ALL server messages
-// ABOUTME: Just connects and prints everything the server sends
+// ABOUTME: Minimal client that prints general non-role protocol messages
+// ABOUTME: Role streams are intentionally dropped and not inspected
 
 use clap::Parser;
 use sendspin::protocol::messages::PlayerState;
@@ -45,9 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(conn.visualizer);
     let _guard = conn.guard;
 
-    println!("\nListening for ALL messages from server...\n");
+    println!("\nListening for general protocol messages from server...\n");
 
-    // Just print everything we receive
+    // Role stream events and audio are consumed by their own receivers, which this client drops.
     loop {
         tokio::select! {
             Some(msg) = message_rx.recv() => {

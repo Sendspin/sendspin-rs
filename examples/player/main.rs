@@ -332,7 +332,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     loop {
         tokio::select! {
             Some(message) = messages.recv() => {
-                if !matches!(message, Message::StreamStart(_) | Message::StreamEnd(_) | Message::StreamClear(_) | Message::ServerCommand(_)) { log::debug!("Received message: {:?}", message); }
+                log::debug!("Received message: {:?}", message);
             }
             changed = status.changed() => {
                 if changed.is_err() || !matches!(*status.borrow(), sendspin::audio::SessionStatus::Open) { break; }

@@ -166,6 +166,8 @@ All three role attach methods start independent urgent drivers on current Tokio 
 
 The live receiving cutover owns typed role endpoints and session-bound work across client, split, and manager paths. The minimal and player examples compile against the lazy session contract, and the player example now decodes encoded audio and commits `AudioWork` through the working playback path.
 
+Step 5 execution: updated the controller, secure, and metadata examples to explicitly dispose of unused role receivers; the minimal example already did so and its wording now reflects the general messages it consumes. Kept connection guards alive for shutdown, removed player-example filtering for role-owned stream markers and commands, retained active-stream guards for format requests, and added eager attach guidance plus a matching compiled `no_run` rustdoc example. README parity was reviewed manually; its code block is not compiled. Verification used `cargo test --example player --all-features`, `cargo test --test protocol_client --test protocol_listener --test connection_manager --all-features`, workspace tests, doctests, examples build, clippy, and warnings-as-errors docs. Step 6 remains responsible for `role_events.rs`, including the required `guard_drop_closes_session` test, plus manager handoff coverage. Full migration tables and changelog updates remain step 7.
+
 ## Risks / decisions
 
 - The coordinator moves into library because expecting callers to compose generations/locks correctly was inconsistent with the requested API. Three small output adapters are deliberate scope growth, not an automatic decoder/device engine.
@@ -173,4 +175,4 @@ The live receiving cutover owns typed role endpoints and session-bound work acro
 - No bounded-media memory policy or 1.0 header/accounting migration. Clear default excludes artwork now; End retains all-role default.
 - Keep one output rate/channels, codec-only switches preserve buffers; no resampling/device-format transition engine.
 - Callbacks under serialization must be nonblocking/nonreentrant; no guarantees against an arbitrary hostile adapter. Built-in calls contain no decode/device/network waits. Existing hardware samples cannot be retracted.
-- No implementation authorized. Session/API ownership design requires fresh review, especially library-driver teardown and lazy output installation.
+- Implementation is authorized. Session/API ownership design has been reviewed, including library-driver teardown and lazy output installation.

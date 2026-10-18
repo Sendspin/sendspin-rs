@@ -439,6 +439,24 @@ impl PlayerReceiver {
     /// then overlaid with any pre-attachment command for each named field; the
     /// resulting values are applied before the session is returned. Output callbacks
     /// are synchronous, short, nonblocking, serialized, and must not reenter this session.
+    ///
+    /// ```rust,no_run
+    /// use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
+    ///
+    /// fn attach_player<O: PlayerOutput>(
+    ///     receiver: PlayerReceiver,
+    ///     output: O,
+    /// ) -> PlayerSession<O> {
+    ///     receiver.attach(
+    ///         output,
+    ///         AppliedControls {
+    ///             volume: 100,
+    ///             muted: false,
+    ///             static_delay_ms: 0,
+    ///         },
+    ///     )
+    /// }
+    /// ```
     pub fn attach<O: PlayerOutput>(
         self,
         output: O,

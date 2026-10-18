@@ -35,6 +35,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let controller = conn
         .controller
         .expect("server should grant controller role");
+    // This example consumes controller/general data only; drop role streams to avoid unread buffers.
+    drop(conn.player);
+    drop(conn.artwork);
+    drop(conn.visualizer);
     let mut message_rx = conn.messages;
     let guard = conn.guard;
 

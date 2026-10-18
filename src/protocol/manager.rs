@@ -79,9 +79,9 @@ impl Default for ManagerConfig {
     }
 }
 
-/// Identical in shape to [`Connection`] except the [`ConnectionGuard`] stays
-/// with the manager: the manager must retain teardown authority so it can
-/// send `client/goodbye (another_server)` to a displaced incumbent.
+/// Connection components delivered by [`ConnectionManager`]. Applications own
+/// these components and should drop unused role receivers to disable delivery;
+/// the manager retains the guard for `client/goodbye (another_server)` teardown.
 pub struct ManagedConnection {
     /// JSON protocol messages from the server.
     pub messages: UnboundedReceiver<Message>,

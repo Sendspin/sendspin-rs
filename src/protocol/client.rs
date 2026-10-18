@@ -90,7 +90,8 @@ where
 }
 
 /// Connection components returned by [`ProtocolClient::split()`].
-/// Use the fields you need; ignore the rest.
+/// Drop role receivers the application does not consume to disable delivery and
+/// avoid unread buffering; retain `guard` until shutdown.
 pub struct Connection {
     /// Protocol messages from the server
     pub messages: UnboundedReceiver<Message>,
@@ -1204,7 +1205,8 @@ impl ProtocolClient {
     /// Split into separate receivers for concurrent processing.
     ///
     /// This allows using `tokio::select!` to process messages and binary
-    /// data concurrently. Use the fields you need; ignore the rest.
+    /// data concurrently. Dropping an unused role receiver disables delivery
+    /// and avoids unread buffering; retain the connection guard until shutdown.
     pub fn split(self) -> Connection {
         let sender = WsSender {
             tx: self.out_tx,
