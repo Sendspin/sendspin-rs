@@ -14,6 +14,10 @@
 pub mod audio;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
+/// Server-role implementation: accept inbound player connections, sync
+/// clocks, stream audio. Prototype scope — see the module docs for what's
+/// deferred.
+pub mod server;
 /// Clock synchronization utilities
 pub mod sync;
 
@@ -25,6 +29,7 @@ pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;
 pub use protocol::manager::{ConnectionManager, ManagedConnection, ManagerConfig};
 pub use protocol::messages::ServerHello;
+pub use server::{ServerConnection, ServerListener};
 pub use sync::raw_clock::{Clock, DefaultClock};
 
 /// Result type for sendspin operations
