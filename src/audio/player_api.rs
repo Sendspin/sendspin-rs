@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch, Notify};
 
 use super::player_session::{
-    Admission, AppliedControls, CommitRejected, Coordinator, InstallRejected, LazyCoordinator,
-    OutputAdapter, OutputError, SessionStatus,
+    Admission, AppliedControls, CommitRejected, ControlUpdate, Coordinator, InstallRejected,
+    LazyCoordinator, OutputAdapter, OutputError, SessionStatus,
 };
 use super::synced_player::PlaybackControl;
 use super::AudioBuffer;
@@ -22,7 +22,7 @@ type LazyOutput = Box<dyn OutputAdapter>;
 type CommitFn = Box<dyn FnOnce(StreamGeneration, AudioBuffer) -> Result<(), CommitRejected> + Send>;
 #[cfg(test)]
 type SetterGate = Arc<(
-    std::sync::mpsc::Sender<()>,
+    std::sync::mpsc::SyncSender<()>,
     parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
 )>;
 
@@ -34,11 +34,11 @@ pub trait PlayerOutput: Clone + Send + Sync + 'static {
     fn commit(&self, buffer: AudioBuffer) -> Result<(), OutputError>;
     /// Clears queued output.
     fn clear(&self) -> Result<(), OutputError>;
-    /// Applies normalized volume.
+    /// Applies clamped volume.
     fn set_volume(&self, volume: u8) -> Result<(), OutputError>;
     /// Applies mute state.
     fn set_mute(&self, muted: bool) -> Result<(), OutputError>;
-    /// Applies normalized static delay.
+    /// Applies clamped static delay.
     fn set_static_delay(&self, delay_ms: u16) -> Result<(), OutputError>;
 }
 
@@ -98,6 +98,13 @@ struct CommandPatch {
     static_delay_ms: Option<u16>,
 }
 impl CommandPatch {
+    fn update(self) -> ControlUpdate {
+        ControlUpdate {
+            volume: self.volume,
+            muted: self.muted,
+            static_delay_ms: self.static_delay_ms,
+        }
+    }
     fn apply_to(self, mut controls: AppliedControls) -> AppliedControls {
         self.apply(&mut controls);
         controls
@@ -435,10 +442,10 @@ impl PlayerReceiver {
     }
     /// Attaches an output and starts the urgent-control driver on the current Tokio runtime.
     ///
-    /// `initial_controls` is normalized (`volume` ≤ 100 and `static_delay_ms` ≤ 5000),
-    /// then overlaid with any pre-attachment command for each named field; the
-    /// resulting values are applied before the session is returned. Output callbacks
-    /// are synchronous, short, nonblocking, serialized, and must not reenter this session.
+    /// `initial_controls` is applied as the starting snapshot, then overlaid with
+    /// any pre-attachment command for each named field; requested values are clamped
+    /// when applied. Output callbacks are synchronous, short, nonblocking, serialized,
+    /// and must not reenter this session.
     ///
     /// ```rust,no_run
     /// use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
@@ -498,11 +505,11 @@ impl PlayerReceiver {
     }
     /// Creates a lazy session whose output can be installed later on the current Tokio runtime.
     ///
-    /// `initial_controls` is normalized and overlaid with pre-attachment commands by
-    /// named field. Controls are published before an output exists and replayed before
-    /// a successful installation is admitted; an installation that fails while applying
-    /// those controls or clearing a retained boundary is terminal; reservation errors
-    /// remain retryable.
+    /// `initial_controls` is applied as the starting snapshot and overlaid with
+    /// pre-attachment commands by named field. Controls are observational before an
+    /// output exists; the lazy session has no control-update API. Installation replays
+    /// the retained controls before admission; application or boundary-clear failures
+    /// are terminal, while reservation errors remain retryable.
     pub fn attach_lazy(self, initial_controls: AppliedControls) -> LazyPlayerSession {
         self.attach_lazy_impl(initial_controls)
     }
@@ -601,10 +608,20 @@ impl Driver {
                         break;
                     }
                 }
-                let mut controls = coordinator.controls();
-                snapshot.commands.apply(&mut controls);
-                if let Err(error) = coordinator.apply_controls_versioned(controls, snapshot.version)
-                {
+                let result = coordinator.apply_controls_transaction(|control_version| {
+                    let mut captured = None;
+                    fence.urgent.send_if_modified(|latest| {
+                        if latest.version > control_version {
+                            captured = Some((latest.commands.update(), latest.version));
+                            latest.commands = CommandPatch::default();
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    captured
+                });
+                if let Err(error) = result {
                     fence.fail(error);
                     break;
                 }
@@ -658,10 +675,20 @@ impl Driver {
                         break;
                     }
                 }
-                let mut controls = coordinator.controls();
-                snapshot.commands.apply(&mut controls);
-                if let Err(error) = coordinator.apply_controls_versioned(controls, snapshot.version)
-                {
+                let result = coordinator.apply_controls_transaction(|control_version| {
+                    let mut captured = None;
+                    fence.urgent.send_if_modified(|latest| {
+                        if latest.version > control_version {
+                            captured = Some((latest.commands.update(), latest.version));
+                            latest.commands = CommandPatch::default();
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    captured
+                });
+                if let Err(error) = result {
                     fence.fail(error);
                     break;
                 }
@@ -767,9 +794,42 @@ impl<O: PlayerOutput> PlayerSession<O> {
     pub fn status(&self) -> watch::Receiver<SessionStatus> {
         self.fence.status.subscribe()
     }
-    /// Subscribes to the latest normalized controls.
+    /// Subscribes to the latest applied control state.
     pub fn controls(&self) -> watch::Receiver<AppliedControls> {
         self.fence.controls.subscribe()
+    }
+    /// Applies the requested fields, merging pending same-field values, and publishes them.
+    /// Unset fields keep their current or queued values; values are clamped when applied.
+    pub fn update_controls(&self, update: ControlUpdate) -> Result<(), OutputError> {
+        let result = self.coordinator.apply_controls_transaction(|_| {
+            let mut captured = None;
+            self.fence.urgent.send_modify(|urgent| {
+                let pending = urgent.commands;
+                urgent.version = urgent.version.wrapping_add(1);
+                captured = Some((
+                    ControlUpdate {
+                        volume: update.volume.or(pending.volume),
+                        muted: update.muted.or(pending.muted),
+                        static_delay_ms: update.static_delay_ms.or(pending.static_delay_ms),
+                    },
+                    urgent.version,
+                ));
+                urgent.commands = CommandPatch::default();
+            });
+            captured
+        });
+        if let Err(error) = &result {
+            self.fence.fail(error.clone());
+        }
+        result
+    }
+    /// Applies a complete control snapshot, overriding all fields, and publishes it.
+    pub fn set_controls(&self, controls: AppliedControls) -> Result<(), OutputError> {
+        self.update_controls(ControlUpdate {
+            volume: Some(controls.volume),
+            muted: Some(controls.muted),
+            static_delay_ms: Some(controls.static_delay_ms),
+        })
     }
     /// Closes the session, then joins its control driver.
     pub async fn shutdown(mut self) {
@@ -797,7 +857,7 @@ pub struct OutputInstallPermit {
     fence: Arc<SessionFence>,
 }
 impl OutputInstallPermit {
-    /// Installs the reserved output and replays current normalized controls.
+    /// Installs the reserved output and replays current applied controls.
     ///
     /// The permit is one-shot. Dropping it abandons the reservation so a later
     /// reservation can be made. Only an installation that fails while applying
@@ -1058,7 +1118,7 @@ impl LazyPlayerSession {
     pub fn status(&self) -> watch::Receiver<SessionStatus> {
         self.receiver.fence.status.subscribe()
     }
-    /// Subscribes to the latest normalized controls.
+    /// Subscribes to the latest applied control state.
     pub fn controls(&self) -> watch::Receiver<AppliedControls> {
         self.receiver.fence.controls.subscribe()
     }
@@ -1099,9 +1159,12 @@ mod tests {
         fail_clear: bool,
         clear_format_mismatch: bool,
         fail_volume: bool,
+        fail_volume_after_attach: Arc<AtomicBool>,
         fail_commit: bool,
         mismatch_commit: bool,
         setter_gate: Option<SetterGate>,
+        setter_gate_enabled: Arc<AtomicBool>,
+        record_static_delay: bool,
         controls: Arc<parking_lot::Mutex<AppliedControls>>,
         calls: Arc<parking_lot::Mutex<Vec<String>>>,
     }
@@ -1152,13 +1215,16 @@ mod tests {
         }
         fn set_volume(&self, volume: u8) -> Result<(), OutputError> {
             #[cfg(test)]
-            if let Some(gate) = &self.setter_gate {
-                gate.0.send(()).unwrap();
-                gate.1.lock().recv().unwrap();
+            let gate = self.setter_gate.clone();
+            if self.setter_gate_enabled.load(Ordering::Acquire) {
+                if let Some(gate) = gate {
+                    gate.0.send(()).unwrap();
+                    gate.1.lock().recv().unwrap();
+                }
             }
             self.controls.lock().volume = volume;
             self.calls.lock().push(format!("volume:{volume}"));
-            if self.fail_volume {
+            if self.fail_volume || self.fail_volume_after_attach.load(Ordering::Acquire) {
                 Err(OutputError::Failed("volume".into()))
             } else {
                 Ok(())
@@ -1170,6 +1236,9 @@ mod tests {
         }
         fn set_static_delay(&self, delay_ms: u16) -> Result<(), OutputError> {
             self.controls.lock().static_delay_ms = delay_ms;
+            if self.record_static_delay {
+                self.calls.lock().push(format!("static_delay:{delay_ms}"));
+            }
             Ok(())
         }
     }
@@ -1204,9 +1273,12 @@ mod tests {
             fail_clear: false,
             clear_format_mismatch: false,
             fail_volume: false,
+            fail_volume_after_attach: Arc::new(AtomicBool::new(false)),
             fail_commit: false,
             mismatch_commit: false,
             setter_gate: None,
+            setter_gate_enabled: Arc::new(AtomicBool::new(true)),
+            record_static_delay: false,
             controls: Arc::new(parking_lot::Mutex::new(AppliedControls {
                 volume: 0,
                 muted: false,
@@ -1271,6 +1343,242 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_set_controls_reapplies_equal_server_value_after_local_change() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let output = output();
+        let calls = Arc::clone(&output.calls);
+        let session = receiver.attach(output, controls());
+        session
+            .set_controls(AppliedControls {
+                volume: 25,
+                ..controls()
+            })
+            .unwrap();
+        producer.set_volume(60);
+        tokio::task::yield_now().await;
+        assert_eq!(session.controls().borrow().volume, 60);
+        assert!(
+            calls
+                .lock()
+                .iter()
+                .filter(|call| *call == "volume:60")
+                .count()
+                >= 1
+        );
+    }
+
+    #[tokio::test]
+    async fn public_update_controls_then_server_applies() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let output = output();
+        let calls = Arc::clone(&output.calls);
+        let session = receiver.attach(output, controls());
+        calls.lock().clear();
+        session
+            .update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            })
+            .unwrap();
+        assert_eq!(calls.lock().as_slice(), ["volume:25"]);
+        producer.set_volume(60);
+        tokio::task::yield_now().await;
+        assert_eq!(session.controls().borrow().volume, 60);
+        assert_eq!(calls.lock().as_slice(), ["volume:25", "volume:60"]);
+    }
+
+    #[tokio::test]
+    async fn public_update_controls_preserves_local_volume_for_mute_and_delay() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let output = output();
+        let calls = Arc::clone(&output.calls);
+        let session = receiver.attach(output, controls());
+        calls.lock().clear();
+        session
+            .update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            })
+            .unwrap();
+        producer.set_mute(true);
+        producer.set_static_delay(60);
+        tokio::task::yield_now().await;
+        let state = session.controls().borrow().clone();
+        assert_eq!(
+            (state.volume, state.muted, state.static_delay_ms),
+            (25, true, 60)
+        );
+        assert!(calls.lock().iter().all(|call| call != "volume:60"));
+    }
+
+    #[tokio::test]
+    async fn public_update_controls_does_not_lose_gated_server_command() {
+        let driver_gate = Arc::new(Notify::new());
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let session =
+            receiver.attach_with_driver_gate(output(), controls(), Arc::clone(&driver_gate));
+        producer.set_volume(60);
+        session
+            .update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            })
+            .unwrap();
+        driver_gate.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(session.controls().borrow().volume, 25);
+    }
+
+    #[tokio::test]
+    async fn public_update_replays_pending_mute_and_delay_without_losing_local_volume() {
+        let driver_gate = Arc::new(Notify::new());
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let output = output();
+        let output_state = Arc::clone(&output.controls);
+        let session =
+            receiver.attach_with_driver_gate(output, controls(), Arc::clone(&driver_gate));
+        let mut controls_rx = session.controls();
+        producer.set_mute(true);
+        producer.set_static_delay(37);
+        session
+            .update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            })
+            .unwrap();
+        assert_eq!(session.controls().borrow().volume, 25);
+        driver_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), controls_rx.changed())
+            .await
+            .expect("timed out waiting for gated producer controls")
+            .unwrap();
+        assert_eq!(
+            *controls_rx.borrow(),
+            AppliedControls {
+                volume: 25,
+                muted: true,
+                static_delay_ms: 37,
+            }
+        );
+        assert_eq!(*output_state.lock(), *controls_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn concurrent_local_updates_serialize_admission_and_preserve_disjoint_fields() {
+        let driver_gate = Arc::new(Notify::new());
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+        let mut output = output();
+        output.setter_gate = Some(Arc::new((
+            first_entered_tx,
+            parking_lot::Mutex::new(first_release_rx),
+        )));
+        let setter_gate_enabled = Arc::clone(&output.setter_gate_enabled);
+        output.record_static_delay = true;
+        let calls = Arc::clone(&output.calls);
+        let actual = Arc::clone(&output.controls);
+        output.setter_gate_enabled.store(false, Ordering::Release);
+        let session = Arc::new(receiver.attach_with_driver_gate(
+            output,
+            controls(),
+            Arc::clone(&driver_gate),
+        ));
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        calls.lock().clear();
+        setter_gate_enabled.store(true, Ordering::Release);
+
+        let first_session = Arc::clone(&session);
+        let (first_result_tx, first_result_rx) = std::sync::mpsc::sync_channel(1);
+        let first = std::thread::spawn(move || {
+            let result = first_session.update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            });
+            first_result_tx.send(result).unwrap();
+        });
+        first_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let second_session = Arc::clone(&session);
+        let (second_started_tx, second_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_result_tx, second_result_rx) = std::sync::mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let result = second_session.update_controls(ControlUpdate {
+                static_delay_ms: Some(37),
+                ..ControlUpdate::default()
+            });
+            second_result_tx.send(result).unwrap();
+        });
+        second_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(second_result_rx.try_recv().is_err());
+
+        first_release_tx.send(()).unwrap();
+        assert!(first_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+        assert!(second_result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .is_ok());
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+
+        driver_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut controls_rx = session.controls();
+            while controls_rx.borrow().volume != 25 || controls_rx.borrow().static_delay_ms != 37 {
+                controls_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("timed out waiting for concurrent control updates");
+        assert_eq!(
+            *actual.lock(),
+            AppliedControls {
+                volume: 25,
+                muted: false,
+                static_delay_ms: 37,
+            }
+        );
+        assert_eq!(calls.lock().as_slice(), ["volume:25", "static_delay:37"]);
+        drop(producer);
+    }
+
+    #[tokio::test]
+    async fn public_update_failure_is_terminal_and_closes_held_work() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let failing = output();
+        let fail_volume = Arc::clone(&failing.fail_volume_after_attach);
+        let mut session = receiver.attach(failing, controls());
+        fail_volume.store(true, Ordering::Release);
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!("audio event")
+        };
+        let error = session
+            .update_controls(ControlUpdate {
+                volume: Some(25),
+                ..ControlUpdate::default()
+            })
+            .expect_err("failed output setter must be returned to the caller");
+        assert!(matches!(error, OutputError::Failed(message) if message == "volume"));
+        assert!(matches!(
+            *session.status().borrow(),
+            SessionStatus::Failed(_)
+        ));
+        assert_eq!(work.commit(buffer()), Err(CommitRejected::Closed));
+        assert!(session.recv().await.is_none());
+        assert!(session.recv().await.is_none());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn public_commit_close_between_wrapper_check_and_admission_is_closed_without_callback() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
@@ -1302,7 +1610,7 @@ mod tests {
         let permit = session.begin_output_install().unwrap();
         let installed = output();
         let clears = Arc::clone(&installed.clears);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut gated = installed.clone();
         gated.setter_gate = Some(Arc::new((entered_tx, parking_lot::Mutex::new(release_rx))));
@@ -2242,7 +2550,7 @@ mod tests {
         producer.audio(chunk()).unwrap();
         let installed = output();
         let clears = Arc::clone(&installed.clears);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let mut gated = installed.clone();
         gated.setter_gate = Some(Arc::new((entered_tx, parking_lot::Mutex::new(release_rx))));

@@ -24,7 +24,7 @@ pub use player_api::{
     PlayerSession,
 };
 pub use player_session::{
-    AppliedControls, CommitRejected, InstallRejected, OutputError, SessionStatus,
+    AppliedControls, CommitRejected, ControlUpdate, InstallRejected, OutputError, SessionStatus,
 };
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};

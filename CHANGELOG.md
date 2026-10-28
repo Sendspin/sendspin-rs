@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added [role-session migration documentation](docs/role-sessions.md), including lazy output release/reinstall and external-source handoff guidance.
 - Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
+- Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
 
 ## [0.3.8](https://github.com/Sendspin/sendspin-rs/compare/v0.3.7...v0.3.8) - 2026-10-15
 

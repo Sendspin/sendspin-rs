@@ -9,27 +9,30 @@ use crate::generation::{OutputIncarnation, StreamGeneration};
 const MAX_STATIC_DELAY_MS: u16 = 5_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Normalized playback controls applied independently of media preparation.
+/// Playback controls applied independently of media preparation.
 pub struct AppliedControls {
-    /// Playback volume, normalized to 0..=100.
+    /// Playback volume, clamped to 0..=100 when applied.
     pub volume: u8,
     /// Whether playback is muted.
     pub muted: bool,
-    /// Static delay in milliseconds, normalized to at most 5000.
+    /// Static delay in milliseconds, clamped to at most 5000 when applied.
     pub static_delay_ms: u16,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-struct ControlPatch {
-    volume: Option<u8>,
-    muted: Option<bool>,
-    static_delay_ms: Option<u16>,
+/// A partial playback-control update. Requested fields override pending values
+/// for the same field; an unset field keeps its current or queued value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ControlUpdate {
+    /// Requested playback volume, clamped to 0..=100 when applied.
+    pub volume: Option<u8>,
+    /// Requested mute state.
+    pub muted: Option<bool>,
+    /// Requested static delay, clamped to at most 5000 milliseconds when applied.
+    pub static_delay_ms: Option<u16>,
 }
 
-#[cfg(test)]
-impl ControlPatch {
-    fn apply(self, controls: &mut AppliedControls) {
+impl ControlUpdate {
+    pub(crate) fn apply(self, controls: &mut AppliedControls) {
         if let Some(value) = self.volume {
             controls.volume = value;
         }
@@ -42,6 +45,9 @@ impl ControlPatch {
         *controls = controls.clone().normalized();
     }
 }
+
+#[cfg(test)]
+type ControlPatch = ControlUpdate;
 
 impl AppliedControls {
     pub(crate) fn normalized(self) -> Self {
@@ -246,9 +252,6 @@ impl<O: OutputAdapter> Coordinator<O> {
     pub(crate) fn status(&self) -> SessionStatus {
         self.shared.state.lock().status.clone()
     }
-    pub(crate) fn controls(&self) -> AppliedControls {
-        self.shared.state.lock().controls.clone()
-    }
     pub(crate) fn shared(&self) -> Arc<Shared<O>> {
         Arc::clone(&self.shared)
     }
@@ -288,22 +291,30 @@ impl<O: OutputAdapter> Coordinator<O> {
         }
     }
 
-    pub(crate) fn apply_controls_versioned(
+    pub(crate) fn apply_controls_transaction(
         &self,
-        controls: AppliedControls,
-        version: u64,
+        capture: impl FnOnce(u64) -> Option<(ControlUpdate, u64)>,
     ) -> Result<(), OutputError> {
         let mut state = self.shared.state.lock();
-        if version < state.control_version {
+        if let SessionStatus::Failed(error) = &state.status {
+            return Err(error.clone());
+        }
+        if matches!(state.status, SessionStatus::Closed) {
+            return Err(OutputError::Failed("session is closed".into()));
+        }
+        let Some((update, version)) = capture(state.control_version) else {
+            return Ok(());
+        };
+        if version <= state.control_version {
             return Ok(());
         }
-        if !matches!(state.status, SessionStatus::Open) {
-            return Ok(());
-        }
-        let controls = controls.normalized();
+        let mut controls = state.controls.clone();
+        update.apply(&mut controls);
         let before = state.controls.clone();
         let Some(mut output) = state.output.take() else {
             state.controls = controls;
+            state.control_version = version;
+            let _ = self.shared.controls.send_replace(state.controls.clone());
             return Ok(());
         };
         let result: Result<(), OutputError> = (|| {
@@ -636,9 +647,6 @@ impl<O: OutputAdapter> LazyCoordinator<O> {
     pub(crate) fn status(&self) -> SessionStatus {
         self.shared.session.lock().status.clone()
     }
-    pub(crate) fn controls(&self) -> AppliedControls {
-        self.shared.session.lock().controls.clone()
-    }
     pub(crate) fn current_generation(&self) -> StreamGeneration {
         self.shared.session.lock().floor
     }
@@ -646,20 +654,25 @@ impl<O: OutputAdapter> LazyCoordinator<O> {
     pub(crate) fn control_version(&self) -> u64 {
         self.shared.session.lock().control_version
     }
-    pub(crate) fn apply_controls_versioned(
+    pub(crate) fn apply_controls_transaction(
         &self,
-        controls: AppliedControls,
-        version: u64,
+        capture: impl FnOnce(u64) -> Option<(ControlUpdate, u64)>,
     ) -> Result<(), OutputError> {
         let mut state = self.shared.session.lock();
-        if !matches!(state.status, SessionStatus::Open) {
+        if let SessionStatus::Failed(error) = &state.status {
+            return Err(error.clone());
+        }
+        if matches!(state.status, SessionStatus::Closed) {
+            return Err(OutputError::Failed("session is closed".into()));
+        }
+        let Some((update, version)) = capture(state.control_version) else {
+            return Ok(());
+        };
+        if version <= state.control_version {
             return Ok(());
         }
-        let (controls, version) = if version < state.control_version {
-            (state.controls.clone(), state.control_version)
-        } else {
-            (controls.normalized(), version)
-        };
+        let mut controls = state.controls.clone();
+        update.apply(&mut controls);
         let before = state.controls.clone();
         let Some(mut output) = state.output.take() else {
             state.controls = controls;
@@ -693,6 +706,7 @@ impl<O: OutputAdapter> LazyCoordinator<O> {
             }
         }
     }
+
     pub(crate) fn close(&self) {
         let mut state = self.shared.session.lock();
         if let Some(mut output) = state.output.take() {
@@ -880,7 +894,7 @@ impl<O: OutputAdapter> LazyWork<O> {
 mod tests {
     use super::*;
     use crate::audio::{AudioBuffer, Codec};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     struct FakeOutput {
@@ -1039,6 +1053,83 @@ mod tests {
         assert_eq!(work.commit(buffer(48_000, 2)), Err(CommitRejected::Closed));
         assert_eq!(c.status(), SessionStatus::Closed);
     }
+    #[test]
+    fn closed_control_update_rejects_before_capture() {
+        let c = coordinator(Arc::new(AtomicUsize::new(0)));
+        c.close();
+        let captured = Arc::new(AtomicBool::new(false));
+        let result = c.apply_controls_transaction({
+            let captured = Arc::clone(&captured);
+            move |_| {
+                captured.store(true, Ordering::SeqCst);
+                Some((
+                    ControlUpdate {
+                        volume: Some(25),
+                        ..ControlUpdate::default()
+                    },
+                    1,
+                ))
+            }
+        });
+        assert_eq!(result, Err(OutputError::Failed("session is closed".into())));
+        assert!(!captured.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_control_update_returns_original_failure_before_capture() {
+        let c = coordinator(Arc::new(AtomicUsize::new(0)));
+        c.shared.state.lock().status =
+            SessionStatus::Failed(OutputError::Failed("original".into()));
+        let first = c.apply_controls_transaction(|_| {
+            Some((
+                ControlUpdate {
+                    volume: Some(25),
+                    ..ControlUpdate::default()
+                },
+                1,
+            ))
+        });
+        assert_eq!(first, Err(OutputError::Failed("original".into())));
+        let captured = Arc::new(AtomicBool::new(false));
+        let second = c.apply_controls_transaction({
+            let captured = Arc::clone(&captured);
+            move |_| {
+                captured.store(true, Ordering::SeqCst);
+                Some((
+                    ControlUpdate {
+                        volume: Some(30),
+                        ..ControlUpdate::default()
+                    },
+                    2,
+                ))
+            }
+        });
+        assert_eq!(second, Err(OutputError::Failed("original".into())));
+        assert!(!captured.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lazy_closed_control_update_rejects_before_capture() {
+        let c = LazyCoordinator::<FakeOutput>::new(controls());
+        c.close();
+        let captured = Arc::new(AtomicBool::new(false));
+        let result = c.apply_controls_transaction({
+            let captured = Arc::clone(&captured);
+            move |_| {
+                captured.store(true, Ordering::SeqCst);
+                Some((
+                    ControlUpdate {
+                        volume: Some(25),
+                        ..ControlUpdate::default()
+                    },
+                    1,
+                ))
+            }
+        });
+        assert_eq!(result, Err(OutputError::Failed("session is closed".into())));
+        assert!(!captured.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn callback_failure_is_terminal_and_cleanup_runs_once() {
         let clears = Arc::new(AtomicUsize::new(0));
