@@ -767,7 +767,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
         if !reservation_matches {
             return Err(InstallRejected::AlreadyInstalled);
         }
-        let (controls, version) = if version < state.control_version {
+        let (controls, version) = if version <= state.control_version {
             (state.controls.clone(), state.control_version)
         } else {
             (controls.normalized(), version)
@@ -1217,6 +1217,49 @@ mod tests {
             c.begin_install(),
             Err(InstallRejected::AlreadyInstalled)
         ));
+    }
+    #[test]
+    fn install_keeps_retained_controls_for_equal_snapshot_version() {
+        let c = lazy();
+        c.apply_controls_transaction(|_| {
+            Some((
+                ControlUpdate {
+                    volume: Some(37),
+                    muted: Some(true),
+                    ..ControlUpdate::default()
+                },
+                1,
+            ))
+        })
+        .unwrap();
+        let stale = AppliedControls {
+            volume: 3,
+            muted: false,
+            static_delay_ms: 1,
+        };
+        let permit = c.begin_install().unwrap();
+        permit
+            .install_with_controls(installable(), 1, stale, || None)
+            .unwrap();
+        let state = c.shared.session.lock();
+        assert_eq!(state.control_version, 1);
+        assert_eq!(state.controls.volume, 37);
+        assert!(state.controls.muted);
+        assert_eq!(state.output.as_ref().unwrap().controls.volume, 37);
+        assert!(state.output.as_ref().unwrap().controls.muted);
+    }
+    #[test]
+    fn initial_install_accepts_initial_controls_at_version_zero() {
+        let c = lazy();
+        let permit = c.begin_install().unwrap();
+        permit.install(installable()).unwrap();
+        let state = c.shared.session.lock();
+        assert_eq!(state.control_version, 0);
+        assert_eq!(state.controls, controls().normalized());
+        assert_eq!(
+            state.output.as_ref().unwrap().controls,
+            controls().normalized()
+        );
     }
     #[test]
     fn release_rejects_old_receipt_and_reinstall_replays_controls() {
