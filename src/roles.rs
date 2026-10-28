@@ -185,20 +185,32 @@ impl ArtworkProducer {
     pub(crate) fn set_generation_max_for_test(&self) {
         *self.generation.lock() = StreamGeneration::max_for_test();
     }
+    fn is_terminated(&self) -> bool {
+        self.terminated.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// Sends a stream start event.
     pub(crate) fn start(&self, c: StreamArtworkConfig) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         self.tx
             .send(ArtRaw::Start(c))
             .map_err(|_| ProducerError::ReceiverClosed)
     }
     /// Sends one encoded artwork frame.
     pub(crate) fn data(&self, c: ArtworkChunk) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         let generation = self.current_generation();
         self.tx
             .send(ArtRaw::Data(c, generation))
             .map_err(|_| ProducerError::ReceiverClosed)
     }
     pub(crate) fn end(&self) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         let generation = match role_core::advance(&self.generation) {
             Ok(generation) => generation,
             Err(error) => {
@@ -426,7 +438,13 @@ impl VisualizerProducer {
     pub(crate) fn set_generation_max_for_test(&self) {
         *self.generation.lock() = StreamGeneration::max_for_test();
     }
+    fn is_terminated(&self) -> bool {
+        self.terminated.load(std::sync::atomic::Ordering::Acquire)
+    }
     fn boundary(&self, a: BoundaryAction) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         let g = match role_core::advance(&self.generation) {
             Ok(generation) => generation,
             Err(error) => {
@@ -444,12 +462,18 @@ impl VisualizerProducer {
     }
     /// Sends a stream start event.
     pub(crate) fn start(&self, c: StreamVisualizerConfig) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         self.tx
             .send(VizRaw::Start(c))
             .map_err(|_| ProducerError::ReceiverClosed)
     }
     /// Sends one encoded visualizer frame.
     pub(crate) fn data(&self, c: VisualizerChunk) -> Result<(), ProducerError> {
+        if self.is_terminated() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         let generation = *self.generation.lock();
         self.tx
             .send(VizRaw::Data(c, generation))
@@ -795,6 +819,22 @@ mod tests {
         assert!(pending.await.is_none());
         assert_eq!(
             *session.status().borrow(),
+            crate::audio::SessionStatus::Failed(error.clone())
+        );
+        assert_eq!(
+            producer.start(art_config()),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            producer.data(art(&[2])),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            producer.end(),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            *session.status().borrow(),
             crate::audio::SessionStatus::Failed(error)
         );
     }
@@ -1070,6 +1110,22 @@ mod tests {
         producer.clear().unwrap();
         boundary_ready.await;
         assert_eq!(work.commit(Prepared(vec![1])), Err(CommitRejected::Closed));
+        assert_eq!(
+            producer.start(viz_config()),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            producer.data(viz(&[2])),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            producer.clear(),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
+        assert_eq!(
+            producer.end(),
+            Err(crate::role_core::ProducerError::ReceiverClosed)
+        );
         assert_eq!(
             *session.status().borrow(),
             crate::audio::SessionStatus::Failed(error)

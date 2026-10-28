@@ -363,6 +363,31 @@ mod tests {
             Ok(())
         }
     }
+    #[derive(Clone)]
+    struct FailingArtwork;
+    impl ArtworkOutput for FailingArtwork {
+        type Prepared = Vec<u8>;
+        fn commit(&self, _: u8, _: Self::Prepared) -> Result<(), OutputError> {
+            Err(OutputError::Failed("artwork commit failed".into()))
+        }
+        fn end(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
+    #[derive(Clone)]
+    struct FailingVisualizer;
+    impl VisualizerOutput for FailingVisualizer {
+        type Prepared = Vec<u8>;
+        fn commit(&self, _: Self::Prepared) -> Result<(), OutputError> {
+            Err(OutputError::Failed("visualizer commit failed".into()))
+        }
+        fn clear(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+        fn end(&self) -> Result<(), OutputError> {
+            Ok(())
+        }
+    }
 
     fn controls() -> AppliedControls {
         AppliedControls {
@@ -629,6 +654,180 @@ mod tests {
         sinks.close();
         assert!(artwork_session.recv().await.is_none());
         assert!(visualizer_session.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_disables_only_failed_artwork_role() {
+        let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, mut messages) =
+            ReceiveSinks::channel(controls());
+        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut artwork = artwork_receiver.attach(FailingArtwork);
+        let mut visualizer = visualizer_receiver.attach(FakeVisualizer);
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: Some(artwork_config()),
+                visualizer: Some(visualizer_config()),
+            }))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Artwork(super::tests::artwork(1, 1, &[1])))
+            .unwrap();
+        assert!(matches!(
+            artwork.recv().await,
+            Some(crate::roles::ArtworkEvent::Start(_))
+        ));
+        let crate::roles::ArtworkEvent::Data(work) = artwork.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            work.commit(Vec::new()),
+            Err(crate::audio::CommitRejected::Output(OutputError::Failed(
+                "artwork commit failed".into()
+            )))
+        );
+        assert!(matches!(
+            *artwork.status().borrow(),
+            crate::audio::SessionStatus::Failed(OutputError::Failed(ref message)) if message == "artwork commit failed"
+        ));
+
+        sinks
+            .dispatch_binary(BinaryFrame::Artwork(super::tests::artwork(1, 2, &[2])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Visualizer(super::tests::visualizer(3, &[3])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(4, &[4, 5])))
+            .unwrap();
+        sinks
+            .dispatch_message(Message::ServerCommand(ServerCommand { player: None }))
+            .unwrap();
+        assert!(!sinks.artwork_open);
+        assert!(sinks.visualizer_open);
+        assert!(sinks.player_open);
+
+        assert!(matches!(
+            visualizer.recv().await,
+            Some(crate::roles::VisualizerEvent::Start(_))
+        ));
+        assert!(matches!(
+            visualizer.recv().await,
+            Some(crate::roles::VisualizerEvent::Data(_))
+        ));
+        assert!(matches!(
+            player.recv().await,
+            Some(crate::audio::PlayerEvent::Start(_))
+        ));
+        let crate::audio::PlayerEvent::Audio(work) = player.recv().await.unwrap() else {
+            panic!()
+        };
+        work.commit(crate::audio::AudioBuffer {
+            timestamp: 4,
+            samples: Arc::from(vec![0, 0]),
+            format: crate::audio::AudioFormat {
+                codec: crate::audio::Codec::Pcm,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            messages.recv().await,
+            Some(Message::ServerCommand(ServerCommand { player: None }))
+        ));
+        artwork.shutdown().await;
+        visualizer.shutdown().await;
+        player.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn receive_sinks_disables_only_failed_visualizer_role() {
+        let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, mut messages) =
+            ReceiveSinks::channel(controls());
+        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut artwork = artwork_receiver.attach(FakeArtwork);
+        let mut visualizer = visualizer_receiver.attach(FailingVisualizer);
+        sinks
+            .dispatch_message(Message::StreamStart(StreamStart {
+                player: Some(session_player_config("pcm")),
+                artwork: Some(artwork_config()),
+                visualizer: Some(visualizer_config()),
+            }))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Visualizer(super::tests::visualizer(1, &[1])))
+            .unwrap();
+        assert!(matches!(
+            visualizer.recv().await,
+            Some(crate::roles::VisualizerEvent::Start(_))
+        ));
+        let crate::roles::VisualizerEvent::Data(work) = visualizer.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            work.commit(Vec::new()),
+            Err(crate::audio::CommitRejected::Output(OutputError::Failed(
+                "visualizer commit failed".into()
+            )))
+        );
+        assert!(matches!(
+            *visualizer.status().borrow(),
+            crate::audio::SessionStatus::Failed(OutputError::Failed(ref message)) if message == "visualizer commit failed"
+        ));
+
+        sinks
+            .dispatch_binary(BinaryFrame::Visualizer(super::tests::visualizer(1, &[2])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Artwork(super::tests::artwork(2, 3, &[3])))
+            .unwrap();
+        sinks
+            .dispatch_binary(BinaryFrame::Audio(audio(4, &[4, 5])))
+            .unwrap();
+        sinks
+            .dispatch_message(Message::ServerCommand(ServerCommand { player: None }))
+            .unwrap();
+        assert!(!sinks.visualizer_open);
+        assert!(sinks.artwork_open);
+        assert!(sinks.player_open);
+
+        assert!(matches!(
+            artwork.recv().await,
+            Some(crate::roles::ArtworkEvent::Start(_))
+        ));
+        assert!(matches!(
+            artwork.recv().await,
+            Some(crate::roles::ArtworkEvent::Data(_))
+        ));
+        assert!(matches!(
+            player.recv().await,
+            Some(crate::audio::PlayerEvent::Start(_))
+        ));
+        let crate::audio::PlayerEvent::Audio(work) = player.recv().await.unwrap() else {
+            panic!()
+        };
+        work.commit(crate::audio::AudioBuffer {
+            timestamp: 4,
+            samples: Arc::from(vec![0, 0]),
+            format: crate::audio::AudioFormat {
+                codec: crate::audio::Codec::Pcm,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            messages.recv().await,
+            Some(Message::ServerCommand(ServerCommand { player: None }))
+        ));
+        artwork.shutdown().await;
+        visualizer.shutdown().await;
+        player.shutdown().await;
     }
 
     #[tokio::test]
