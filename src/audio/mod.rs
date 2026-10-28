@@ -14,8 +14,20 @@ pub mod synced_player;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
 
+pub(crate) mod player_api;
+mod player_session;
+
+pub use crate::protocol::messages::StreamPlayerConfig;
 pub use gain::GainControl;
+pub use player_api::{
+    AudioWork, LazyPlayerSession, OutputInstallPermit, PlayerEvent, PlayerOutput, PlayerReceiver,
+    PlayerSession,
+};
+pub use player_session::{
+    AppliedControls, CommitRejected, ControlUpdate, InstallRejected, OutputError, SessionStatus,
+};
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
+pub use synced_player::PlaybackControl;
 pub use synced_player::{ProcessCallback, SyncedPlayer, SyncedPlayerConfig};
 pub use types::{AudioBuffer, AudioFormat, Codec};

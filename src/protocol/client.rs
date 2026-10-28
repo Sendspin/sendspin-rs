@@ -1,6 +1,7 @@
 // ABOUTME: WebSocket client implementation for Sendspin protocol
 // ABOUTME: Handles connection, message routing, and protocol state machine
 
+use crate::audio::PlayerReceiver;
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
@@ -9,6 +10,7 @@ use crate::protocol::messages::{
     PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat,
     StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
+use crate::roles::{ArtworkReceiver, VisualizerReceiver};
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
 use futures_util::{
@@ -88,16 +90,20 @@ where
 }
 
 /// Connection components returned by [`ProtocolClient::split()`].
-/// Use the fields you need; ignore the rest.
+/// Drop role receivers the application does not consume to disable delivery and
+/// avoid unread buffering; retain `guard` until shutdown.
 pub struct Connection {
     /// Protocol messages from the server
     pub messages: UnboundedReceiver<Message>,
-    /// Audio chunks from the server
-    pub audio: UnboundedReceiver<AudioChunk>,
-    /// Artwork chunks from the server
-    pub artwork: UnboundedReceiver<ArtworkChunk>,
-    /// Visualizer chunks from the server
-    pub visualizer: UnboundedReceiver<VisualizerChunk>,
+    /// Player stream receiver. Attach it with [`PlayerReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub player: PlayerReceiver,
+    /// Artwork stream receiver. Attach it with [`ArtworkReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub artwork: ArtworkReceiver,
+    /// Visualizer stream receiver. Attach it with [`VisualizerReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub visualizer: VisualizerReceiver,
     /// Clock synchronization state
     pub clock_sync: Arc<Mutex<ClockSync>>,
     /// Sender for writing messages to the server
@@ -494,7 +500,7 @@ impl Controller {
     }
 }
 
-/// Binary message type IDs per Sendspin spec
+/// Binary message type IDs per Sendspin spec.
 pub mod binary_types {
     /// Player audio chunk (types 4-7, we use 4)
     pub const PLAYER_AUDIO: u8 = 0x04;
@@ -724,9 +730,9 @@ impl BinaryFrame {
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
     out_tx: UnboundedSender<WriteCommand>,
-    audio_rx: UnboundedReceiver<AudioChunk>,
-    artwork_rx: UnboundedReceiver<ArtworkChunk>,
-    visualizer_rx: UnboundedReceiver<VisualizerChunk>,
+    player: PlayerReceiver,
+    artwork: ArtworkReceiver,
+    visualizer: VisualizerReceiver,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
     server_hello: ServerHello,
@@ -930,10 +936,12 @@ impl ProtocolClient {
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
         let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
-        let (audio_tx, audio_rx) = unbounded_channel();
-        let (artwork_tx, artwork_rx) = unbounded_channel();
-        let (visualizer_tx, visualizer_rx) = unbounded_channel();
-        let (message_tx, message_rx) = unbounded_channel();
+        let (mut sinks, player, artwork, visualizer, message_rx) =
+            crate::protocol::routing::ReceiveSinks::channel(crate::audio::AppliedControls {
+                volume: 100,
+                muted: false,
+                static_delay_ms: 0,
+            });
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let stream_state = Arc::new(StreamState::default());
 
@@ -946,10 +954,7 @@ impl ProtocolClient {
         let router_handle = tokio::spawn(async move {
             Self::message_router(
                 read,
-                audio_tx,
-                artwork_tx,
-                visualizer_tx,
-                message_tx,
+                &mut sinks,
                 clock_sync_router,
                 clock_router,
                 stream_state_router,
@@ -991,9 +996,9 @@ impl ProtocolClient {
 
         Ok(Self {
             out_tx: out_tx.clone(),
-            audio_rx,
-            artwork_rx,
-            visualizer_rx,
+            player,
+            artwork,
+            visualizer,
             message_rx,
             clock_sync,
             server_hello,
@@ -1010,23 +1015,15 @@ impl ProtocolClient {
         })
     }
 
-    #[allow(clippy::too_many_arguments)] // internal plumbing: per-channel senders + shared state
     async fn message_router<S>(
         mut read: SplitStream<WebSocketStream<S>>,
-        audio_tx: UnboundedSender<AudioChunk>,
-        artwork_tx: UnboundedSender<ArtworkChunk>,
-        visualizer_tx: UnboundedSender<VisualizerChunk>,
-        message_tx: UnboundedSender<Message>,
+        sinks: &mut crate::protocol::routing::ReceiveSinks,
         clock_sync: Arc<Mutex<ClockSync>>,
         clock: Arc<dyn Clock>,
         stream_state: Arc<StreamState>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let mut audio_closed = false;
-        let mut artwork_closed = false;
-        let mut visualizer_closed = false;
-        let mut message_closed = false;
         let mut audio_chunk_count = 0u64;
         let mut visualizer_chunk_count = 0u64;
 
@@ -1034,7 +1031,14 @@ impl ProtocolClient {
             match msg {
                 Ok(WsMessage::Binary(data)) => match BinaryFrame::from_bytes(&data) {
                     Ok(BinaryFrame::Audio(chunk)) => {
-                        audio_chunk_count += 1;
+                        audio_chunk_count = match audio_chunk_count.checked_add(1) {
+                            Some(count) => count,
+                            None => {
+                                log::error!("Audio chunk counter exhausted; closing router");
+                                sinks.close();
+                                break;
+                            }
+                        };
                         if should_log_sample(audio_chunk_count) {
                             log::trace!(
                                 "Received audio chunk: chunk={}, timestamp={}µs, payload_bytes={}, wire_bytes={}",
@@ -1044,9 +1048,9 @@ impl ProtocolClient {
                                 data.len()
                             );
                         }
-                        if !audio_closed && audio_tx.send(chunk).is_err() {
-                            log::error!("Audio receiver dropped — audio data will be discarded");
-                            audio_closed = true;
+                        if sinks.dispatch_binary(BinaryFrame::Audio(chunk)).is_err() {
+                            log::error!("Binary routing failed; stopping message router");
+                            break;
                         }
                     }
                     Ok(BinaryFrame::Artwork(chunk)) => {
@@ -1059,15 +1063,20 @@ impl ProtocolClient {
                             chunk.timestamp,
                             chunk.data.len()
                         );
-                        if !artwork_closed && artwork_tx.send(chunk).is_err() {
-                            log::error!(
-                                "Artwork receiver dropped — artwork data will be discarded"
-                            );
-                            artwork_closed = true;
+                        if sinks.dispatch_binary(BinaryFrame::Artwork(chunk)).is_err() {
+                            log::error!("Binary routing failed; stopping message router");
+                            break;
                         }
                     }
                     Ok(BinaryFrame::Visualizer(chunk)) => {
-                        visualizer_chunk_count += 1;
+                        visualizer_chunk_count = match visualizer_chunk_count.checked_add(1) {
+                            Some(count) => count,
+                            None => {
+                                log::error!("Visualizer chunk counter exhausted; closing router");
+                                sinks.close();
+                                break;
+                            }
+                        };
                         if should_log_sample(visualizer_chunk_count) {
                             log::trace!(
                                 "Received visualizer chunk: chunk={}, timestamp={}µs, payload_bytes={}",
@@ -1076,11 +1085,12 @@ impl ProtocolClient {
                                 chunk.data.len()
                             );
                         }
-                        if !visualizer_closed && visualizer_tx.send(chunk).is_err() {
-                            log::error!(
-                                "Visualizer receiver dropped — visualizer data will be discarded"
-                            );
-                            visualizer_closed = true;
+                        if sinks
+                            .dispatch_binary(BinaryFrame::Visualizer(chunk))
+                            .is_err()
+                        {
+                            log::error!("Binary routing failed; stopping message router");
+                            break;
                         }
                     }
                     Ok(BinaryFrame::Unknown { type_id, .. }) => {
@@ -1123,11 +1133,11 @@ impl ProtocolClient {
                                     Message::StreamEnd(end) => stream_state.note_stream_end(end),
                                     _ => {}
                                 }
-                                if !message_closed && message_tx.send(msg).is_err() {
+                                if sinks.dispatch_message(msg).is_err() {
                                     log::error!(
-                                        "Message receiver dropped — messages will be discarded"
+                                        "Message routing failed due to generation exhaustion; stopping message router"
                                     );
-                                    message_closed = true;
+                                    break;
                                 }
                             }
                         }
@@ -1148,6 +1158,7 @@ impl ProtocolClient {
                 _ => {}
             }
         }
+        sinks.close();
         log::debug!("Message router: WebSocket stream ended");
     }
 
@@ -1194,7 +1205,8 @@ impl ProtocolClient {
     /// Split into separate receivers for concurrent processing.
     ///
     /// This allows using `tokio::select!` to process messages and binary
-    /// data concurrently. Use the fields you need; ignore the rest.
+    /// data concurrently. Dropping an unused role receiver disables delivery
+    /// and avoids unread buffering; retain the connection guard until shutdown.
     pub fn split(self) -> Connection {
         let sender = WsSender {
             tx: self.out_tx,
@@ -1210,14 +1222,130 @@ impl ProtocolClient {
             });
         Connection {
             messages: self.message_rx,
-            audio: self.audio_rx,
-            artwork: self.artwork_rx,
-            visualizer: self.visualizer_rx,
+            player: self.player,
+            artwork: self.artwork,
+            visualizer: self.visualizer,
             clock_sync: self.clock_sync,
             sender,
             controller,
             server_hello: self.server_hello,
             guard: self.guard,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::AppliedControls;
+    use crate::sync::raw_clock::Clock;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    struct FakeClock(AtomicI64);
+
+    impl FakeClock {
+        fn new(now: i64) -> Self {
+            Self(AtomicI64::new(now))
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now_micros(&self) -> i64 {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn router_consumes_server_time_after_all_endpoints_are_dropped() {
+        let (left, right) = duplex(4096);
+        let mut server = WebSocketStream::from_raw_socket(left, Role::Server, None).await;
+        let client = WebSocketStream::from_raw_socket(right, Role::Client, None).await;
+        let (_, read) = client.split();
+        let (mut sinks, player, artwork, visualizer, messages) =
+            crate::protocol::routing::ReceiveSinks::channel(AppliedControls {
+                volume: 100,
+                muted: false,
+                static_delay_ms: 0,
+            });
+        drop(player);
+        drop(artwork);
+        drop(visualizer);
+        drop(messages);
+
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
+        let stream_state = Arc::new(StreamState::default());
+        let router_clock_sync = Arc::clone(&clock_sync);
+        let mut router = tokio::spawn(async move {
+            ProtocolClient::message_router(
+                read,
+                &mut sinks,
+                router_clock_sync,
+                clock,
+                stream_state,
+            )
+            .await;
+        });
+
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&Message::StreamStart(StreamStart {
+                    player: Some(crate::protocol::messages::StreamPlayerConfig {
+                        codec: "pcm".into(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    }),
+                    artwork: None,
+                    visualizer: None,
+                }))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut audio = vec![binary_types::PLAYER_AUDIO];
+        audio.extend_from_slice(&42_i64.to_be_bytes());
+        audio.extend_from_slice(&[0, 0x10, 0, 0xf0]);
+        server.send(WsMessage::Binary(audio.into())).await.unwrap();
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&Message::ServerCommand(
+                    crate::protocol::messages::ServerCommand { player: None },
+                ))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let server_time = Message::ServerTime(crate::protocol::messages::ServerTime {
+            client_transmitted: 1_000,
+            server_received: 2_000,
+            server_transmitted: 3_000,
+        });
+        server
+            .send(WsMessage::Text(
+                serde_json::to_string(&server_time).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        server.send(WsMessage::Close(None)).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), &mut router).await {
+            Ok(result) => {
+                result.expect("router task panicked while processing dropped destinations")
+            }
+            Err(_) => {
+                router.abort();
+                panic!(
+                    "router did not terminate after all destinations were dropped and peer close"
+                );
+            }
+        }
+        assert_eq!(clock_sync.lock().rtt_micros(), Some(1_000));
     }
 }

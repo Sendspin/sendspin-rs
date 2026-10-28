@@ -68,6 +68,7 @@ base64 = "0.22"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 mdns-sd = "0.20"
+trybuild = "1.0"
 
 [profile.release]
 opt-level = 3
@@ -77,3 +78,7 @@ codegen-units = 1
 [[example]]
 name = "secure_socket"
 required-features = ["native-tls"]
+
+[[example]]
+name = "player"
+test = true

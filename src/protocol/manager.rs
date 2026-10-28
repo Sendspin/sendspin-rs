@@ -1,14 +1,14 @@
 // ABOUTME: Managed connection lifecycle: concurrent inbound handshakes, spec
 // ABOUTME: multi-server arbitration, and automatic goodbye(another_server).
 
+use crate::audio::PlayerReceiver;
 use crate::error::Error;
-use crate::protocol::client::{
-    ArtworkChunk, AudioChunk, Connection, ConnectionGuard, Controller, VisualizerChunk, WsSender,
-};
+use crate::protocol::client::{Connection, ConnectionGuard, Controller, WsSender};
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ConnectionReason, GoodbyeReason, Message, PlayerState, ServerHello,
 };
+use crate::roles::{ArtworkReceiver, VisualizerReceiver};
 use crate::sync::ClockSync;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
@@ -79,18 +79,21 @@ impl Default for ManagerConfig {
     }
 }
 
-/// Identical in shape to [`Connection`] except the [`ConnectionGuard`] stays
-/// with the manager: the manager must retain teardown authority so it can
-/// send `client/goodbye (another_server)` to a displaced incumbent.
+/// Connection components delivered by [`ConnectionManager`]. Applications own
+/// these components and should drop unused role receivers to disable delivery;
+/// the manager retains the guard for `client/goodbye (another_server)` teardown.
 pub struct ManagedConnection {
     /// JSON protocol messages from the server.
     pub messages: UnboundedReceiver<Message>,
-    /// Audio chunks from the server.
-    pub audio: UnboundedReceiver<AudioChunk>,
-    /// Artwork chunks from the server.
-    pub artwork: UnboundedReceiver<ArtworkChunk>,
-    /// Visualizer chunks from the server.
-    pub visualizer: UnboundedReceiver<VisualizerChunk>,
+    /// Player stream receiver. Attach it with [`PlayerReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub player: PlayerReceiver,
+    /// Artwork stream receiver. Attach it with [`ArtworkReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub artwork: ArtworkReceiver,
+    /// Visualizer stream receiver. Attach it with [`VisualizerReceiver::attach`] to an output
+    /// to consume ordered events.
+    pub visualizer: VisualizerReceiver,
     /// Clock synchronization state. Fresh per connection: audio components
     /// built around it (e.g. `SyncedPlayer`) must be rebuilt per connection.
     pub clock_sync: Arc<Mutex<ClockSync>>,
@@ -495,7 +498,7 @@ fn arbitrate(
 
     let Connection {
         messages,
-        audio,
+        player,
         artwork,
         visualizer,
         clock_sync,
@@ -515,7 +518,7 @@ fn arbitrate(
     // exit via its command channel shortly after.
     let _ = conn_tx.send(ManagedConnection {
         messages,
-        audio,
+        player,
         artwork,
         visualizer,
         clock_sync,

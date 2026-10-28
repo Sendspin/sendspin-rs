@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking receiving API:** audio chunks previously arrived through the unbounded `connection.audio` receiver, while role configuration and controls remained in `messages`; artwork and visualizer chunks likewise had separate receivers. Attach the `player`, `artwork`, and `visualizer` role sessions and commit prepared work through their output contracts instead of consuming role-owned data directly.
+- Player preparation can run on an application-owned worker without blocking urgent controls or ordered boundaries. `AudioWork::commit` reports `FormatMismatch` only for the mismatched item; all other role output failures close the session and require a new connection.
+
+### Added
+
+- Added [role-session migration documentation](docs/role-sessions.md), including lazy output release/reinstall and external-source handoff guidance.
+- Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
+- Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
+
 ## [0.3.8](https://github.com/Sendspin/sendspin-rs/compare/v0.3.7...v0.3.8) - 2026-10-15
 
 ### Fixed

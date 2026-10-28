@@ -2,10 +2,52 @@
 // ABOUTME: handshakes, multi-server arbitration, and automatic goodbyes.
 
 use futures_util::{SinkExt, StreamExt};
+use sendspin::audio::decode::{Decoder, PcmDecoder};
+use sendspin::audio::{
+    AppliedControls, AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput,
+};
+use sendspin::protocol::client::binary_types;
 use sendspin::protocol::manager::{ConnectionManager, ManagerConfig};
 use sendspin::protocol::messages::{ConnectionReason, GoodbyeReason, Message, ServerHello};
 use sendspin::ProtocolClientBuilder;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Clone, Default)]
+struct ManagerOutput {
+    commits: Arc<Mutex<Vec<AudioBufferRecord>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AudioBufferRecord {
+    timestamp: i64,
+    samples: Arc<[i32]>,
+    format: AudioFormat,
+}
+
+impl PlayerOutput for ManagerOutput {
+    fn commit(&self, buffer: AudioBuffer) -> Result<(), OutputError> {
+        self.commits.lock().unwrap().push(AudioBufferRecord {
+            timestamp: buffer.timestamp,
+            samples: buffer.samples,
+            format: buffer.format,
+        });
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_volume(&self, _: u8) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_mute(&self, _: bool) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_static_delay(&self, _: u16) -> Result<(), OutputError> {
+        Ok(())
+    }
+}
+
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -14,13 +56,16 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 /// forwards every subsequent text frame to `messages`.
 struct Peer {
     messages: tokio::sync::mpsc::UnboundedReceiver<String>,
-    /// Send raw frames to the client (unused by most tests; keeps write half alive).
-    _writer: tokio::sync::mpsc::UnboundedSender<WsMessage>,
+    /// Send raw frames to the client, including role hello/state traffic.
+    writer: tokio::sync::mpsc::UnboundedSender<WsMessage>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 async fn connect_peer(url: &str, server_id: &str, reason: ConnectionReason) -> Peer {
-    let (ws, _) = connect_async(url).await.expect("WS connect failed");
+    let (ws, _) = timeout(Duration::from_secs(5), connect_async(url))
+        .await
+        .expect("peer establishment timed out")
+        .expect("WS connect failed");
     let (mut write, mut read) = ws.split();
 
     let hello_text = match read.next().await.expect("no hello").expect("ws error") {
@@ -37,7 +82,7 @@ async fn connect_peer(url: &str, server_id: &str, reason: ConnectionReason) -> P
         server_id: server_id.to_string(),
         name: format!("{server_id} name"),
         version: 1,
-        active_roles: vec![],
+        active_roles: vec!["player@v1".to_string()],
         connection_reason: reason,
     }))
     .unwrap();
@@ -71,7 +116,7 @@ async fn connect_peer(url: &str, server_id: &str, reason: ConnectionReason) -> P
 
     Peer {
         messages: msg_rx,
-        _writer: out_tx,
+        writer: out_tx,
         _tasks: vec![reader, writer],
     }
 }
@@ -133,6 +178,190 @@ async fn expect_channels_close(conn: &mut sendspin::ManagedConnection) {
             Ok(Some(_)) => continue,
             Err(_) => panic!("displaced connection's channels never closed"),
         }
+    }
+}
+
+#[tokio::test]
+async fn manager_role_session_handoff_and_displacement_fences_audio() {
+    let (url, mut mgr) = manager(None).await;
+    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let conn_a = timeout(Duration::from_secs(5), mgr.next_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    let output_a = ManagerOutput::default();
+    let mut session_a = conn_a.player.attach(
+        output_a.clone(),
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
+    peer_a
+        .writer
+        .send(WsMessage::Text(
+            serde_json::to_string(&Message::StreamStart(
+                sendspin::protocol::messages::StreamStart {
+                    player: Some(sendspin::protocol::messages::StreamPlayerConfig {
+                        codec: "pcm".into(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    }),
+                    artwork: None,
+                    visualizer: None,
+                },
+            ))
+            .unwrap()
+            .into(),
+        ))
+        .unwrap();
+    let mut frame_a = vec![binary_types::PLAYER_AUDIO];
+    frame_a.extend_from_slice(&11i64.to_be_bytes());
+    frame_a.extend_from_slice(&[0, 1, 0, 2]);
+    peer_a
+        .writer
+        .send(WsMessage::Binary(frame_a.into()))
+        .unwrap();
+    match timeout(Duration::from_secs(5), session_a.recv())
+        .await
+        .expect("start event timed out")
+        .expect("session ended before start")
+    {
+        PlayerEvent::Start(config) => {
+            assert_eq!(config.codec, "pcm");
+            assert_eq!(config.sample_rate, 48_000);
+            assert_eq!(config.channels, 2);
+            assert_eq!(config.bit_depth, 16);
+        }
+        other => panic!("expected start event, got {other:?}"),
+    }
+    let held = match timeout(Duration::from_secs(5), session_a.recv())
+        .await
+        .expect("audio event timed out")
+        .expect("session ended before audio")
+    {
+        PlayerEvent::Audio(work) => {
+            assert_eq!(work.timestamp(), 11);
+            assert_eq!(work.data(), &[0, 1, 0, 2]);
+            work
+        }
+        other => panic!("expected audio event, got {other:?}"),
+    };
+    let peer_b = connect_peer(&url, "server-b", ConnectionReason::Playback).await;
+    assert_eq!(
+        expect_goodbye(&mut peer_a).await,
+        GoodbyeReason::AnotherServer
+    );
+    assert!(timeout(Duration::from_secs(5), session_a.recv())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        held.commit(AudioBuffer {
+            timestamp: 11,
+            samples: PcmDecoder::new(16).decode(&[0, 1, 0, 2]).unwrap(),
+            format: AudioFormat {
+                codec: Codec::Pcm,
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            },
+        }),
+        Err(sendspin::audio::CommitRejected::Closed)
+    );
+    assert!(output_a.commits.lock().unwrap().is_empty());
+    let conn_b = timeout(Duration::from_secs(5), mgr.next_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    let output_b = ManagerOutput::default();
+    let mut session_b = conn_b.player.attach(
+        output_b.clone(),
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
+    peer_b
+        .writer
+        .send(WsMessage::Text(
+            serde_json::to_string(&Message::StreamStart(
+                sendspin::protocol::messages::StreamStart {
+                    player: Some(sendspin::protocol::messages::StreamPlayerConfig {
+                        codec: "pcm".into(),
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    }),
+                    artwork: None,
+                    visualizer: None,
+                },
+            ))
+            .unwrap()
+            .into(),
+        ))
+        .unwrap();
+    let mut frame_b = vec![binary_types::PLAYER_AUDIO];
+    frame_b.extend_from_slice(&22i64.to_be_bytes());
+    frame_b.extend_from_slice(&[3, 4, 5, 6]);
+    peer_b
+        .writer
+        .send(WsMessage::Binary(frame_b.into()))
+        .unwrap();
+    match timeout(Duration::from_secs(5), session_b.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        PlayerEvent::Start(_) => {}
+        other => panic!("expected replacement start, got {other:?}"),
+    }
+    match timeout(Duration::from_secs(5), session_b.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        PlayerEvent::Audio(work) => {
+            assert_eq!(work.timestamp(), 22);
+            assert_eq!(work.data(), &[3, 4, 5, 6]);
+            let samples = PcmDecoder::new(16).decode(work.data()).unwrap();
+            assert_eq!(
+                work.commit(AudioBuffer {
+                    timestamp: 22,
+                    samples: samples.clone(),
+                    format: AudioFormat {
+                        codec: Codec::Pcm,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    },
+                }),
+                Ok(())
+            );
+            assert_eq!(
+                output_b.commits.lock().unwrap().as_slice(),
+                &[AudioBufferRecord {
+                    timestamp: 22,
+                    samples,
+                    format: AudioFormat {
+                        codec: Codec::Pcm,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    },
+                }]
+            );
+            assert!(output_a.commits.lock().unwrap().is_empty());
+        }
+        other => panic!("expected replacement audio, got {other:?}"),
     }
 }
 

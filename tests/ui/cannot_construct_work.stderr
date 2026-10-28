@@ -1,0 +1,41 @@
+warning: unreachable expression
+ --> tests/ui/cannot_construct_work.rs:7:16
+  |
+6 |         generation: panic!(),
+  |                     -------- any code following this expression is unreachable
+7 |         chunk: panic!(),
+  |                ^^^^^^^^ unreachable expression
+  |
+  = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0451]: fields `commit`, `generation`, `chunk` and `fence` of struct `AudioWork` are private
+ --> tests/ui/cannot_construct_work.rs:5:9
+  |
+4 |     let _ = AudioWork {
+  |             --------- in this type
+5 |         commit: None,
+  |         ^^^^^^ private field
+6 |         generation: panic!(),
+  |         ^^^^^^^^^^ private field
+7 |         chunk: panic!(),
+  |         ^^^^^ private field
+8 |         fence: panic!(),
+  |         ^^^^^ private field
+
+error: type `sendspin::generation::StreamGeneration` is private
+ --> tests/ui/cannot_construct_work.rs:5:17
+  |
+5 |         commit: None,
+  |                 ^^^^ private type
+
+error: type `sendspin::generation::StreamGeneration` is private
+ --> tests/ui/cannot_construct_work.rs:6:21
+  |
+6 |         generation: panic!(),
+  |                     ^^^^^^^^ private type
+
+error: type `audio::player_api::SessionFence` is private
+ --> tests/ui/cannot_construct_work.rs:8:16
+  |
+8 |         fence: panic!(),
+  |                ^^^^^^^^ private type
