@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking receiving API:** audio chunks previously arrived through the unbounded `connection.audio` receiver, while role configuration and controls remained in `messages`; artwork and visualizer chunks likewise had separate receivers. Attach the `player`, `artwork`, and `visualizer` role sessions and commit prepared work through their output contracts instead of consuming role-owned data directly.
-- Player preparation can run on an application-owned worker without blocking urgent controls or ordered boundaries. `AudioWork::commit` reports `FormatMismatch` only for the mismatched item; all other role output failures close the session and require a new connection.
+- **Breaking receiving API:** released audio now arrives through the typed `player`, `artwork`, and `visualizer` role sessions rather than the old `connection.audio` receiver and unbounded role chunks. Role configuration and controls are handled through each session’s typed events and controls.
+- Player preparation can run on an application-owned worker without blocking urgent controls or ordered boundaries. `AudioWork::commit` reports `FormatMismatch` only for the mismatched item; transient player output loss is recoverable through fresh installation, while terminal failures remain terminal for custom roles.
+- Automatic player-state reporting is enabled only with the player role and an initial player-state object; applications can disable it and use explicit partial updates or raw client-state transitions.
 
 ### Added
 
-- Added [role-session migration documentation](docs/role-sessions.md), including lazy output release/reinstall and external-source handoff guidance.
+- Added `StreamDecoder` for selecting and validating PCM, Opus, and FLAC decoders from each stream configuration.
 - Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
 - Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
 

@@ -181,10 +181,6 @@ impl ArtworkReceiver {
     }
 }
 impl ArtworkProducer {
-    #[cfg(test)]
-    pub(crate) fn set_generation_max_for_test(&self) {
-        *self.generation.lock() = StreamGeneration::max_for_test();
-    }
     fn is_terminated(&self) -> bool {
         self.terminated.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -211,13 +207,7 @@ impl ArtworkProducer {
         if self.is_terminated() {
             return Err(ProducerError::ReceiverClosed);
         }
-        let generation = match role_core::advance(&self.generation) {
-            Ok(generation) => generation,
-            Err(error) => {
-                self.close();
-                return Err(error);
-            }
-        };
+        let generation = role_core::advance(&self.generation);
         role_core::publish_boundary(&self.urgent, BoundaryAction::End, generation);
         self.tx
             .send(ArtRaw::End(generation))
@@ -434,10 +424,6 @@ impl VisualizerReceiver {
     }
 }
 impl VisualizerProducer {
-    #[cfg(test)]
-    pub(crate) fn set_generation_max_for_test(&self) {
-        *self.generation.lock() = StreamGeneration::max_for_test();
-    }
     fn is_terminated(&self) -> bool {
         self.terminated.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -445,13 +431,7 @@ impl VisualizerProducer {
         if self.is_terminated() {
             return Err(ProducerError::ReceiverClosed);
         }
-        let g = match role_core::advance(&self.generation) {
-            Ok(generation) => generation,
-            Err(error) => {
-                self.close();
-                return Err(error);
-            }
-        };
+        let g = role_core::advance(&self.generation);
         role_core::publish_boundary(&self.urgent, a, g);
         self.tx
             .send(match a {
@@ -783,28 +763,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn artwork_generation_exhaustion_closes_all_role_sinks() {
-        let (receiver, producer) = ArtworkReceiver::channel();
-        let (other_receiver, other_producer) = VisualizerReceiver::channel();
-        let mut artwork = receiver.attach(ArtworkFake {
-            events: Arc::new(Mutex::new(Vec::new())),
-            boundary: Arc::new(Notify::new()),
-        });
-        let mut visualizer = other_receiver.attach(VisualFake {
-            events: Arc::new(Mutex::new(Vec::new())),
-            clear: Arc::new(Notify::new()),
-        });
-        producer.set_generation_max_for_test();
-        assert_eq!(
-            producer.end(),
-            Err(crate::role_core::ProducerError::GenerationExhausted)
-        );
-        other_producer.close();
-        assert!(artwork.recv().await.is_none());
-        assert!(visualizer.recv().await.is_none());
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn artwork_recv_boundary_failure_returns_none_and_retains_failure_before_driver_poll() {
         let error = OutputError::Failed("end-failed".into());
@@ -932,27 +890,6 @@ mod tests {
         assert!(matches!(session.recv().await, Some(ArtworkEvent::End)));
         assert!(matches!(session.recv().await, Some(ArtworkEvent::Start(_))));
         session.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn visualizer_generation_exhaustion_closes_held_work() {
-        let (receiver, producer) = VisualizerReceiver::channel();
-        let mut session = receiver.attach(VisualFake {
-            events: Arc::new(Mutex::new(Vec::new())),
-            clear: Arc::new(Notify::new()),
-        });
-        producer.data(viz(&[1])).unwrap();
-        let work = match session.recv().await.unwrap() {
-            VisualizerEvent::Data(work) => work,
-            _ => panic!(),
-        };
-        producer.set_generation_max_for_test();
-        assert_eq!(
-            producer.clear(),
-            Err(crate::role_core::ProducerError::GenerationExhausted)
-        );
-        assert_eq!(work.commit(Prepared(vec![1])), Err(CommitRejected::Closed));
-        assert!(session.recv().await.is_none());
     }
 
     #[tokio::test]

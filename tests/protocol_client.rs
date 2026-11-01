@@ -275,6 +275,40 @@ async fn test_connect_without_player_state_sends_state_without_player() {
 }
 
 #[tokio::test]
+async fn test_no_player_sender_can_send_sync_state_without_reporter() {
+    let (url, mut rx, _handle) = start_test_server().await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id("test-client".to_string())
+        .name("Test".to_string())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let split = client.split();
+    discard_initial_state(&mut rx).await;
+    split
+        .sender
+        .send_sync_state(ClientSyncState::ExternalSource)
+        .await
+        .unwrap();
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for sync state")
+            .expect("server channel closed");
+        match serde_json::from_str::<Message>(&message).unwrap() {
+            Message::ClientState(cs) => {
+                assert_eq!(cs.state, Some(ClientSyncState::ExternalSource));
+                assert!(cs.player.is_none());
+                break;
+            }
+            Message::ClientTime(_) => {}
+            other => panic!("expected sync state, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_connect_can_send_initial_external_source_state() {
     let (url, mut rx, _handle) = start_test_server().await;
 
@@ -878,7 +912,10 @@ async fn test_exit_external_source_sends_synchronized_state() {
 
     let state = next_client_state(&mut rx).await;
     assert_eq!(state.state, Some(ClientSyncState::Synchronized));
-    assert!(state.player.is_none());
+    assert!(
+        state.player.is_none(),
+        "opted-out exit must not fabricate player fields"
+    );
 }
 
 #[tokio::test]
@@ -896,8 +933,9 @@ async fn test_exit_external_source_sends_full_player_state() {
 
     client
         .exit_external_source(Some(PlayerState {
-            volume: Some(42),
-            muted: Some(true),
+            volume: None,
+            muted: None,
+            static_delay_ms: Some(3),
             ..Default::default()
         }))
         .await
@@ -906,8 +944,9 @@ async fn test_exit_external_source_sends_full_player_state() {
     let state = next_client_state(&mut rx).await;
     assert_eq!(state.state, Some(ClientSyncState::Synchronized));
     let player = state.player.expect("player state should be present");
-    assert_eq!(player.volume, Some(42));
-    assert_eq!(player.muted, Some(true));
+    assert_eq!(player.volume, None);
+    assert_eq!(player.muted, None);
+    assert_eq!(player.static_delay_ms, Some(3));
 }
 
 // Macro to generate tests for simple controller commands (no parameters).

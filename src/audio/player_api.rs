@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use super::player_session::{
     Admission, AppliedControls, CommitRejected, ControlUpdate, Coordinator, InstallRejected,
-    LazyCoordinator, OutputAdapter, OutputError, SessionStatus,
+    Lifecycle, OutputAdapter, OutputError, SessionStatus,
 };
 use super::synced_player::PlaybackControl;
 use super::AudioBuffer;
@@ -18,7 +18,6 @@ use crate::protocol::client::AudioChunk;
 pub use crate::protocol::messages::StreamPlayerConfig;
 use crate::role_core::ProducerError;
 
-type LazyOutput = Box<dyn OutputAdapter>;
 type CommitFn = Box<dyn FnOnce(StreamGeneration, AudioBuffer) -> Result<(), CommitRejected> + Send>;
 #[cfg(test)]
 type SetterGate = Arc<(
@@ -132,7 +131,8 @@ struct UrgentState {
 
 struct SessionFence {
     status: watch::Sender<SessionStatus>,
-    status_value: Mutex<SessionStatus>,
+    status_value: Arc<Mutex<SessionStatus>>,
+    lifecycle: Arc<Lifecycle>,
     controls: watch::Sender<AppliedControls>,
     urgent: watch::Sender<UrgentState>,
     boundary: Mutex<StreamGeneration>,
@@ -149,30 +149,20 @@ impl SessionFence {
         self.cancelled.store(true, Ordering::Release);
         self.cancel.notify_waiters();
     }
-    fn fail(&self, error: OutputError) {
-        {
-            let mut status = self.status_value.lock();
-            if !matches!(*status, SessionStatus::Open) {
-                return;
-            }
-            *status = SessionStatus::Failed(error.clone());
-            let _ = self.status.send_replace(SessionStatus::Failed(error));
-            self.admission.close();
+    fn publish_terminal(&self, proposed: SessionStatus) {
+        let _transition = self.lifecycle.transition.lock();
+        let mut status = self.status_value.lock();
+        if matches!(*status, SessionStatus::Closed | SessionStatus::Failed(_)) {
+            return;
         }
-        self.cancel();
+        *status = proposed.clone();
+        let _ = self.status.send_replace(proposed);
     }
     fn close(&self) {
         self.cancel.notify_waiters();
         self.admission.close();
-        {
-            let mut status = self.status_value.lock();
-            if !matches!(*status, SessionStatus::Open) {
-                return;
-            }
-            *status = SessionStatus::Closed;
-            let _ = self.status.send_replace(SessionStatus::Closed);
-            self.urgent.send_modify(|urgent| urgent.closed = true);
-        }
+        self.publish_terminal(SessionStatus::Closed);
+        self.urgent.send_modify(|urgent| urgent.closed = true);
         self.cancel();
     }
 }
@@ -197,6 +187,7 @@ impl AudioWork {
             + Send
             + 'static,
     ) -> Self {
+        #[cfg(test)]
         let commit_fence = Arc::clone(&fence);
         Self {
             commit: Some(Box::new(move |generation, buffer| {
@@ -205,13 +196,7 @@ impl AudioWork {
                     reached.wait();
                     release.wait();
                 }
-                let result = commit(work, generation, buffer);
-                if let Err(CommitRejected::Output(error)) = &result {
-                    if matches!(error, OutputError::Failed(_)) {
-                        commit_fence.fail(error.clone());
-                    }
-                }
-                result
+                commit(work, generation, buffer)
             })),
             generation,
             chunk,
@@ -232,15 +217,14 @@ impl AudioWork {
         &self.chunk
     }
 
-    /// Commits prepared audio.
-    ///
-    /// For the player, `FormatMismatch` is a per-item `CommitRejected::Output` and
-    /// leaves the session open. Callback failures are retained as terminal status
-    /// and reject later work. Clear/end/release, missing installed output, and
-    /// terminal closure make older work `Obsolete` or `Closed`. Each work item is
-    /// one-shot; dropping it has no session effect.
+    /// Commits once; dropping work has no session effect. `FormatMismatch` leaves the session open.
+    /// Output failure detaches as `OutputLost`, rejecting admitted work; recovery needs new output/work.
+    /// Clear/end/release or closure reject older work as `Obsolete` or `Closed`.
     pub fn commit(mut self, prepared: AudioBuffer) -> Result<(), CommitRejected> {
-        if !matches!(*self.fence.status_value.lock(), SessionStatus::Open) {
+        if matches!(
+            *self.fence.status_value.lock(),
+            SessionStatus::Closed | SessionStatus::Failed(_)
+        ) {
             return Err(CommitRejected::Closed);
         }
         let receipt_generation = self.generation;
@@ -298,10 +282,6 @@ impl PlayerProducer {
             .map_err(|_| ProducerError::ReceiverClosed)
     }
     #[cfg(test)]
-    pub(crate) fn set_generation_max_for_test(&self) {
-        *self.generation.lock() = StreamGeneration::max_for_test();
-    }
-    #[cfg(test)]
     pub(crate) fn set_controls(&self, controls: AppliedControls) {
         self.fence.urgent.send_modify(|urgent| {
             urgent.version = urgent.version.wrapping_add(1);
@@ -348,15 +328,8 @@ impl PlayerProducer {
     pub(crate) fn clear(&self) -> Result<(), ProducerError> {
         let generation = {
             let mut current = self.generation.lock();
-            let next = match current.checked_advance() {
-                Some(next) => next,
-                None => {
-                    self.fence.close();
-                    return Err(ProducerError::GenerationExhausted);
-                }
-            };
-            *current = next;
-            next
+            *current = current.advance();
+            *current
         };
         *self.fence.boundary.lock() = generation;
         self.fence.urgent.send_modify(|urgent| {
@@ -369,15 +342,8 @@ impl PlayerProducer {
     pub(crate) fn end(&self) -> Result<(), ProducerError> {
         let generation = {
             let mut current = self.generation.lock();
-            let next = match current.checked_advance() {
-                Some(next) => next,
-                None => {
-                    self.fence.close();
-                    return Err(ProducerError::GenerationExhausted);
-                }
-            };
-            *current = next;
-            next
+            *current = current.advance();
+            *current
         };
         *self.fence.boundary.lock() = generation;
         self.fence.urgent.send_modify(|urgent| {
@@ -403,10 +369,16 @@ pub struct PlayerReceiver {
     fence: Arc<SessionFence>,
 }
 impl PlayerReceiver {
+    pub(crate) fn controls(&self) -> watch::Receiver<AppliedControls> {
+        self.fence.controls.subscribe()
+    }
+
     pub(crate) fn channel(initial: AppliedControls) -> (Self, PlayerProducer) {
         let (tx, rx) = mpsc::unbounded_channel();
         let controls = initial.normalized();
         let (status, _) = watch::channel(SessionStatus::Open);
+        let status_value = Arc::new(Mutex::new(SessionStatus::Open));
+        let lifecycle = Arc::new(Lifecycle::new(status.clone(), Arc::clone(&status_value)));
         let (control_tx, _) = watch::channel(controls.clone());
         let (urgent, _) = watch::channel(UrgentState {
             version: 0,
@@ -419,7 +391,8 @@ impl PlayerReceiver {
         ));
         let fence = Arc::new(SessionFence {
             status,
-            status_value: Mutex::new(SessionStatus::Open),
+            status_value,
+            lifecycle,
             controls: control_tx,
             urgent,
             boundary: Mutex::new(StreamGeneration::initial()),
@@ -471,47 +444,57 @@ impl PlayerReceiver {
     ) -> PlayerSession<O> {
         let mut controls = initial_controls.normalized();
         self.fence.urgent.borrow().commands.apply(&mut controls);
-        let coordinator = Coordinator::with_controls_sender(
-            OutputAdapterHandle(output.clone()),
+        let coordinator = Coordinator::<OutputAdapterHandle<O>>::with_admission_and_controls(
             controls.clone(),
-            self.fence.controls.clone(),
             Arc::clone(&self.fence.admission),
+            self.fence.controls.clone(),
+            Arc::clone(&self.fence.lifecycle),
         );
         let shared = coordinator.shared();
         let initial = self.fence.urgent.borrow().clone();
-        if let Err(error) =
-            Coordinator::from_shared(Arc::clone(&shared)).apply_initial_controls(controls.clone())
-        {
-            self.fence.fail(error);
-        } else {
-            let _ = self.fence.controls.send_replace(controls);
-        }
-        let coordinator = Coordinator::from_shared(Arc::clone(&shared));
-        if let Some(boundary) = initial.boundary {
-            if let Err(error) = coordinator.boundary(boundary) {
-                self.fence.fail(error);
+        let latest = initial.clone();
+        if let Ok(permit) = coordinator.begin_install() {
+            let latest_controls = latest.commands.apply_to(controls.clone());
+            let result = permit.install_with_controls(
+                OutputAdapterHandle(output),
+                latest.version,
+                latest_controls.clone(),
+                Some(latest.commands.update()),
+                || latest.boundary,
+            );
+            if result.is_err() {
+                let _ = self.fence.controls.send_replace(controls.clone());
             }
+        } else {
+            let _ = self.fence.controls.send_replace(controls.clone());
         }
-        if initial.closed || !matches!(*self.fence.status_value.lock(), SessionStatus::Open) {
+        if initial.closed
+            || !matches!(
+                *self.fence.status_value.lock(),
+                SessionStatus::Open | SessionStatus::OutputLost(_)
+            )
+        {
             coordinator.close();
         }
         let driver = Driver::start(Arc::clone(&self.fence), shared);
         PlayerSession {
-            rx: self.rx,
+            receiver: self,
             coordinator,
-            fence: self.fence,
             driver: Some(driver),
         }
     }
-    /// Creates a lazy session whose output can be installed later on the current Tokio runtime.
-    ///
-    /// `initial_controls` is applied as the starting snapshot and overlaid with
-    /// pre-attachment commands by named field. Controls are observational before an
-    /// output exists; the lazy session has no control-update API. Installation replays
-    /// the retained controls before admission; application or boundary-clear failures
-    /// are terminal, while reservation errors remain retryable.
-    pub fn attach_lazy(self, initial_controls: AppliedControls) -> LazyPlayerSession {
-        self.attach_lazy_impl(initial_controls)
+    /// Creates a session with no output on the current Tokio runtime.
+    /// Initial controls are overlaid by pre-attachment commands and remain updatable.
+    /// Installation replays retained controls before admitting work.
+    pub fn attach_empty<O: PlayerOutput>(
+        self,
+        initial_controls: AppliedControls,
+    ) -> PlayerSession<O> {
+        self.attach_empty_impl(initial_controls)
+    }
+    /// Creates a `PlaybackControl` session whose output can be installed later.
+    pub fn attach_lazy(self, initial_controls: AppliedControls) -> PlayerSession<PlaybackControl> {
+        self.attach_empty(initial_controls)
     }
 
     #[cfg(test)]
@@ -526,47 +509,53 @@ impl PlayerReceiver {
     }
 
     #[cfg(test)]
-    fn attach_lazy_for_test<O: PlayerOutput>(
+    fn attach_empty_for_test<O: PlayerOutput>(
         self,
         initial_controls: AppliedControls,
-    ) -> LazyPlayerSession {
-        let _ = std::marker::PhantomData::<O>;
-        self.attach_lazy_impl(initial_controls)
+    ) -> PlayerSession<O> {
+        self.attach_empty_impl::<O>(initial_controls)
     }
 
     #[cfg(test)]
-    fn attach_lazy_with_driver_gate(
+    fn attach_empty_with_driver_gate<O: PlayerOutput>(
         self,
         initial_controls: AppliedControls,
         gate: Arc<Notify>,
-    ) -> LazyPlayerSession {
+    ) -> PlayerSession<O> {
         *self.fence.driver_start_gate.lock() = Some(gate);
-        self.attach_lazy_impl(initial_controls)
+        self.attach_empty_impl::<O>(initial_controls)
     }
 
-    fn attach_lazy_impl(self, initial_controls: AppliedControls) -> LazyPlayerSession {
+    fn attach_empty_impl<O: PlayerOutput>(
+        self,
+        initial_controls: AppliedControls,
+    ) -> PlayerSession<O> {
         let mut controls = initial_controls.normalized();
         self.fence.urgent.borrow().commands.apply(&mut controls);
         let fence = Arc::clone(&self.fence);
-        let coordinator = LazyCoordinator::<LazyOutput>::with_admission_and_controls(
+        let coordinator = Coordinator::<OutputAdapterHandle<O>>::with_admission_and_controls(
             controls.clone(),
             Arc::clone(&fence.admission),
             fence.controls.clone(),
+            Arc::clone(&fence.lifecycle),
         );
         let shared = coordinator.shared();
         let initial = fence.urgent.borrow().clone();
-        let coordinator = super::player_session::LazyCoordinator::from_shared(Arc::clone(&shared));
+        let coordinator = super::player_session::Coordinator::from_shared(Arc::clone(&shared));
         let _ = fence.controls.send_replace(controls.clone());
         if let Some(boundary) = initial.boundary {
-            if let Err(error) = coordinator.boundary(boundary) {
-                fence.fail(error);
-            }
+            let _ = coordinator.boundary(boundary);
         }
-        if initial.closed || !matches!(*fence.status_value.lock(), SessionStatus::Open) {
+        if initial.closed
+            || !matches!(
+                *fence.status_value.lock(),
+                SessionStatus::Open | SessionStatus::OutputLost(_)
+            )
+        {
             coordinator.close();
         }
-        let driver = Driver::start_lazy(Arc::clone(&fence), shared);
-        LazyPlayerSession {
+        let driver = Driver::start(Arc::clone(&fence), shared);
+        PlayerSession {
             receiver: self,
             coordinator,
             driver: Some(driver),
@@ -595,7 +584,16 @@ impl Driver {
                 let driver_gate = { fence.driver_start_gate.lock().take() };
                 #[cfg(test)]
                 if let Some(gate) = driver_gate {
-                    gate.notified().await;
+                    let cancelled = cancel.notified();
+                    tokio::pin!(cancelled);
+                    cancelled.as_mut().enable();
+                    if fence.cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = cancelled => break,
+                        _ = gate.notified() => {}
+                    }
                 }
                 let coordinator = Coordinator::from_shared(Arc::clone(&shared));
                 if snapshot.closed {
@@ -603,10 +601,7 @@ impl Driver {
                     break;
                 }
                 if let Some(boundary) = snapshot.boundary {
-                    if let Err(error) = coordinator.boundary(boundary) {
-                        fence.fail(error);
-                        break;
-                    }
+                    let _ = coordinator.boundary(boundary);
                 }
                 let result = coordinator.apply_controls_transaction(|control_version| {
                     let mut captured = None;
@@ -621,14 +616,18 @@ impl Driver {
                     });
                     captured
                 });
-                if let Err(error) = result {
-                    fence.fail(error);
-                    break;
-                }
+                let _ = result;
                 tokio::select! {
                     _ = cancel.notified() => break,
                     changed = status.changed() => {
-                        if changed.is_err() || !matches!(*status.borrow(), SessionStatus::Open) { break; }
+                        if changed.is_err()
+                            || matches!(
+                                *status.borrow(),
+                                SessionStatus::Closed | SessionStatus::Failed(_)
+                            )
+                        {
+                            break;
+                        }
                     }
                     changed = urgent.changed() => {
                         if changed.is_err() { break; }
@@ -644,68 +643,6 @@ impl Driver {
             let _ = task.await;
         }
     }
-    fn start_lazy<O: OutputAdapter + 'static>(
-        fence: Arc<SessionFence>,
-        coordinator: Arc<super::player_session::LazyShared<O>>,
-    ) -> Self {
-        let mut urgent = fence.urgent.subscribe();
-        let mut status = fence.status.subscribe();
-        let cancel = Arc::clone(&fence.cancel);
-        let task = tokio::spawn(async move {
-            loop {
-                if fence.cancelled.load(Ordering::Acquire) {
-                    break;
-                }
-                let snapshot = urgent.borrow().clone();
-                #[cfg(test)]
-                let driver_gate = { fence.driver_start_gate.lock().take() };
-                #[cfg(test)]
-                if let Some(gate) = driver_gate {
-                    gate.notified().await;
-                }
-                let coordinator =
-                    super::player_session::LazyCoordinator::from_shared(Arc::clone(&coordinator));
-                if snapshot.closed {
-                    coordinator.close();
-                    break;
-                }
-                if let Some(boundary) = snapshot.boundary {
-                    if let Err(error) = coordinator.boundary(boundary) {
-                        fence.fail(error);
-                        break;
-                    }
-                }
-                let result = coordinator.apply_controls_transaction(|control_version| {
-                    let mut captured = None;
-                    fence.urgent.send_if_modified(|latest| {
-                        if latest.version > control_version {
-                            captured = Some((latest.commands.update(), latest.version));
-                            latest.commands = CommandPatch::default();
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                    captured
-                });
-                if let Err(error) = result {
-                    fence.fail(error);
-                    break;
-                }
-                tokio::select! {
-                    _ = cancel.notified() => break,
-                    changed = status.changed() => {
-                        if changed.is_err() || !matches!(*status.borrow(), SessionStatus::Open) { break; }
-                    }
-                    changed = urgent.changed() => {
-                        if changed.is_err() { break; }
-                    }
-                }
-            }
-            super::player_session::LazyCoordinator::from_shared(Arc::clone(&coordinator)).close();
-        });
-        Self { task: Some(task) }
-    }
 }
 impl Drop for Driver {
     fn drop(&mut self) {
@@ -715,186 +652,53 @@ impl Drop for Driver {
     }
 }
 
-/// Session receiving ordered player events for an attached output.
-pub struct PlayerSession<O: PlayerOutput> {
-    rx: mpsc::UnboundedReceiver<RawEvent>,
-    coordinator: Coordinator<OutputAdapterHandle<O>>,
-    fence: Arc<SessionFence>,
-    driver: Option<Driver>,
-}
-impl<O: PlayerOutput> PlayerSession<O> {
-    /// Receives the next ordered event; returns `None` after closure or failure.
-    ///
-    /// Waiting is cancellation-safe: cancelling this future does not consume the next
-    /// event. After a terminal status, subsequent calls return `None` without draining
-    /// queued events.
-    pub async fn recv(&mut self) -> Option<PlayerEvent> {
-        loop {
-            let mut status = self.fence.status.subscribe();
-            if !matches!(*status.borrow(), SessionStatus::Open) {
-                return None;
-            }
-            let urgent = self.fence.urgent.borrow().clone();
-            if let Some(boundary) = urgent.boundary {
-                if let Err(error) = self.coordinator.boundary(boundary) {
-                    self.fence.fail(error);
-                    return None;
-                }
-            }
-            let event = tokio::select! {
-                biased;
-                changed = status.changed() => {
-                    if changed.is_err() || !matches!(*status.borrow(), SessionStatus::Open) { return None; }
-                    return None;
-                },
-                event = self.rx.recv() => event?,
-            };
-            return Some(match event {
-                RawEvent::Start(config) => PlayerEvent::Start(config),
-                RawEvent::Audio {
-                    generation,
-                    chunk,
-                    receipt,
-                } => {
-                    if generation < self.coordinator.current_generation() {
-                        continue;
-                    }
-                    PlayerEvent::Audio(AudioWork::new(
-                        self.coordinator.work_receipt(generation, receipt),
-                        generation,
-                        chunk,
-                        Arc::clone(&self.fence),
-                        |work, generation, buffer| {
-                            let (result, status) = work.commit_at_with_status(generation, buffer);
-                            if let SessionStatus::Failed(error) = status {
-                                return Err(CommitRejected::Output(error));
-                            }
-                            result
-                        },
-                    ))
-                }
-                RawEvent::Clear(generation) => {
-                    if let Err(error) = self.coordinator.boundary(generation) {
-                        self.fence.fail(error);
-                        return None;
-                    }
-                    PlayerEvent::Clear
-                }
-                RawEvent::End(generation) => {
-                    if let Err(error) = self.coordinator.boundary(generation) {
-                        self.fence.fail(error);
-                        return None;
-                    }
-                    PlayerEvent::End
-                }
-            });
-        }
-    }
-    /// Subscribes to retained lifecycle status without polling `recv`.
-    pub fn status(&self) -> watch::Receiver<SessionStatus> {
-        self.fence.status.subscribe()
-    }
-    /// Subscribes to the latest applied control state.
-    pub fn controls(&self) -> watch::Receiver<AppliedControls> {
-        self.fence.controls.subscribe()
-    }
-    /// Applies the requested fields, merging pending same-field values, and publishes them.
-    /// Unset fields keep their current or queued values; values are clamped when applied.
-    pub fn update_controls(&self, update: ControlUpdate) -> Result<(), OutputError> {
-        let result = self.coordinator.apply_controls_transaction(|_| {
-            let mut captured = None;
-            self.fence.urgent.send_modify(|urgent| {
-                let pending = urgent.commands;
-                urgent.version = urgent.version.wrapping_add(1);
-                captured = Some((
-                    ControlUpdate {
-                        volume: update.volume.or(pending.volume),
-                        muted: update.muted.or(pending.muted),
-                        static_delay_ms: update.static_delay_ms.or(pending.static_delay_ms),
-                    },
-                    urgent.version,
-                ));
-                urgent.commands = CommandPatch::default();
-            });
-            captured
-        });
-        if let Err(error) = &result {
-            self.fence.fail(error.clone());
-        }
-        result
-    }
-    /// Applies a complete control snapshot, overriding all fields, and publishes it.
-    pub fn set_controls(&self, controls: AppliedControls) -> Result<(), OutputError> {
-        self.update_controls(ControlUpdate {
-            volume: Some(controls.volume),
-            muted: Some(controls.muted),
-            static_delay_ms: Some(controls.static_delay_ms),
-        })
-    }
-    /// Closes the session, then joins its control driver.
-    pub async fn shutdown(mut self) {
-        self.fence.close();
-        self.rx.close();
-        while self.rx.recv().await.is_some() {}
-        if let Some(driver) = self.driver.take() {
-            driver.join().await;
-        }
-    }
-}
-impl<O: PlayerOutput> Drop for PlayerSession<O> {
-    fn drop(&mut self) {
-        self.fence.close();
-        self.rx.close();
-        self.driver.take();
-        self.coordinator.close();
-    }
-}
-
 /// One-shot reservation for installing lazy output.
-pub struct OutputInstallPermit {
-    permit: Option<super::player_session::InstallPermit<LazyOutput>>,
-    shared: Arc<super::player_session::LazyShared<LazyOutput>>,
+pub struct OutputInstallPermit<O: PlayerOutput> {
+    permit: Option<super::player_session::InstallPermit<OutputAdapterHandle<O>>>,
+    shared: Arc<super::player_session::Shared<OutputAdapterHandle<O>>>,
     fence: Arc<SessionFence>,
 }
-impl OutputInstallPermit {
-    /// Installs the reserved output and replays current applied controls.
-    ///
-    /// The permit is one-shot. Dropping it abandons the reservation so a later
-    /// reservation can be made. Only an installation that fails while applying
-    /// controls or clearing a retained boundary is terminal; reservation, closure,
-    /// and already-installed errors are not.
-    pub fn install(self, output: PlaybackControl) -> Result<(), InstallRejected> {
-        self.install_adapter(Box::new(OutputAdapterHandle(output)))
+impl<O: PlayerOutput> OutputInstallPermit<O> {
+    /// Installs the output and replays pending controls. The permit is consumed by the attempt.
+    /// Dropping it releases the reservation; an install failure reports `OutputLost` and requires
+    /// a fresh reservation. Only `Closed` is terminal for the player session.
+    pub fn install(self, output: O) -> Result<(), InstallRejected> {
+        self.install_adapter(OutputAdapterHandle(output))
     }
 
     #[cfg(test)]
-    fn install_for_test<O: PlayerOutput>(self, output: O) -> Result<(), InstallRejected> {
-        self.install_adapter(Box::new(OutputAdapterHandle(output)))
+    fn install_for_test(self, output: O) -> Result<(), InstallRejected> {
+        self.install_adapter(OutputAdapterHandle(output))
     }
 
-    fn install_adapter(mut self, output: LazyOutput) -> Result<(), InstallRejected> {
-        if !matches!(*self.fence.status_value.lock(), SessionStatus::Open) {
-            return Err(match *self.fence.status_value.lock() {
+    fn install_adapter(mut self, output: OutputAdapterHandle<O>) -> Result<(), InstallRejected> {
+        let status = self.fence.status_value.lock().clone();
+        if !matches!(status, SessionStatus::Open | SessionStatus::OutputLost(_)) {
+            return Err(match status {
                 SessionStatus::Closed => InstallRejected::Closed,
                 SessionStatus::Failed(_) => InstallRejected::Failed,
-                SessionStatus::Open => unreachable!(),
+                SessionStatus::Open | SessionStatus::OutputLost(_) => unreachable!(),
             });
         }
         let urgent = self.fence.urgent.borrow().clone();
         let current_controls = self.fence.controls.borrow().clone();
-        let controls = urgent.commands.apply_to(current_controls);
-        let result = self
+        let patch = urgent.commands.update();
+        let mut controls = current_controls;
+        patch.apply(&mut controls);
+        let mut result = self
             .permit
             .take()
             .ok_or(InstallRejected::Reserved)?
-            .install_with_controls(output, urgent.version, controls, || {
+            .install_with_controls(output, urgent.version, controls, Some(patch), || {
                 self.fence.urgent.borrow().boundary
             });
-        if matches!(result, Err(InstallRejected::Failed)) {
-            if let SessionStatus::Failed(error) =
-                LazyCoordinator::from_shared(Arc::clone(&self.shared)).status()
+        if result.is_ok() {
+            let status = Coordinator::from_shared(Arc::clone(&self.shared)).status();
+            if matches!(status, SessionStatus::Open)
+                && matches!(*self.fence.status_value.lock(), SessionStatus::Closed)
             {
-                self.fence.fail(error);
+                Coordinator::from_shared(Arc::clone(&self.shared)).close();
+                result = Err(InstallRejected::Closed);
             }
         }
         result
@@ -902,41 +706,32 @@ impl OutputInstallPermit {
 }
 
 /// Session that accepts player events before and after output installation.
-pub struct LazyPlayerSession {
+pub struct PlayerSession<O: PlayerOutput = PlaybackControl> {
     receiver: PlayerReceiver,
-    coordinator: LazyCoordinator<LazyOutput>,
+    coordinator: Coordinator<OutputAdapterHandle<O>>,
     driver: Option<Driver>,
 }
-impl LazyPlayerSession {
+impl<O: PlayerOutput> PlayerSession<O> {
     /// Reserves the single output-install slot.
     ///
     /// Only one reservation may exist at a time. Clear and end advance the invalidation
     /// floor but do not consume the slot; release fences old work and permits by output
-    /// incarnation. Terminal closure or failure rejects installation permanently.
-    pub fn begin_output_install(&self) -> Result<OutputInstallPermit, InstallRejected> {
-        if !matches!(
-            *self.receiver.fence.status_value.lock(),
-            SessionStatus::Open
-        ) {
-            return Err(match *self.receiver.fence.status_value.lock() {
+    /// incarnation. `Closed` rejects installation permanently; an installation failure
+    /// consumes that attempt and recovery requires a fresh reservation.
+    pub fn begin_output_install(&self) -> Result<OutputInstallPermit<O>, InstallRejected> {
+        let status = self.receiver.fence.status_value.lock().clone();
+        if !matches!(status, SessionStatus::Open | SessionStatus::OutputLost(_)) {
+            return Err(match status {
                 SessionStatus::Closed => InstallRejected::Closed,
                 SessionStatus::Failed(_) => InstallRejected::Failed,
-                SessionStatus::Open => unreachable!(),
+                SessionStatus::Open | SessionStatus::OutputLost(_) => unreachable!(),
             });
         }
         let coordinator = &self.coordinator;
         let boundary = *self.receiver.fence.boundary.lock();
-        if let Err(error) = coordinator.boundary(boundary) {
-            self.receiver.fence.fail(error);
-        }
-        let permit = coordinator.begin_install().map_err(|error| match error {
-            InstallRejected::Closed => InstallRejected::Closed,
-            InstallRejected::Failed => InstallRejected::Failed,
-            InstallRejected::AlreadyInstalled => InstallRejected::AlreadyInstalled,
-            InstallRejected::Reserved => InstallRejected::Reserved,
-            InstallRejected::Superseded => InstallRejected::Superseded,
-        })?;
-        Ok(OutputInstallPermit {
+        let _ = coordinator.boundary(boundary);
+        let permit = coordinator.begin_install()?;
+        Ok(OutputInstallPermit::<O> {
             shared: Arc::clone(&coordinator.shared()),
             permit: Some(permit),
             fence: Arc::clone(&self.receiver.fence),
@@ -944,48 +739,38 @@ impl LazyPlayerSession {
     }
 
     /// Installs output using a newly reserved slot.
-    pub fn install(&mut self, output: PlaybackControl) -> Result<(), InstallRejected> {
-        self.install_adapter(Box::new(OutputAdapterHandle(output)))
+    pub fn install(&mut self, output: O) -> Result<(), InstallRejected> {
+        self.install_adapter(OutputAdapterHandle(output))
     }
 
     #[cfg(test)]
-    fn install_for_test<O: PlayerOutput>(&mut self, output: O) -> Result<(), InstallRejected> {
-        self.install_adapter(Box::new(OutputAdapterHandle(output)))
+    fn install_for_test(&mut self, output: O) -> Result<(), InstallRejected> {
+        self.install_adapter(OutputAdapterHandle(output))
     }
 
-    fn install_adapter(&mut self, output: LazyOutput) -> Result<(), InstallRejected> {
-        if !matches!(
-            *self.receiver.fence.status_value.lock(),
-            SessionStatus::Open
-        ) {
-            return Err(match *self.receiver.fence.status_value.lock() {
-                SessionStatus::Closed => InstallRejected::Closed,
-                SessionStatus::Failed(_) => InstallRejected::Failed,
-                SessionStatus::Open => unreachable!(),
-            });
-        }
+    fn install_adapter(&mut self, output: OutputAdapterHandle<O>) -> Result<(), InstallRejected> {
         self.begin_output_install()?.install_adapter(output)
     }
     /// Releases the installed output while keeping the session open for reinstall.
     ///
     /// Receipt-time admission is detached first, so queued and outstanding old work is
     /// rejected or skipped. The output is cleared before the result is returned; a clear
-    /// failure is the retained terminal failure and prevents reinstall.
+    /// failure is retained as `OutputLost` and a fresh installation may recover the session.
     ///
     /// The output-owning worker must acknowledge dropping its device before the application
     /// advertises an external source. The session remains open and retains controls and the
     /// current boundary for a later installation; the worker retains the latest start/configuration.
     ///
     /// ```rust,no_run
-    /// use sendspin::audio::{LazyPlayerSession, PlaybackControl};
+    /// use sendspin::audio::{PlaybackControl, PlayerSession};
     /// use sendspin::{protocol::messages::PlayerState, WsSender};
     ///
     /// async fn handoff(
-    ///     session: &mut LazyPlayerSession,
+    ///     session: &mut PlayerSession<PlaybackControl>,
     ///     sender: &WsSender,
     ///     worker: &mut OutputWorker,
     /// ) -> Result<(), Box<dyn std::error::Error>> {
-    ///     session.release_output().map_err(|error| format!("{error:?}"))?;
+    ///     session.release_output()?;
     ///     worker.drop_device_and_ack().await;
     ///     sender.enter_external_source().await?;
     ///
@@ -994,11 +779,10 @@ impl LazyPlayerSession {
     ///     let initial_state = worker.read_player_state().await?;
     ///     let controls = session.controls().borrow().clone();
     ///     sender.exit_external_source(Some(with_session_controls(initial_state, controls))).await?;
-    ///     let permit = session
-    ///         .begin_output_install()
-    ///         .map_err(|error| format!("{error:?}"))?;
+    ///
+    ///     let permit = session.begin_output_install()?;
     ///     let output = worker.create_output().await?;
-    ///     permit.install(output).map_err(|error| format!("{error:?}"))?;
+    ///     permit.install(output)?;
     ///     Ok(())
     /// }
     ///
@@ -1030,10 +814,7 @@ impl LazyPlayerSession {
         let coordinator = &self.coordinator;
         match coordinator.release() {
             Ok(()) => Ok(()),
-            Err(error) => {
-                self.receiver.fence.fail(error.clone());
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
     /// Receives the next event, skipping audio from detached or superseded output
@@ -1046,22 +827,29 @@ impl LazyPlayerSession {
         loop {
             let receiver = &mut self.receiver;
             let mut status = receiver.fence.status.subscribe();
-            if !matches!(*status.borrow(), SessionStatus::Open) {
+            if matches!(
+                *status.borrow(),
+                SessionStatus::Closed | SessionStatus::Failed(_)
+            ) {
                 return None;
             }
             let coordinator = &self.coordinator;
             let boundary = receiver.fence.urgent.borrow().boundary;
             if let Some(boundary) = boundary {
-                if let Err(error) = coordinator.boundary(boundary) {
-                    receiver.fence.fail(error);
-                    return None;
-                }
+                let _ = coordinator.boundary(boundary);
             }
             let event = tokio::select! {
                 biased;
                 changed = status.changed() => {
-                    if changed.is_err() || !matches!(*status.borrow(), SessionStatus::Open) { return None; }
-                    return None;
+                    if changed.is_err()
+                        || matches!(
+                            *status.borrow(),
+                            SessionStatus::Closed | SessionStatus::Failed(_)
+                        )
+                    {
+                        return None;
+                    }
+                    continue;
                 },
                 event = receiver.rx.recv() => event?,
             };
@@ -1097,18 +885,12 @@ impl LazyPlayerSession {
                 RawEvent::Start(config) => return Some(PlayerEvent::Start(config)),
                 RawEvent::Clear(generation) => {
                     let coordinator = &self.coordinator;
-                    if let Err(error) = coordinator.boundary(generation) {
-                        receiver.fence.fail(error);
-                        return None;
-                    }
+                    let _ = coordinator.boundary(generation);
                     return Some(PlayerEvent::Clear);
                 }
                 RawEvent::End(generation) => {
                     let coordinator = &self.coordinator;
-                    if let Err(error) = coordinator.boundary(generation) {
-                        receiver.fence.fail(error);
-                        return None;
-                    }
+                    let _ = coordinator.boundary(generation);
                     return Some(PlayerEvent::End);
                 }
             }
@@ -1122,6 +904,34 @@ impl LazyPlayerSession {
     pub fn controls(&self) -> watch::Receiver<AppliedControls> {
         self.receiver.fence.controls.subscribe()
     }
+    /// Applies the requested fields while output is installed or detached.
+    pub fn update_controls(&self, update: ControlUpdate) -> Result<(), OutputError> {
+        self.coordinator.apply_controls_transaction(|_| {
+            let mut captured = None;
+            self.receiver.fence.urgent.send_modify(|urgent| {
+                let pending = urgent.commands;
+                urgent.version = urgent.version.wrapping_add(1);
+                captured = Some((
+                    ControlUpdate {
+                        volume: update.volume.or(pending.volume),
+                        muted: update.muted.or(pending.muted),
+                        static_delay_ms: update.static_delay_ms.or(pending.static_delay_ms),
+                    },
+                    urgent.version,
+                ));
+                urgent.commands = CommandPatch::default();
+            });
+            captured
+        })
+    }
+    /// Applies a complete control snapshot while output is installed or detached.
+    pub fn set_controls(&self, controls: AppliedControls) -> Result<(), OutputError> {
+        self.update_controls(ControlUpdate {
+            volume: Some(controls.volume),
+            muted: Some(controls.muted),
+            static_delay_ms: Some(controls.static_delay_ms),
+        })
+    }
     /// Closes the lazy session and joins its control driver.
     pub async fn shutdown(mut self) {
         self.receiver.fence.close();
@@ -1132,7 +942,7 @@ impl LazyPlayerSession {
         }
     }
 }
-impl Drop for LazyPlayerSession {
+impl<O: PlayerOutput> Drop for PlayerSession<O> {
     fn drop(&mut self) {
         self.receiver.fence.close();
         self.receiver.rx.close();
@@ -1286,23 +1096,6 @@ mod tests {
             })),
             calls: Arc::new(parking_lot::Mutex::new(Vec::new())),
         }
-    }
-
-    #[tokio::test]
-    async fn player_generation_exhaustion_closes_held_work() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach(output(), controls());
-        producer.audio(chunk()).unwrap();
-        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
-            panic!("audio event")
-        };
-        producer.set_generation_max_for_test();
-        assert_eq!(
-            producer.clear(),
-            Err(crate::role_core::ProducerError::GenerationExhausted)
-        );
-        assert_eq!(work.commit(buffer()), Err(CommitRejected::Closed));
-        assert!(session.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -1553,137 +1346,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_update_failure_is_terminal_and_closes_held_work() {
+    async fn public_update_failure_is_output_loss_and_keeps_session_alive() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let failing = output();
-        let fail_volume = Arc::clone(&failing.fail_volume_after_attach);
+        let mut failing = output();
+        failing.fail_commit = true;
         let mut session = receiver.attach(failing, controls());
-        fail_volume.store(true, Ordering::Release);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio event")
         };
-        let error = session
+        assert_eq!(
+            work.commit(buffer()),
+            Err(CommitRejected::Output(OutputError::Failed("commit".into())))
+        );
+        assert_eq!(
+            *session.status().borrow(),
+            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+        );
+        session
             .update_controls(ControlUpdate {
                 volume: Some(25),
                 ..ControlUpdate::default()
             })
-            .expect_err("failed output setter must be returned to the caller");
-        assert!(matches!(error, OutputError::Failed(message) if message == "volume"));
-        assert!(matches!(
-            *session.status().borrow(),
-            SessionStatus::Failed(_)
-        ));
-        assert_eq!(work.commit(buffer()), Err(CommitRejected::Closed));
-        assert!(session.recv().await.is_none());
-        assert!(session.recv().await.is_none());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn public_commit_close_between_wrapper_check_and_admission_is_closed_without_callback() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
-        let installed = output();
-        let commits = Arc::clone(&installed.commits);
-        session.install_for_test(installed).unwrap();
-        producer.audio(chunk()).unwrap();
-        let work = match session.recv().await {
-            Some(PlayerEvent::Audio(work)) => work,
-            _ => panic!("audio event"),
-        };
-        let reached = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        *session.receiver.fence.commit_admission_gate.lock() =
-            Some((Arc::clone(&reached), Arc::clone(&release)));
-        let commit = std::thread::spawn(move || work.commit(buffer()));
-        reached.wait();
-        producer.close();
-        release.wait();
-        assert_eq!(commit.join().unwrap(), Err(CommitRejected::Closed));
-        assert_eq!(commits.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn install_setter_blocked_then_producer_close_rejects_without_publication() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
-        let permit = session.begin_output_install().unwrap();
-        let installed = output();
-        let clears = Arc::clone(&installed.clears);
-        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let mut gated = installed.clone();
-        gated.setter_gate = Some(Arc::new((entered_tx, parking_lot::Mutex::new(release_rx))));
-        let install = std::thread::spawn(move || permit.install_for_test(gated));
-        entered_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-        let close = std::thread::spawn(move || {
-            producer.close();
-            closed_tx.send(()).unwrap();
-        });
-        closed_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
             .unwrap();
-        close.join().unwrap();
-        release_tx.send(()).unwrap();
-        assert_eq!(install.join().unwrap(), Err(InstallRejected::Closed));
-        assert_eq!(clears.load(Ordering::SeqCst), 1);
-        assert!(matches!(
-            session.coordinator.admission().admit(),
-            Admission::Closed
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn handoff_waits_for_device_drop() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
-        let installed = output();
-        session.install_for_test(installed).unwrap();
-
-        producer.audio(chunk()).unwrap();
-        let PlayerEvent::Audio(old_work) = session.recv().await.unwrap() else {
-            panic!("audio event")
-        };
-        session.release_output().unwrap();
-        assert_eq!(old_work.commit(buffer()), Err(CommitRejected::Obsolete));
-
-        let (drop_ack_tx, drop_ack_rx) = tokio::sync::oneshot::channel();
-        let advertised = Arc::new(AtomicUsize::new(0));
-        let created = Arc::new(AtomicUsize::new(0));
-        let advertised_by_handoff = Arc::clone(&advertised);
-        let mut handoff = Box::pin(async move {
-            drop_ack_rx.await.expect("device-drop acknowledgement");
-            advertised_by_handoff.fetch_add(1, Ordering::SeqCst);
-        });
-        assert!(handoff.as_mut().now_or_never().is_none());
-        assert_eq!(advertised.load(Ordering::SeqCst), 0);
-        assert_eq!(created.load(Ordering::SeqCst), 0);
-
-        drop_ack_tx.send(()).unwrap();
-        handoff.await;
-        let replacement = output();
-        created.fetch_add(1, Ordering::SeqCst);
-        let replacement_controls = Arc::clone(&replacement.controls);
-        let permit = session.begin_output_install().unwrap();
-        permit.install_for_test(replacement).unwrap();
-
-        assert_eq!(advertised.load(Ordering::SeqCst), 1);
-        assert_eq!(created.load(Ordering::SeqCst), 1);
-        assert_eq!(*replacement_controls.lock(), controls());
-        producer.audio(chunk()).unwrap();
-        let PlayerEvent::Audio(new_work) = session.recv().await.unwrap() else {
-            panic!("audio event")
-        };
-        new_work.commit(buffer()).unwrap();
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
+        session.install_for_test(output()).unwrap();
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
     }
 
     #[tokio::test]
     async fn blocked_output_creation_does_not_block_controls_or_end() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         let old_work = match session.recv().await {
             Some(PlayerEvent::Audio(work)) => work,
@@ -1730,7 +1433,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_public_session_replays_preinstall_work_and_rejects_old_work_after_release() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio event")
@@ -1759,7 +1462,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_audio_before_reinstall_does_not_hide_start() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         session.release_output().unwrap();
         producer
@@ -1780,21 +1483,67 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let applied = Arc::clone(&output.controls);
-        let gate = Arc::new(Notify::new());
-        let session = receiver.attach_with_driver_gate(output, controls(), Arc::clone(&gate));
-        let mut controls_rx = session.controls();
+        let session = receiver.attach(output, controls());
         producer.set_volume(42);
-        gate.notify_one();
-        controls_rx.changed().await.unwrap();
+        for _ in 0..100 {
+            if applied.lock().volume == 42 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(applied.lock().volume, 42);
-        assert_eq!(controls_rx.borrow().volume, 42);
+        assert_eq!(session.controls().borrow().volume, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn eager_attach_preserves_controls_published_during_initial_setters() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut output = output();
+        let actual = Arc::clone(&output.controls);
+        let setter_gate_enabled = Arc::clone(&output.setter_gate_enabled);
+        output.setter_gate = Some(Arc::new((entered_tx, parking_lot::Mutex::new(release_rx))));
+        let handle = tokio::runtime::Handle::current();
+        let attach = std::thread::spawn(move || {
+            let _entered = handle.enter();
+            receiver.attach(output, controls())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("initial setter must block attach");
+        producer.set_mute(true);
+        producer.set_volume(0);
+        setter_gate_enabled.store(false, Ordering::Release);
+        release_tx.send(()).unwrap();
+        let mut session = attach.join().unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(
+            *session.controls().borrow(),
+            AppliedControls {
+                volume: 0,
+                muted: true,
+                static_delay_ms: 0,
+            }
+        );
+        assert_eq!(*actual.lock(), *session.controls().borrow());
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
+            .unwrap();
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_does_not_regress_controls_published_without_output() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(20);
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut control_watch = session.controls();
         loop {
             let volume = {
@@ -1833,21 +1582,21 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         session.install_for_test(failing).unwrap();
         producer.audio(chunk()).unwrap();
         producer.clear().unwrap();
-        assert!(session.recv().await.is_none());
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::Failed("clear".into()))
+            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_recv_skips_detached_audio_and_preserves_following_start() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         session.release_output().unwrap();
         producer.audio(chunk()).unwrap();
         producer
@@ -1868,7 +1617,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(20);
         let gate = Arc::new(Notify::new());
-        let session = receiver.attach_lazy_with_driver_gate(controls(), Arc::clone(&gate));
+        let session = receiver.attach_empty_with_driver_gate(controls(), Arc::clone(&gate));
         let permit = session.begin_output_install().unwrap();
         producer.set_volume(50);
         let installed = output();
@@ -1888,7 +1637,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_publishes_controls_across_driver_yields() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let permit = session.begin_output_install().unwrap();
         producer.set_volume(20);
         let installed = output();
@@ -1917,24 +1666,24 @@ mod tests {
         failing.fail_clear = true;
         let mut session = receiver.attach(failing, controls());
         producer.clear().unwrap();
-        assert!(session.recv().await.is_none());
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::Failed("clear".into()))
+            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn eager_recv_bridges_format_mismatch_clear_to_terminal_status() {
+    async fn eager_recv_bridges_format_mismatch_clear_to_output_loss() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.clear_format_mismatch = true;
         let mut session = receiver.attach(failing, controls());
         producer.clear().unwrap();
-        assert!(session.recv().await.is_none());
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::FormatMismatch { .. })
+            SessionStatus::OutputLost(OutputError::FormatMismatch { .. })
         ));
     }
 
@@ -1963,7 +1712,7 @@ mod tests {
     #[tokio::test]
     async fn public_lazy_format_mismatch_keeps_session_open_and_next_commit_succeeds() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut mismatch = output();
         mismatch.mismatch_commit = true;
         session.install_for_test(mismatch).unwrap();
@@ -2016,7 +1765,7 @@ mod tests {
         while matches!(*status.borrow(), SessionStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::Failed(_)));
+        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
         assert_eq!(controls_rx.borrow().volume, 80);
     }
 
@@ -2119,7 +1868,7 @@ mod tests {
             muted: false,
             static_delay_ms: 9999,
         });
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut controls_rx = session.controls();
         producer.set_controls(AppliedControls {
             volume: 33,
@@ -2168,7 +1917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_clear_failure_and_setter_failure_are_terminal() {
+    async fn public_clear_failure_and_setter_failure_are_output_loss() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing_clear = output();
         failing_clear.fail_clear = true;
@@ -2178,7 +1927,7 @@ mod tests {
         while matches!(*status.borrow(), SessionStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::Failed(_)));
+        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
 
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing_setter = output();
@@ -2192,13 +1941,13 @@ mod tests {
         while matches!(*status.borrow(), SessionStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::Failed(_)));
+        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
     }
 
     #[tokio::test]
     async fn lazy_queued_audio_before_release_is_not_replayed_after_reinstall() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -2213,7 +1962,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_work_keeps_generation_across_synchronous_clear() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(old_work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -2232,7 +1981,7 @@ mod tests {
     #[tokio::test]
     async fn detached_audio_is_skipped_but_fresh_audio_is_delivered() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.audio(chunk()).unwrap();
         session.release_output().unwrap();
         assert_eq!(producer.audio(chunk()), Ok(()));
@@ -2246,7 +1995,7 @@ mod tests {
     #[tokio::test]
     async fn reservation_identity_preserves_new_install_after_old_permit_drop_or_failure() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let old = session.begin_output_install().unwrap();
         session.release_output().unwrap();
         let new = session.begin_output_install().unwrap();
@@ -2254,7 +2003,7 @@ mod tests {
         new.install_for_test(output()).unwrap();
 
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let old = session.begin_output_install().unwrap();
         session.release_output().unwrap();
         let new = session.begin_output_install().unwrap();
@@ -2271,7 +2020,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        let coordinator = Arc::new(crate::audio::player_session::LazyCoordinator::<
+        let coordinator = Arc::new(crate::audio::player_session::Coordinator::<
             OutputAdapterHandle<FakeOutput>,
         >::new(controls()));
         let permit = coordinator.begin_install().unwrap();
@@ -2297,7 +2046,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn close_rejects_outstanding_install_before_driver_poll() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let permit = session.begin_output_install().unwrap();
         producer.close();
         assert_eq!(
@@ -2333,7 +2082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_commit_late_status_is_retained_and_shutdown_wakes_recv() {
+    async fn failed_commit_late_output_loss_is_retained_and_shutdown_wakes_recv() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
@@ -2349,15 +2098,64 @@ mod tests {
         let status = session.status();
         assert_eq!(
             *status.borrow(),
-            SessionStatus::Failed(OutputError::Failed("commit".into()))
+            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
         );
-        let pending = session.recv();
-        assert!(pending.await.is_none());
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
+            .unwrap();
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
+        session.install_for_test(output()).unwrap();
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
         session.shutdown().await;
+        assert_eq!(*status.borrow(), SessionStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn output_loss_keeps_session_open_and_reinstalls_fresh_output() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_commit = true;
+        let mut session = receiver.attach(failing, controls());
+        producer.audio(chunk()).unwrap();
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!("audio event")
+        };
+        let PlayerEvent::Audio(stale) = session.recv().await.unwrap() else {
+            panic!("stale audio event")
+        };
         assert_eq!(
-            *status.borrow(),
-            SessionStatus::Failed(OutputError::Failed("commit".into()))
+            work.commit(buffer()),
+            Err(CommitRejected::Output(OutputError::Failed("commit".into())))
         );
+        assert_eq!(
+            *session.status().borrow(),
+            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+        );
+        assert_eq!(stale.commit(buffer()), Err(CommitRejected::Obsolete));
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
+            .unwrap();
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
+        session.install_for_test(output()).unwrap();
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!("fresh audio event")
+        };
+        assert_eq!(work.commit(buffer()), Ok(()));
     }
 
     #[tokio::test]
@@ -2372,7 +2170,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_shutdown_completes_with_live_producer() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
             .await
             .expect("lazy shutdown must not wait for producer drop");
@@ -2397,7 +2195,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_shutdown_awaits_driver_and_releases_shared_state() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let shared = session.coordinator.shared();
         let weak = Arc::downgrade(&shared);
         drop(producer);
@@ -2410,7 +2208,7 @@ mod tests {
     async fn controls_mirror_publishes_install_and_retains_close() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(37);
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut controls_watch = session.controls();
         while controls_watch.borrow().volume != 37 {
             controls_watch.changed().await.unwrap();
@@ -2466,12 +2264,12 @@ mod tests {
     #[tokio::test]
     async fn lazy_public_session_install_retry_and_closed_rejection() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         assert!(session.begin_output_install().is_ok());
         drop(session);
 
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         producer.close();
         assert!(session.recv().await.is_none());
         drop(session);
@@ -2497,24 +2295,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_clear_failure_before_recv_publishes_original_failure() {
+    async fn lazy_clear_failure_before_recv_publishes_output_loss() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         session.install_for_test(failing).unwrap();
         producer.clear().unwrap();
-        assert!(session.recv().await.is_none());
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::Failed("clear".into()))
+            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
     #[tokio::test]
-    async fn lazy_install_setter_failure_publishes_public_failure() {
+    async fn lazy_install_setter_failure_publishes_output_loss() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut failing = output();
         failing.fail_volume = true;
         assert_eq!(
@@ -2523,14 +2321,14 @@ mod tests {
         );
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::Failed(ref error)) if error == "volume"
+            SessionStatus::OutputLost(OutputError::Failed(ref error)) if error == "volume"
         ));
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_clears_queued_audio_after_end_before_permit() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let permit = session.begin_output_install().unwrap();
         producer.audio(chunk()).unwrap();
         producer.end().unwrap();
@@ -2545,7 +2343,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_reconciles_end_while_setter_is_blocked() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let permit = session.begin_output_install().unwrap();
         producer.audio(chunk()).unwrap();
         let installed = output();
@@ -2567,9 +2365,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lazy_release_clear_failure_retains_public_failure() {
+    async fn lazy_release_clear_failure_retains_output_loss() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_lazy_for_test::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
         let mut failing = output();
         failing.fail_clear = true;
         session.install_for_test(failing).unwrap();
@@ -2579,7 +2377,265 @@ mod tests {
         );
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::Failed(OutputError::Failed("clear".into()))
+            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn public_loss_invalidates_two_held_works_before_reinstall() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_commit = true;
+        let mut session = receiver.attach(failing, controls());
+        producer.audio(chunk()).unwrap();
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(first) = session.recv().await.unwrap() else {
+            panic!()
+        };
+        let PlayerEvent::Audio(second) = session.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            first.commit(buffer()),
+            Err(CommitRejected::Output(OutputError::Failed("commit".into())))
+        );
+        session.install_for_test(output()).unwrap();
+        assert_eq!(second.commit(buffer()), Err(CommitRejected::Obsolete));
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(fresh) = session.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(fresh.commit(buffer()), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn public_pending_recv_gets_start_after_commit_loss() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_commit = true;
+        let mut session = receiver.attach(failing, controls());
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!()
+        };
+        let pending = tokio::spawn(async move { session.recv().await });
+        assert_eq!(
+            work.commit(buffer()),
+            Err(CommitRejected::Output(OutputError::Failed("commit".into())))
+        );
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
+            .unwrap();
+        let event = timeout(Duration::from_secs(5), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, Some(PlayerEvent::Start(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_loss_shutdown_before_driver_poll_closes_and_joins() {
+        let (receiver, _producer) = PlayerReceiver::channel(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
+        let mut failing = output();
+        failing.fail_volume = true;
+        assert_eq!(
+            session.install_for_test(failing),
+            Err(InstallRejected::Failed)
+        );
+        assert!(matches!(
+            *session.status().borrow(),
+            SessionStatus::OutputLost(_)
+        ));
+        timeout(Duration::from_secs(5), session.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_failed_setter_replays_requested_controls_after_reinstall() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let failing = output();
+        failing
+            .fail_volume_after_attach
+            .store(true, Ordering::Release);
+        let mut session = receiver.attach(
+            failing,
+            AppliedControls {
+                volume: 50,
+                muted: false,
+                static_delay_ms: 0,
+            },
+        );
+        let controls_watch = session.controls();
+        producer.set_volume(70);
+        timeout(Duration::from_secs(5), async {
+            while !matches!(*session.status().borrow(), SessionStatus::OutputLost(_)) {
+                session.status().changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(controls_watch.borrow().volume, 50);
+        assert!(!controls_watch.borrow().muted);
+        producer.set_mute(true);
+        assert_eq!(controls_watch.borrow().volume, 50);
+        assert!(!controls_watch.borrow().muted);
+        let replacement = output();
+        let replacement_state = replacement.controls.clone();
+        session.install_for_test(replacement).unwrap();
+        assert_eq!(replacement_state.lock().volume, 70);
+        assert!(replacement_state.lock().muted);
+        assert_eq!(controls_watch.borrow().volume, 70);
+        assert!(controls_watch.borrow().muted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_volume_patch_overrides_failed_desired_volume_on_install() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let failing = output();
+        failing
+            .fail_volume_after_attach
+            .store(true, Ordering::Release);
+        let mut session = receiver.attach(
+            failing,
+            AppliedControls {
+                volume: 50,
+                muted: false,
+                static_delay_ms: 0,
+            },
+        );
+        producer.set_volume(70);
+        timeout(Duration::from_secs(5), async {
+            while !matches!(*session.status().borrow(), SessionStatus::OutputLost(_)) {
+                session.status().changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        producer.set_volume(50);
+        let replacement = output();
+        let replacement_state = replacement.controls.clone();
+        session.install_for_test(replacement).unwrap();
+        assert_eq!(replacement_state.lock().volume, 50);
+        assert_eq!(session.controls().borrow().volume, 50);
+    }
+
+    #[tokio::test]
+    async fn public_pending_boundary_loss_keeps_install_recovery_available() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_clear = true;
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
+        session.install_for_test(failing).unwrap();
+        producer.clear().unwrap();
+        let permit = session.begin_output_install().unwrap();
+        assert!(matches!(
+            *session.status().borrow(),
+            SessionStatus::OutputLost(_)
+        ));
+        permit.install_for_test(output()).unwrap();
+        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+    }
+
+    #[tokio::test]
+    async fn core_install_and_close_publication_are_monotonic() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut session = receiver.attach_empty_for_test::<FakeOutput>(controls());
+        let status = session.status();
+        session.install_for_test(output()).unwrap();
+        assert_eq!(*status.borrow(), SessionStatus::Open);
+        producer.close();
+        session.shutdown().await;
+        assert_eq!(*status.borrow(), SessionStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn release_clear_failure_advances_incarnation_once_and_retains_loss() {
+        let c = Coordinator::<OutputAdapterHandle<FakeOutput>>::new(controls());
+        let held = c.receipt().unwrap();
+        let mut failing = output();
+        failing.fail_clear = true;
+        c.begin_install()
+            .unwrap()
+            .install(OutputAdapterHandle(failing))
+            .unwrap();
+        let initial = c.incarnation();
+        let expected = initial.advance();
+        let error = c.release().unwrap_err();
+        assert_eq!(error, OutputError::Failed("clear".into()));
+        assert_eq!(c.incarnation(), expected);
+        assert_eq!(c.status(), SessionStatus::OutputLost(error.clone()));
+        assert_eq!(held.commit(buffer()), Err(CommitRejected::Obsolete));
+        c.begin_install()
+            .unwrap()
+            .install(OutputAdapterHandle(output()))
+            .unwrap();
+        assert_eq!(c.status(), SessionStatus::Open);
+        assert_eq!(c.incarnation(), expected);
+    }
+
+    #[tokio::test]
+    async fn pending_recv_wakes_with_start_after_loss_and_reinstall() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_commit = true;
+        let mut session = receiver.attach(failing, controls());
+        let mut pending = Box::pin(session.recv());
+        assert!(matches!(
+            futures_util::poll!(&mut pending),
+            std::task::Poll::Pending
+        ));
+        drop(pending);
+        producer.audio(chunk()).unwrap();
+        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
+            panic!("expected audio work")
+        };
+        assert_eq!(
+            work.commit(buffer()),
+            Err(CommitRejected::Output(OutputError::Failed("commit".into())))
+        );
+        assert!(matches!(
+            *session.status().borrow(),
+            SessionStatus::OutputLost(_)
+        ));
+        producer
+            .start(StreamPlayerConfig {
+                codec: "pcm".into(),
+                sample_rate: 48_000,
+                channels: 2,
+                bit_depth: 16,
+                codec_header: None,
+            })
+            .unwrap();
+        session.install_for_test(output()).unwrap();
+        let event = timeout(Duration::from_secs(5), session.recv())
+            .await
+            .expect("recovered recv must not remain pending")
+            .expect("recovered recv must yield queued start");
+        assert!(matches!(event, PlayerEvent::Start(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_install_cannot_reopen_after_concurrent_close() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let session = receiver.attach_empty_for_test::<FakeOutput>(controls());
+        let permit = session.begin_output_install().unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut gated = output();
+        gated.setter_gate = Some(Arc::new((entered_tx, parking_lot::Mutex::new(release_rx))));
+        let install = std::thread::spawn(move || permit.install_for_test(gated));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        producer.close();
+        release_tx.send(()).unwrap();
+        assert_eq!(install.join().unwrap(), Err(InstallRejected::Closed));
+        assert_eq!(*session.status().borrow(), SessionStatus::Closed);
     }
 }

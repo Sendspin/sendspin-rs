@@ -18,7 +18,6 @@ pub(crate) enum BoundaryAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProducerError {
     ReceiverClosed,
-    GenerationExhausted,
 }
 
 #[derive(Clone, Default)]
@@ -241,15 +240,10 @@ fn fail<A: RoleAdapter>(state: &mut State<A>, mut output: A, error: OutputError)
     state.status = SessionStatus::Failed(error);
 }
 
-pub(crate) fn advance(
-    generation: &Mutex<StreamGeneration>,
-) -> Result<StreamGeneration, ProducerError> {
+pub(crate) fn advance(generation: &Mutex<StreamGeneration>) -> StreamGeneration {
     let mut current = generation.lock();
-    let next = current
-        .checked_advance()
-        .ok_or(ProducerError::GenerationExhausted)?;
-    *current = next;
-    Ok(next)
+    *current = current.advance();
+    *current
 }
 
 pub(crate) fn publish_boundary(

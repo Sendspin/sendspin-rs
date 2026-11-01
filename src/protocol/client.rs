@@ -29,7 +29,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 /// `Goodbye` is one variant (not `Send` + `Close`) so the writer processes it
 /// atomically: once dequeued it flushes goodbye + close and exits, so nothing
 /// *enqueued after it* reaches the wire.
-enum WriteCommand {
+pub(crate) enum WriteCommand {
     Send {
         msg: WsMessage,
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
@@ -188,6 +188,8 @@ fn role_ended(end: &StreamEnd, role: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct WsSender {
     tx: UnboundedSender<WriteCommand>,
+    reporter: Option<UnboundedSender<crate::protocol::state_reporter::Command>>,
+    controls: tokio::sync::watch::Receiver<crate::audio::AppliedControls>,
     /// The router updates this *before* forwarding the triggering `stream/start`
     /// / `stream/end`, so a consumer that reacts to those messages already
     /// observes the settled state.
@@ -197,6 +199,28 @@ pub struct WsSender {
 impl WsSender {
     /// Send a message to the server.
     pub async fn send_message(&self, msg: Message) -> Result<(), Error> {
+        match msg {
+            Message::ClientState(state) => {
+                let Some(reporter) = &self.reporter else {
+                    return self.send_raw(Message::ClientState(state)).await;
+                };
+                let (ack, result) = tokio::sync::oneshot::channel();
+                reporter
+                    .send(crate::protocol::state_reporter::Command::State {
+                        state,
+                        boundary_applied_controls: self.controls.borrow().clone(),
+                        ack,
+                    })
+                    .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+                result
+                    .await
+                    .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+            }
+            message => self.send_raw(message).await,
+        }
+    }
+
+    async fn send_raw(&self, msg: Message) -> Result<(), Error> {
         let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
         // Time pings go out at 1Hz for as long as the connection lives; keep
         // that housekeeping at trace so debug shows only meaningful traffic.
@@ -222,13 +246,56 @@ impl WsSender {
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
-    /// Send a top-level client synchronization state update.
+    /// Send a top-level client synchronization state update through the state reporter.
     pub async fn send_sync_state(&self, state: ClientSyncState) -> Result<(), Error> {
-        self.send_message(Message::ClientState(ClientState {
-            state: Some(state),
-            player: None,
-        }))
-        .await
+        let Some(reporter) = &self.reporter else {
+            return self
+                .send_message(Message::ClientState(ClientState {
+                    state: Some(state),
+                    player: None,
+                }))
+                .await;
+        };
+        let (ack, result) = tokio::sync::oneshot::channel();
+        reporter
+            .send(crate::protocol::state_reporter::Command::State {
+                state: ClientState {
+                    state: Some(state),
+                    player: None,
+                },
+                boundary_applied_controls: self.controls.borrow().clone(),
+                ack,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        result
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+    }
+
+    /// Send a partial player state update, merging it into the retained state.
+    pub async fn set_player_state(&self, player: PlayerState) -> Result<(), Error> {
+        let Some(reporter) = &self.reporter else {
+            return self
+                .send_message(Message::ClientState(ClientState {
+                    state: None,
+                    player: Some(player),
+                }))
+                .await;
+        };
+        let (ack, result) = tokio::sync::oneshot::channel();
+        reporter
+            .send(crate::protocol::state_reporter::Command::State {
+                state: ClientState {
+                    state: None,
+                    player: Some(player),
+                },
+                boundary_applied_controls: self.controls.borrow().clone(),
+                ack,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        result
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
     /// Tell the server this client is temporarily owned by another audio source.
@@ -236,7 +303,16 @@ impl WsSender {
     /// Release any Sendspin-owned output first so the external source can open
     /// the device without racing this client's audio stream.
     pub async fn enter_external_source(&self) -> Result<(), Error> {
-        self.send_sync_state(ClientSyncState::ExternalSource).await
+        let Some(reporter) = &self.reporter else {
+            return self.send_sync_state(ClientSyncState::ExternalSource).await;
+        };
+        let (ack, result) = tokio::sync::oneshot::channel();
+        reporter
+            .send(crate::protocol::state_reporter::Command::Enter { ack })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        result
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
     /// Tell the server this client's clock filter has converged enough to resume
@@ -247,11 +323,26 @@ impl WsSender {
     /// must be read through platform APIs; this library only tracks its own
     /// software [`GainControl`](crate::audio::GainControl).
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
-        self.send_message(Message::ClientState(ClientState {
-            state: Some(ClientSyncState::Synchronized),
-            player,
-        }))
-        .await
+        let Some(reporter) = &self.reporter else {
+            return self
+                .send_message(Message::ClientState(ClientState {
+                    state: Some(ClientSyncState::Synchronized),
+                    player,
+                }))
+                .await;
+        };
+        let (ack, result) = tokio::sync::oneshot::channel();
+        let controls = self.controls.borrow().clone();
+        reporter
+            .send(crate::protocol::state_reporter::Command::Exit {
+                player,
+                controls,
+                ack,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        result
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
     /// Request a change to the active stream format.
@@ -748,6 +839,7 @@ pub struct ConnectionGuard {
     router_handle: Option<tokio::task::JoinHandle<()>>,
     sync_handle: Option<tokio::task::JoinHandle<()>>,
     writer_handle: Option<tokio::task::JoinHandle<()>>,
+    reporter_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionGuard {
@@ -756,11 +848,14 @@ impl ConnectionGuard {
     /// surface the wire error if they didn't), then reap the writer.
     pub async fn disconnect(mut self, reason: GoodbyeReason) -> Result<(), Error> {
         log::debug!("Disconnecting (reason: {reason:?})");
-        // Stop clock-sync first so it can't enqueue time samples behind the
-        // goodbye. The reader stays up until the goodbye/close has flushed
-        // (below) so the socket isn't half-closed while we're still writing.
+        // Stop producers before goodbye so no report can be queued after it.
+        if let Some(h) = self.reporter_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
         if let Some(h) = self.sync_handle.take() {
             h.abort();
+            let _ = h.await;
         }
 
         let ack_rx = self.sender.send_goodbye(reason)?;
@@ -815,6 +910,9 @@ impl Drop for ConnectionGuard {
         if let Some(h) = self.writer_handle.take() {
             h.abort();
         }
+        if let Some(h) = self.reporter_handle.take() {
+            h.abort();
+        }
     }
 }
 
@@ -837,6 +935,7 @@ impl ProtocolClient {
         hello: ClientHello,
         initial_state: ClientState,
         clock: Arc<dyn Clock>,
+        automatic_player_state: bool,
     ) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
@@ -845,7 +944,14 @@ impl ProtocolClient {
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        Self::drive(ws_stream, hello, initial_state, clock).await
+        Self::drive(
+            ws_stream,
+            hello,
+            initial_state,
+            clock,
+            automatic_player_state,
+        )
+        .await
     }
 
     /// Drive the protocol-client state machine over an already-handshaked
@@ -856,6 +962,7 @@ impl ProtocolClient {
         hello: ClientHello,
         initial_state: ClientState,
         clock: Arc<dyn Clock>,
+        automatic_player_state: bool,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -926,7 +1033,7 @@ impl ProtocolClient {
             }
         };
 
-        let state_msg = Message::ClientState(initial_state);
+        let state_msg = Message::ClientState(initial_state.clone());
         let state_json =
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending initial client/state: {}", state_json);
@@ -936,16 +1043,49 @@ impl ProtocolClient {
             .map_err(|e| Error::WebSocket(e.to_string()))?;
 
         let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
+        let initial_controls = crate::audio::AppliedControls {
+            volume: initial_state
+                .player
+                .as_ref()
+                .and_then(|p| p.volume)
+                .unwrap_or(100),
+            muted: initial_state
+                .player
+                .as_ref()
+                .and_then(|p| p.muted)
+                .unwrap_or(false),
+            static_delay_ms: initial_state
+                .player
+                .as_ref()
+                .and_then(|p| p.static_delay_ms)
+                .unwrap_or(0),
+        };
         let (mut sinks, player, artwork, visualizer, message_rx) =
-            crate::protocol::routing::ReceiveSinks::channel(crate::audio::AppliedControls {
-                volume: 100,
-                muted: false,
-                static_delay_ms: 0,
-            });
+            crate::protocol::routing::ReceiveSinks::channel(initial_controls);
+        let controls = player.controls();
+        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let stream_state = Arc::new(StreamState::default());
 
         let writer_handle = tokio::spawn(writer_task(write, out_rx));
+        let reporter_handle = if automatic_player_state
+            && initial_state.player.is_some()
+            && server_hello
+                .active_roles
+                .iter()
+                .any(|role| role == "player@v1")
+        {
+            Some(tokio::spawn(crate::protocol::state_reporter::run(
+                crate::protocol::state_reporter::Config {
+                    commands: report_rx,
+                    controls: controls.clone(),
+                    initial: initial_state.clone(),
+                    output: out_tx.clone(),
+                },
+            )))
+        } else {
+            None
+        };
 
         let clock_sync_router = Arc::clone(&clock_sync);
         let clock_router = Arc::clone(&clock);
@@ -967,6 +1107,8 @@ impl ProtocolClient {
         // over the following 1Hz samples (see TimeFilter).
         let sync_sender = WsSender {
             tx: out_tx.clone(),
+            reporter: reporter_handle.as_ref().map(|_| report_tx.clone()),
+            controls: controls.clone(),
             stream_state: Arc::clone(&stream_state),
         };
         let sync_handle = tokio::spawn(async move {
@@ -1006,11 +1148,14 @@ impl ProtocolClient {
             guard: ConnectionGuard {
                 sender: WsSender {
                     tx: out_tx,
+                    reporter: reporter_handle.as_ref().map(|_| report_tx),
+                    controls,
                     stream_state,
                 },
                 router_handle: Some(router_handle),
                 sync_handle: Some(sync_handle),
                 writer_handle: Some(writer_handle),
+                reporter_handle,
             },
         })
     }
@@ -1048,10 +1193,7 @@ impl ProtocolClient {
                                 data.len()
                             );
                         }
-                        if sinks.dispatch_binary(BinaryFrame::Audio(chunk)).is_err() {
-                            log::error!("Binary routing failed; stopping message router");
-                            break;
-                        }
+                        sinks.dispatch_binary(BinaryFrame::Audio(chunk));
                     }
                     Ok(BinaryFrame::Artwork(chunk)) => {
                         // Artwork arrives in short bursts on track changes, so
@@ -1063,10 +1205,7 @@ impl ProtocolClient {
                             chunk.timestamp,
                             chunk.data.len()
                         );
-                        if sinks.dispatch_binary(BinaryFrame::Artwork(chunk)).is_err() {
-                            log::error!("Binary routing failed; stopping message router");
-                            break;
-                        }
+                        sinks.dispatch_binary(BinaryFrame::Artwork(chunk));
                     }
                     Ok(BinaryFrame::Visualizer(chunk)) => {
                         visualizer_chunk_count = match visualizer_chunk_count.checked_add(1) {
@@ -1085,13 +1224,7 @@ impl ProtocolClient {
                                 chunk.data.len()
                             );
                         }
-                        if sinks
-                            .dispatch_binary(BinaryFrame::Visualizer(chunk))
-                            .is_err()
-                        {
-                            log::error!("Binary routing failed; stopping message router");
-                            break;
-                        }
+                        sinks.dispatch_binary(BinaryFrame::Visualizer(chunk));
                     }
                     Ok(BinaryFrame::Unknown { type_id, .. }) => {
                         log::warn!("Received unknown binary type: {}", type_id);
@@ -1133,12 +1266,7 @@ impl ProtocolClient {
                                     Message::StreamEnd(end) => stream_state.note_stream_end(end),
                                     _ => {}
                                 }
-                                if sinks.dispatch_message(msg).is_err() {
-                                    log::error!(
-                                        "Message routing failed due to generation exhaustion; stopping message router"
-                                    );
-                                    break;
-                                }
+                                sinks.dispatch_message(msg);
                             }
                         }
                         Err(e) => {
@@ -1172,6 +1300,8 @@ impl ProtocolClient {
     pub async fn enter_external_source(&self) -> Result<(), Error> {
         WsSender {
             tx: self.out_tx.clone(),
+            reporter: self.guard.sender.reporter.clone(),
+            controls: self.guard.sender.controls.clone(),
             stream_state: Arc::clone(&self.stream_state),
         }
         .enter_external_source()
@@ -1182,6 +1312,8 @@ impl ProtocolClient {
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
         WsSender {
             tx: self.out_tx.clone(),
+            reporter: self.guard.sender.reporter.clone(),
+            controls: self.guard.sender.controls.clone(),
             stream_state: Arc::clone(&self.stream_state),
         }
         .exit_external_source(player)
@@ -1210,6 +1342,8 @@ impl ProtocolClient {
     pub fn split(self) -> Connection {
         let sender = WsSender {
             tx: self.out_tx,
+            reporter: self.guard.sender.reporter.clone(),
+            controls: self.guard.sender.controls.clone(),
             stream_state: self.stream_state,
         };
         let controller = self

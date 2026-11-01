@@ -6,12 +6,14 @@ use sendspin::audio::{
 };
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ArtworkSource, ConnectionReason, ImageFormat, Message, PlayerCommand, PlayerCommandType,
-    ServerCommand, ServerHello, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear,
-    StreamEnd, StreamPlayerConfig, StreamStart, StreamVisualizerConfig, VisualizerDataType,
+    ArtworkSource, ClientSyncState, ConnectionReason, ImageFormat, Message, PlayerCommand,
+    PlayerCommandType, PlayerState, PlayerStateCommand, ServerCommand, ServerHello,
+    StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
+    StreamStart, StreamVisualizerConfig, VisualizerDataType,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
 use sendspin::{Clock, ProtocolClientBuilder};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -64,6 +66,35 @@ impl RecordedOutput {
 impl Default for RecordedOutput {
     fn default() -> Self {
         Self::new().0
+    }
+}
+
+#[derive(Clone)]
+struct GatedOutput {
+    entered: Arc<tokio::sync::Notify>,
+    applied: Arc<Mutex<Vec<u8>>>,
+    gate_enabled: Arc<AtomicBool>,
+}
+
+impl PlayerOutput for GatedOutput {
+    fn commit(&self, _: AudioBuffer) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_volume(&self, volume: u8) -> Result<(), OutputError> {
+        self.applied.lock().unwrap().push(volume);
+        if self.gate_enabled.load(Ordering::Acquire) {
+            self.entered.notify_one();
+        }
+        Ok(())
+    }
+    fn set_mute(&self, _: bool) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_static_delay(&self, _: u16) -> Result<(), OutputError> {
+        Ok(())
     }
 }
 
@@ -179,6 +210,13 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with(None, true).await
+}
+
+async fn fixture_with(
+    initial_player_state: Option<PlayerState>,
+    automatic_player_state: bool,
+) -> Fixture {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
     let mut server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
@@ -227,8 +265,12 @@ async fn fixture() -> Fixture {
     let builder = ProtocolClientBuilder::builder()
         .client_id("role-events".into())
         .name("Role events".into())
-        .build()
-        .clock(clock_trait);
+        .automatic_player_state(automatic_player_state);
+    let builder = match initial_player_state {
+        Some(player) => builder.initial_player_state(player).build(),
+        None => builder.build(),
+    }
+    .clock(clock_trait);
     let client = timeout(Duration::from_secs(5), builder.accept(client_ws))
         .await
         .expect("accept timeout")
@@ -862,6 +904,404 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
         .await
         .expect("session shutdown timed out");
     assert_eq!(split.clock_sync.lock().rtt_micros(), Some(1_000));
+}
+
+async fn next_state(
+    observed: &mut mpsc::UnboundedReceiver<Message>,
+) -> sendspin::protocol::messages::ClientState {
+    loop {
+        if let Message::ClientState(state) = timeout(Duration::from_secs(5), observed.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            return state;
+        }
+    }
+}
+
+#[tokio::test]
+async fn reporter_waits_for_applied_output_and_preserves_initial_fields() {
+    let initial = PlayerState {
+        volume: Some(80),
+        muted: Some(false),
+        static_delay_ms: Some(7),
+        required_lead_time_ms: Some(120),
+        min_buffer_ms: Some(240),
+        supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
+    };
+    let mut f = fixture_with(Some(initial), true).await;
+    let split = f.client.split();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_wait = Arc::clone(&entered);
+    let gate_enabled = Arc::new(AtomicBool::new(false));
+    let output = GatedOutput {
+        entered,
+        applied: Arc::new(Mutex::new(Vec::new())),
+        gate_enabled: Arc::clone(&gate_enabled),
+    };
+    let mut session = split.player.attach(
+        output,
+        AppliedControls {
+            volume: 80,
+            muted: false,
+            static_delay_ms: 7,
+        },
+    );
+    f.server_tx
+        .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
+        .unwrap();
+    f.server_tx.send(audio(1, &[1, 2])).unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(5), session.recv())
+            .await
+            .unwrap(),
+        Some(PlayerEvent::Start(_))
+    ));
+    gate_enabled.store(true, Ordering::Release);
+    f.server_tx
+        .send(
+            serde_json::to_string(&Message::ServerCommand(ServerCommand {
+                player: Some(PlayerCommand {
+                    command: PlayerCommandType::Volume,
+                    volume: Some(41),
+                    mute: None,
+                    static_delay_ms: None,
+                }),
+            }))
+            .unwrap()
+            .into(),
+        )
+        .unwrap();
+    entered_wait.notified().await;
+    let state = next_state(&mut f.observed).await;
+    let player = state.player.unwrap();
+    assert_eq!(player.volume, Some(41));
+    assert_eq!(player.required_lead_time_ms, Some(120));
+    assert_eq!(player.min_buffer_ms, Some(240));
+    assert_eq!(
+        player.supported_commands,
+        Some(vec![PlayerStateCommand::SetStaticDelay])
+    );
+}
+
+#[tokio::test]
+async fn reporter_omits_disabled_fields_and_deduplicates_local_controls() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: None,
+            muted: None,
+            static_delay_ms: Some(3),
+            ..Default::default()
+        }),
+        true,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 100,
+            muted: false,
+            static_delay_ms: 3,
+        },
+    );
+    f.server_tx
+        .send(
+            serde_json::to_string(&Message::ServerCommand(ServerCommand {
+                player: Some(PlayerCommand {
+                    command: PlayerCommandType::SetStaticDelay,
+                    volume: None,
+                    mute: None,
+                    static_delay_ms: Some(19),
+                }),
+            }))
+            .unwrap()
+            .into(),
+        )
+        .unwrap();
+    let player = next_state(&mut f.observed).await.player.unwrap();
+    assert_eq!(player.static_delay_ms, Some(19));
+    assert_eq!(player.volume, None);
+    assert_eq!(player.muted, None);
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            static_delay_ms: Some(22),
+            ..Default::default()
+        })
+        .unwrap();
+    let player = next_state(&mut f.observed).await.player.unwrap();
+    assert_eq!(player.static_delay_ms, Some(22));
+    assert!(
+        f.observed.try_recv().is_err(),
+        "equal local controls are deduplicated"
+    );
+}
+
+#[tokio::test]
+async fn external_source_suppresses_auto_reports_and_exit_merges_partial_state() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: Some(50),
+            muted: Some(false),
+            static_delay_ms: Some(4),
+            required_lead_time_ms: Some(9),
+            min_buffer_ms: Some(18),
+            ..Default::default()
+        }),
+        true,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 50,
+            muted: false,
+            static_delay_ms: 4,
+        },
+    );
+    split.sender.enter_external_source().await.unwrap();
+    assert_eq!(
+        next_state(&mut f.observed).await.state,
+        Some(ClientSyncState::ExternalSource)
+    );
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            volume: Some(33),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(
+        f.observed.try_recv().is_err(),
+        "external source suppresses automatic player reports"
+    );
+    split
+        .sender
+        .exit_external_source(Some(PlayerState {
+            muted: Some(true),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    let state = next_state(&mut f.observed).await;
+    let player = state.player.unwrap();
+    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+    assert_eq!(player.volume, Some(33));
+    assert_eq!(player.muted, Some(true));
+    assert_eq!(player.required_lead_time_ms, Some(9));
+    assert_eq!(player.min_buffer_ms, Some(18));
+}
+
+#[tokio::test]
+async fn manual_partial_player_state_persists_into_next_automatic_report() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: Some(60),
+            muted: Some(false),
+            static_delay_ms: Some(1),
+            ..Default::default()
+        }),
+        true,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 60,
+            muted: false,
+            static_delay_ms: 1,
+        },
+    );
+    split
+        .sender
+        .set_player_state(PlayerState {
+            required_lead_time_ms: Some(77),
+            min_buffer_ms: Some(88),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let _ = next_state(&mut f.observed).await;
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            volume: Some(61),
+            ..Default::default()
+        })
+        .unwrap();
+    let player = next_state(&mut f.observed).await.player.unwrap();
+    assert_eq!(player.volume, Some(61));
+    assert_eq!(player.required_lead_time_ms, Some(77));
+    assert_eq!(player.min_buffer_ms, Some(88));
+}
+
+#[tokio::test]
+async fn automatic_player_state_false_keeps_manual_marker_order_without_auto_report() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: Some(70),
+            ..Default::default()
+        }),
+        false,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 70,
+            muted: false,
+            static_delay_ms: 0,
+        },
+    );
+    split
+        .sender
+        .set_player_state(PlayerState {
+            min_buffer_ms: Some(12),
+            ..Default::default()
+        })
+        .await
+        .expect("opt-out sender writes manual state directly");
+    let state = next_state(&mut f.observed).await;
+    assert_eq!(state.player.unwrap().min_buffer_ms, Some(12));
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            volume: Some(71),
+            ..Default::default()
+        })
+        .unwrap();
+    while f.observed.try_recv().is_ok() {}
+    assert!(
+        f.observed.try_recv().is_err(),
+        "opt-out does not start a reporter"
+    );
+}
+
+#[tokio::test]
+async fn raw_client_state_partial_patch_retains_full_state_for_next_auto_report() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: Some(60),
+            muted: Some(false),
+            static_delay_ms: Some(1),
+            required_lead_time_ms: Some(77),
+            ..Default::default()
+        }),
+        true,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 60,
+            muted: false,
+            static_delay_ms: 1,
+        },
+    );
+    split
+        .sender
+        .send_message(Message::ClientState(
+            sendspin::protocol::messages::ClientState {
+                state: None,
+                player: Some(PlayerState {
+                    min_buffer_ms: Some(88),
+                    ..Default::default()
+                }),
+            },
+        ))
+        .await
+        .unwrap();
+    let state = next_state(&mut f.observed).await;
+    assert_eq!(state.player.unwrap().required_lead_time_ms, Some(77));
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            volume: Some(61),
+            ..Default::default()
+        })
+        .unwrap();
+    let player = next_state(&mut f.observed).await.player.unwrap();
+    assert_eq!(player.volume, Some(61));
+    assert_eq!(player.min_buffer_ms, Some(88));
+    assert_eq!(player.required_lead_time_ms, Some(77));
+}
+
+#[tokio::test]
+async fn raw_external_source_state_suppresses_pending_control_report() {
+    let mut f = fixture_with(
+        Some(PlayerState {
+            volume: Some(50),
+            muted: Some(false),
+            static_delay_ms: Some(4),
+            ..Default::default()
+        }),
+        true,
+    )
+    .await;
+    let split = f.client.split();
+    let session = split.player.attach(
+        Events::default(),
+        AppliedControls {
+            volume: 50,
+            muted: false,
+            static_delay_ms: 4,
+        },
+    );
+    split
+        .sender
+        .send_message(Message::ClientState(
+            sendspin::protocol::messages::ClientState {
+                state: Some(ClientSyncState::ExternalSource),
+                player: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_state(&mut f.observed).await.state,
+        Some(ClientSyncState::ExternalSource)
+    );
+    session
+        .update_controls(sendspin::audio::ControlUpdate {
+            volume: Some(30),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(f.observed.try_recv().is_err());
+    split
+        .sender
+        .send_message(Message::ClientState(
+            sendspin::protocol::messages::ClientState {
+                state: Some(ClientSyncState::Synchronized),
+                player: Some(PlayerState {
+                    muted: Some(true),
+                    ..Default::default()
+                }),
+            },
+        ))
+        .await
+        .unwrap();
+    let state = next_state(&mut f.observed).await;
+    let player = state.player.unwrap();
+    assert_eq!(player.volume, Some(30));
+    assert_eq!(player.muted, Some(true));
+}
+
+#[tokio::test]
+async fn reporter_shutdown_does_not_write_client_state_after_goodbye() {
+    let mut f = fixture().await;
+    let client = f.client;
+    client
+        .disconnect(sendspin::protocol::messages::GoodbyeReason::Shutdown)
+        .await
+        .unwrap();
+    while let Ok(message) = f.observed.try_recv() {
+        assert!(
+            !matches!(message, Message::ClientState(_)),
+            "no post-goodbye state is emitted"
+        );
+    }
 }
 
 #[tokio::test]

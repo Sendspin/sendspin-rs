@@ -19,6 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use super::diagnostics::{clear_diagnostic_observer, install_diagnostic_observer};
+use super::diagnostics::{record_playback_diagnostic, PlaybackDiagnostic};
+
 /// Callback for post-processing audio samples before output.
 ///
 /// Receives `&mut [f32]` (interleaved, after gain is applied).
@@ -1031,17 +1035,19 @@ impl SyncedPlayer {
 }
 
 impl PlaybackControl {
+    #[cfg(test)]
+    pub(crate) fn set_error_for_test(&self, error: impl Into<String>) {
+        *self.last_error.lock() = Some(error.into());
+    }
+
     /// Returns the format accepted by this control handle.
     pub fn format(&self) -> &AudioFormat {
         &self.format
     }
 
-    /// Commits a decoded buffer to the playback queue.
-    ///
-    /// Sample rate and channel count must match this control's format; mismatches
-    /// return [`crate::audio::OutputError::FormatMismatch`] without poisoning the
-    /// session. An existing audio-callback failure is returned as `Failed` and is
-    /// retained; `clear` and all setters report that same failure.
+    /// Commits whole frames matching this control's sample rate and channel count.
+    /// Format and frame rejections leave the session usable; callback failures are retained.
+    /// `clear` and all setters report retained callback failures.
     pub fn commit(&self, buffer: AudioBuffer) -> Result<(), crate::audio::OutputError> {
         if self.format.sample_rate != buffer.format.sample_rate
             || self.format.channels != buffer.format.channels
@@ -1051,20 +1057,58 @@ impl PlaybackControl {
                 actual: buffer.format.clone(),
             });
         }
+        if self.format.channels == 0
+            || !buffer
+                .samples
+                .len()
+                .is_multiple_of(self.format.channels as usize)
+        {
+            return Err(crate::audio::OutputError::InvalidBuffer {
+                samples: buffer.samples.len(),
+                channels: self.format.channels,
+            });
+        }
         if let Some(error) = self.last_error.lock().as_ref() {
             return Err(crate::audio::OutputError::Failed(error.clone()));
         }
-        self.queue.lock().enqueue(buffer);
+        let timestamp = buffer.timestamp;
+        let duration_us = buffer.duration_us();
+        let diagnostic = {
+            let mut queue = self.queue.lock();
+            queue.enqueue(buffer);
+            PlaybackDiagnostic::Enqueued {
+                timestamp,
+                duration_us,
+                enqueue_count: queue.enqueue_count,
+                queued_us: queue
+                    .queued_duration_us(self.format.channels as usize, self.format.sample_rate),
+                buffers: queue.buffer_count(),
+                cursor_us: queue.cursor_us,
+                reset: queue.playback_reset_generation,
+            }
+        };
+        record_playback_diagnostic(diagnostic);
         Ok(())
     }
 
-    /// Clears queued audio.
+    /// Clears queued audio before reporting any retained callback failure.
     pub fn clear(&self) -> Result<(), crate::audio::OutputError> {
-        if let Some(error) = self.last_error.lock().as_ref() {
-            return Err(crate::audio::OutputError::Failed(error.clone()));
-        }
-        self.queue.lock().clear();
-        Ok(())
+        let diagnostic = {
+            let mut queue = self.queue.lock();
+            let diagnostic = PlaybackDiagnostic::Cleared {
+                queued_us: queue
+                    .queued_duration_us(self.format.channels as usize, self.format.sample_rate),
+                buffers: queue.buffer_count(),
+                cursor_us: queue.cursor_us,
+                reset: queue.playback_reset_generation,
+            };
+            queue.clear();
+            diagnostic
+        };
+        record_playback_diagnostic(diagnostic);
+        self.last_error.lock().as_ref().map_or(Ok(()), |error| {
+            Err(crate::audio::OutputError::Failed(error.clone()))
+        })
     }
 
     /// Sets the software output volume.
@@ -1248,77 +1292,14 @@ impl SyncedPlayer {
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
     /// drift-corrected playback.
     pub fn enqueue(&self, buffer: AudioBuffer) {
-        let buffer_timestamp = buffer.timestamp;
-        let buffer_duration_us = buffer.duration_us();
-        let channels = self.format.channels as usize;
-        let sample_rate = self.format.sample_rate;
-
-        // Snapshot log fields under the lock but log after dropping it: the
-        // audio callback contends on this lock, and logging can block on I/O.
-        // The O(buffers) depth walk runs only for sampled, trace-enabled
-        // enqueues.
-        let trace_fields = {
-            let mut queue = self.queue.lock();
-            queue.enqueue(buffer);
-            if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
-                Some((
-                    queue.enqueue_count,
-                    queue.queued_duration_us(channels, sample_rate),
-                    queue.buffer_count(),
-                    queue.cursor_us,
-                    queue.playback_reset_generation,
-                ))
-            } else {
-                None
-            }
-        };
-
-        if let Some((enqueue_count, queued_us, buffers, cursor_us, playback_reset_generation)) =
-            trace_fields
-        {
-            log::trace!(
-                "Audio buffer enqueued: enqueue={}, ts={}µs, duration={:.1}ms, queued={:.1}ms, buffers={}, cursor={}µs, playback_reset_generation={:?}",
-                enqueue_count,
-                buffer_timestamp,
-                buffer_duration_us as f64 / 1000.0,
-                us_to_ms(queued_us),
-                buffers,
-                cursor_us,
-                playback_reset_generation,
-            );
+        if let Err(error) = self.control().commit(buffer) {
+            log::warn!("Audio buffer rejected: {error}");
         }
     }
 
     /// Clear queued audio and reset playback state.
     pub fn clear(&self) {
-        let channels = self.format.channels as usize;
-        let sample_rate = self.format.sample_rate;
-
-        // Snapshot log fields under the lock but log after dropping it: the
-        // audio callback contends on this lock, and logging can block on I/O.
-        let debug_fields = {
-            let mut queue = self.queue.lock();
-            let fields = log::log_enabled!(log::Level::Debug).then(|| {
-                (
-                    queue.queued_duration_us(channels, sample_rate),
-                    queue.buffer_count(),
-                    queue.cursor_us,
-                    queue.playback_reset_generation,
-                )
-            });
-            queue.clear();
-            fields
-        };
-
-        if let Some((queued_us, buffers, cursor_us, playback_reset_generation)) = debug_fields {
-            log::debug!(
-                "Cleared playback queue: queued={:.1}ms, buffers={}, cursor={}µs, playback_reset_generation={:?}",
-                us_to_ms(queued_us),
-                buffers,
-                cursor_us,
-                playback_reset_generation,
-            );
-        }
+        let _ = self.control().clear();
     }
 
     /// Release the underlying audio output device.
@@ -2112,20 +2093,29 @@ impl SyncedPlayer {
                     }
                     },
                     move |err| {
-                        // cpal reports a refused real-time promotion as
-                        // RealtimeDenied ("Audio will still play"); playback
-                        // continues at normal priority. Warn without storing:
-                        // take_error()/has_error() signal fatal stream
-                        // failures, and a consumer must not tear down a
-                        // working stream over a scheduling downgrade.
-                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
-                            log::warn!(
-                                "Audio thread priority promotion failed (non-fatal): {err}"
-                            );
-                            return;
+                        // These recoverable notifications do not invalidate a working stream;
+                        // only other callback errors are retained for take_error()/has_error().
+                        match err.kind() {
+                            cpal::ErrorKind::RealtimeDenied => {
+                                log::warn!(
+                                    "Audio thread priority promotion failed (non-fatal): {err}"
+                                );
+                            }
+                            cpal::ErrorKind::Xrun => {
+                                static XRUNS: AtomicU64 = AtomicU64::new(0);
+                                let count = XRUNS.fetch_add(1, Ordering::Relaxed);
+                                if should_log_sample(count) {
+                                    log::debug!("Audio callback underrun (xrun): {err}");
+                                }
+                            }
+                            cpal::ErrorKind::DeviceChanged => {
+                                log::warn!("Audio device changed; playback stream continues: {err}");
+                            }
+                            _ => {
+                                log::error!("Audio stream error: {err}");
+                                *error.lock() = Some(err.to_string());
+                            }
                         }
-                        log::error!("Audio stream error: {err}");
-                        *error.lock() = Some(err.to_string());
                     },
                     None,
                 )
@@ -2170,15 +2160,28 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
-        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        clear_diagnostic_observer, install_diagnostic_observer, record_playback_diagnostic,
+        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackDiagnostic, PlaybackQueue,
+        SyncedPlayer, SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
     };
+    use crate::audio::decode::{Decoder, PcmDecoder};
+    use crate::audio::diagnostics::DiagnosticScope;
     use crate::audio::{AudioBuffer, AudioFormat, Codec, OutputError};
     use crate::error::Error;
     use crate::sync::{ClockSync, DefaultClock};
     use cpal::Sample;
     use parking_lot::Mutex;
+    use std::cell::Cell;
     use std::sync::Arc;
+
+    fn diagnostic() -> PlaybackDiagnostic {
+        PlaybackDiagnostic::Cleared {
+            queued_us: 0,
+            buffers: 0,
+            cursor_us: 0,
+            reset: crate::generation::PlaybackResetGeneration::initial(),
+        }
+    }
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {
@@ -2245,6 +2248,124 @@ mod tests {
         let mut different_codec = test_format();
         different_codec.codec = Codec::Opus;
         control.commit(control_buffer(different_codec, 0)).unwrap();
+    }
+
+    fn decoded_buffer(bit_depth: u8, data: &[u8], timestamp: i64) -> AudioBuffer {
+        let samples = PcmDecoder::new(bit_depth).decode(data).unwrap();
+        AudioBuffer {
+            timestamp,
+            samples,
+            format: AudioFormat {
+                bit_depth,
+                ..test_format()
+            },
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_decoder_partial_frames_without_changing_queue() {
+        for (bit_depth, valid_data, invalid_data) in [
+            (16, [0_u8; 8].as_slice(), [0_u8; 6].as_slice()),
+            (24, [0_u8; 12].as_slice(), [0_u8; 9].as_slice()),
+        ] {
+            let control = SyncedPlayer::control_for_test(test_format());
+            control
+                .commit(decoded_buffer(bit_depth, valid_data, 0))
+                .unwrap();
+            let before = {
+                let queue = control.queue.lock();
+                (
+                    queue.enqueue_count,
+                    queue.initialized,
+                    queue.cursor_us,
+                    queue.current.as_ref().map(|buffer| buffer.samples.to_vec()),
+                    queue
+                        .queue
+                        .iter()
+                        .map(|buffer| (buffer.timestamp, buffer.samples.to_vec()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let invalid = decoded_buffer(bit_depth, invalid_data, 1);
+            assert_eq!(invalid.samples.len(), 3);
+            assert_eq!(
+                control.commit(invalid),
+                Err(OutputError::InvalidBuffer {
+                    samples: 3,
+                    channels: 2,
+                })
+            );
+            let queue = control.queue.lock();
+            assert_eq!(
+                (
+                    queue.enqueue_count,
+                    queue.initialized,
+                    queue.cursor_us,
+                    queue.current.as_ref().map(|buffer| buffer.samples.to_vec()),
+                    queue
+                        .queue
+                        .iter()
+                        .map(|buffer| (buffer.timestamp, buffer.samples.to_vec()))
+                        .collect::<Vec<_>>(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_partial_frames_on_empty_queue_then_accepts_valid() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        let invalid = decoded_buffer(16, &[0; 6], 0);
+        assert_eq!(
+            control.commit(invalid),
+            Err(OutputError::InvalidBuffer {
+                samples: 3,
+                channels: 2,
+            })
+        );
+        {
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 0);
+            assert!(!queue.initialized);
+            assert!(queue.current.is_none());
+            assert!(queue.queue.is_empty());
+        }
+        let valid = AudioBuffer {
+            timestamp: 1,
+            samples: PcmDecoder::new(16).decode(&[0; 8]).unwrap(),
+            format: test_format(),
+        };
+        control.commit(valid).unwrap();
+        assert_eq!(control.queue.lock().enqueue_count, 1);
+    }
+
+    #[test]
+    fn playback_control_accepts_three_mono_samples() {
+        let control = SyncedPlayer::control_for_test(test_format_mono());
+        let buffer = AudioBuffer {
+            timestamp: 0,
+            samples: PcmDecoder::new(16).decode(&[0; 6]).unwrap(),
+            format: test_format_mono(),
+        };
+        control.commit(buffer).unwrap();
+        assert_eq!(control.queue.lock().enqueue_count, 1);
+    }
+
+    #[test]
+    fn playback_control_clear_drains_queue_before_returning_callback_error() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        control
+            .commit(control_buffer(test_format(), 0))
+            .expect("queue starts healthy");
+        *control.last_error.lock() = Some("callback failed".into());
+        assert_eq!(
+            control.clear(),
+            Err(OutputError::Failed("callback failed".into()))
+        );
+        let queue = control.queue.lock();
+        assert!(queue.queue.is_empty());
+        assert!(queue.current.is_none());
     }
 
     #[test]
@@ -3036,5 +3157,63 @@ mod tests {
             .next_frame(2, 48_000)
             .expect("should return a frame from the next buffer, not panic");
         assert_eq!(frame[0], 222, "expected frame from the ahead buffer");
+    }
+
+    #[test]
+    fn nested_diagnostic_scopes_flush_only_at_outer_drop() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        {
+            let _outer = DiagnosticScope::new();
+            record_playback_diagnostic(diagnostic());
+            {
+                let _inner = DiagnosticScope::new();
+                record_playback_diagnostic(diagnostic());
+                assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        clear_diagnostic_observer();
+    }
+
+    #[test]
+    fn diagnostic_emission_drops_reentrant_records() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_playback_diagnostic(diagnostic());
+        });
+        record_playback_diagnostic(diagnostic());
+        clear_diagnostic_observer();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn diagnostic_emission_guard_resets_after_panic() {
+        let panicking = Cell::new(true);
+        install_diagnostic_observer(move |_| {
+            if panicking.replace(false) {
+                panic!("diagnostic callback panic");
+            }
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            record_playback_diagnostic(diagnostic());
+        }));
+        assert!(result.is_err());
+        clear_diagnostic_observer();
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        record_playback_diagnostic(diagnostic());
+        clear_diagnostic_observer();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

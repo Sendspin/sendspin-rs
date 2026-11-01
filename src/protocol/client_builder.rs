@@ -29,6 +29,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    automatic_player_state: bool,
     metadata: bool,
     controller: bool,
     color: bool,
@@ -108,6 +109,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             visualizer_v1_support: raw.visualizer_v1_support,
             initial_sync_state: raw.initial_sync_state,
             initial_player_state: raw.initial_player_state,
+            automatic_player_state: raw.automatic_player_state,
         }
     }
 }
@@ -138,6 +140,9 @@ pub struct ProtocolClientBuilderFields {
     initial_sync_state: ClientSyncState,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
+    /// Automatically report successful player control changes as client/state updates.
+    #[builder(default = true)]
+    automatic_player_state: bool,
     #[builder(default = false, setter(transform = || true))]
     metadata: bool,
     #[builder(default = false, setter(transform = || true))]
@@ -160,6 +165,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             visualizer_v1_support: fields.visualizer_v1_support,
             initial_sync_state: fields.initial_sync_state,
             initial_player_state: fields.initial_player_state,
+            automatic_player_state: fields.automatic_player_state,
             metadata: fields.metadata,
             controller: fields.controller,
             color: fields.color,
@@ -183,6 +189,7 @@ pub struct ProtocolClientBuilder {
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    automatic_player_state: bool,
     clock: Arc<dyn Clock>,
 }
 
@@ -223,8 +230,8 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
-        let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::connect(request, hello, initial_state, clock).await
+        let (hello, initial_state, clock, automatic_player_state) = self.into_parts();
+        ProtocolClient::connect(request, hello, initial_state, clock, automatic_player_state).await
     }
 
     /// Adopt an already-handshaked WebSocket stream and drive the protocol
@@ -238,8 +245,15 @@ impl ProtocolClientBuilder {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::drive(ws_stream, hello, initial_state, clock).await
+        let (hello, initial_state, clock, automatic_player_state) = self.into_parts();
+        ProtocolClient::drive(
+            ws_stream,
+            hello,
+            initial_state,
+            clock,
+            automatic_player_state,
+        )
+        .await
     }
 
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
@@ -256,7 +270,7 @@ impl ProtocolClientBuilder {
         Ok(ProtocolListener::new(tcp, self))
     }
 
-    fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>) {
+    fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>, bool) {
         let hello = ClientHello {
             client_id: self.client_id,
             name: self.name,
@@ -278,6 +292,11 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        (hello, initial_state, self.clock)
+        (
+            hello,
+            initial_state,
+            self.clock,
+            self.automatic_player_state,
+        )
     }
 }

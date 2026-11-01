@@ -3,6 +3,7 @@
 
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
+mod diagnostics;
 /// Lock-free volume/mute control
 pub mod gain;
 /// Buffer pool for reusing audio sample buffers
@@ -20,8 +21,7 @@ mod player_session;
 pub use crate::protocol::messages::StreamPlayerConfig;
 pub use gain::GainControl;
 pub use player_api::{
-    AudioWork, LazyPlayerSession, OutputInstallPermit, PlayerEvent, PlayerOutput, PlayerReceiver,
-    PlayerSession,
+    AudioWork, OutputInstallPermit, PlayerEvent, PlayerOutput, PlayerReceiver, PlayerSession,
 };
 pub use player_session::{
     AppliedControls, CommitRejected, ControlUpdate, InstallRejected, OutputError, SessionStatus,

@@ -141,6 +141,13 @@ async fn wait_for_goodbye(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>)
     false
 }
 
+async fn wait_for_peer_close(reader: tokio::task::JoinHandle<()>) {
+    timeout(Duration::from_secs(2), reader)
+        .await
+        .expect("peer did not observe WebSocket close")
+        .expect("peer reader task failed");
+}
+
 #[tokio::test]
 async fn test_listen_role_session_delivers_player_events() {
     let builder = ProtocolClientBuilder::builder()
@@ -404,12 +411,18 @@ async fn test_listen_path_mismatch_rejects_but_listener_survives() {
         .await
         .expect("second accept timed out")
         .expect("second accept");
-    let _ = good_peer.await.expect("good peer task");
+    let (_roles, mut rx, reader, writer) = good_peer.await.expect("good peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
         .await
         .expect("disconnect");
+    assert!(
+        wait_for_goodbye(&mut rx).await,
+        "matched-path connection never delivered client/goodbye"
+    );
+    drop(writer);
+    wait_for_peer_close(reader).await;
 }
 
 #[tokio::test]
