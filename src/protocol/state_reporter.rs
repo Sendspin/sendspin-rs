@@ -185,10 +185,8 @@ pub(crate) async fn run(mut config: Config) {
                                 Some(player.clone())
                             },
                         })).await;
-                        if result.is_ok()
-                            && !external
-                            && !was_external
-                            && reconcile_post_state(
+                        let reconciled = if result.is_ok() && !external && !was_external {
+                            reconcile_post_state(
                                 &config.output,
                                 &config.controls,
                                 &mut player,
@@ -196,11 +194,13 @@ pub(crate) async fn run(mut config: Config) {
                                 &post_boundary,
                             )
                             .await
-                            .is_err()
-                        {
+                        } else {
+                            Ok(())
+                        };
+                        let _ = ack.send(result);
+                        if reconciled.is_err() {
                             break;
                         }
-                        let _ = ack.send(result);
                     }
                     Command::Enter { ack } => {
                         external = true;
@@ -210,18 +210,24 @@ pub(crate) async fn run(mut config: Config) {
                     Command::Exit { player: patch, controls: boundary, ack } => {
                         external = false;
                         synchronize_player(&mut player, &boundary, patch);
-                        last_controls = boundary;
+                        last_controls = boundary.clone();
                         let result = send(&config.output, Message::ClientState(ClientState { state: Some(ClientSyncState::Synchronized), player: Some(player.clone()) })).await;
-                        if result.is_ok() {
-                            let current = config.controls.borrow().clone();
-                            if current != last_controls {
-                                last_controls = current.clone();
-                                apply_controls(&mut player, &current);
-                                let followup = send(&config.output, Message::ClientState(ClientState { state: None, player: Some(player.clone()) })).await;
-                                if followup.is_err() { break; }
-                            }
-                        }
+                        let reconciled = if result.is_ok() {
+                            reconcile_post_state(
+                                &config.output,
+                                &config.controls,
+                                &mut player,
+                                &mut last_controls,
+                                &boundary,
+                            )
+                            .await
+                        } else {
+                            Ok(())
+                        };
                         let _ = ack.send(result);
+                        if reconciled.is_err() {
+                            break;
+                        }
                     }
                 }
             }
