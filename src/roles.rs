@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Receives encoded artwork frames and stream boundary notifications.
-pub trait ArtworkOutput: Clone + Send + Sync + 'static {
+pub trait ArtworkOutput: Send + 'static {
     /// Prepared representation committed for an artwork frame.
     type Prepared: Send + 'static;
     /// Commits a frame for the specified artwork channel.
@@ -23,7 +23,7 @@ pub trait ArtworkOutput: Clone + Send + Sync + 'static {
     fn end(&self) -> Result<(), OutputError>;
 }
 /// Receives encoded visualizer frames and stream boundary notifications.
-pub trait VisualizerOutput: Clone + Send + Sync + 'static {
+pub trait VisualizerOutput: Send + 'static {
     /// Prepared representation committed for a visualizer frame.
     type Prepared: Send + 'static;
     /// Commits a prepared visualizer frame.

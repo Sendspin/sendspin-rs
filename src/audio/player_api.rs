@@ -28,7 +28,7 @@ type SetterGate = Arc<(
 /// A synchronous device-independent player output.
 ///
 /// Calls are serialized, short, nonblocking, and must not reenter the session.
-pub trait PlayerOutput: Clone + Send + Sync + 'static {
+pub trait PlayerOutput: Send + 'static {
     /// Commits one decoded buffer.
     fn commit(&self, buffer: AudioBuffer) -> Result<(), OutputError>;
     /// Clears queued output.
