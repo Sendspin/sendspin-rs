@@ -533,7 +533,7 @@ mod tests {
         );
         assert!(matches!(
             *artwork.status().borrow(),
-            crate::audio::SessionStatus::Failed(OutputError::Failed(ref message)) if message == "artwork commit failed"
+            crate::roles::RoleStatus::Failed(OutputError::Failed(ref message)) if message == "artwork commit failed"
         ));
 
         sinks.dispatch_binary(BinaryFrame::Artwork(super::tests::artwork(1, 2, &[2])));
@@ -608,7 +608,7 @@ mod tests {
         );
         assert!(matches!(
             *visualizer.status().borrow(),
-            crate::audio::SessionStatus::Failed(OutputError::Failed(ref message)) if message == "visualizer commit failed"
+            crate::roles::RoleStatus::Failed(OutputError::Failed(ref message)) if message == "visualizer commit failed"
         ));
 
         sinks.dispatch_binary(BinaryFrame::Visualizer(super::tests::visualizer(1, &[2])));

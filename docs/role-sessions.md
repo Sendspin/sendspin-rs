@@ -40,12 +40,13 @@ does not require application sequence counters. Keep output callbacks synchronou
 nonblocking, serialized, and nonreentrant.
 
 `recv` returns `PlayerEvent::OutputLost(error)` once when the player output was detached after
-a recoverable output failure. Install a fresh output to recover. `Closed` means the session has ended. A player
-`OutputError::Failed` or callback-related `CommitRejected::Output` failure detaches the output
-and rejects admitted work until recovery; `FormatMismatch` rejects only that item. An
-`InstallRejected::Failed` result consumes its permit and requires a fresh reservation. `Failed`
-is reserved for terminal failures in custom roles. A retry is a new output installation, not a
-new connection, and uses the retained stream configuration.
+a recoverable output failure. Install a fresh output to recover. `Closed` means the session has
+ended. A player `OutputError::Failed` or callback-related `CommitRejected::Output` failure
+detaches the output and rejects admitted work until recovery; `FormatMismatch` rejects only that
+item. An `InstallRejected::Failed` result consumes its permit and requires a fresh reservation.
+Artwork and visualizer sessions treat output failures as terminal and report
+`RoleStatus::Failed`. A retry is a new output installation, not a new connection, and uses the
+retained stream configuration.
 
 ## Controls and state
 

@@ -5,15 +5,15 @@ use thiserror::Error;
 use tokio::sync::watch;
 
 pub(crate) struct Lifecycle {
-    pub(crate) status: watch::Sender<SessionStatus>,
-    pub(crate) current: Arc<Mutex<SessionStatus>>,
+    pub(crate) status: watch::Sender<PlayerStatus>,
+    pub(crate) current: Arc<Mutex<PlayerStatus>>,
     pub(crate) transition: Mutex<()>,
 }
 
 impl Lifecycle {
     pub(crate) fn new(
-        status: watch::Sender<SessionStatus>,
-        current: Arc<Mutex<SessionStatus>>,
+        status: watch::Sender<PlayerStatus>,
+        current: Arc<Mutex<PlayerStatus>>,
     ) -> Self {
         Self {
             status,
@@ -116,16 +116,14 @@ pub(crate) trait OutputAdapter: Send + 'static {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-/// Retained lifecycle state of a role session.
-pub enum SessionStatus {
+/// Retained lifecycle state of a player session.
+pub enum PlayerStatus {
     /// The session accepts controls and current output work.
     Open,
     /// The session was closed and rejects future work.
     Closed,
     /// The output is detached after a recoverable device failure; the first error is retained.
     OutputLost(OutputError),
-    /// A terminal failure rejects future work.
-    Failed(OutputError),
 }
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -147,7 +145,7 @@ pub enum CommitRejected {
 struct State<O> {
     floor: StreamGeneration,
     incarnation: OutputIncarnation,
-    status: SessionStatus,
+    status: PlayerStatus,
     output: Option<O>,
     /// Controls known to have been applied to the installed output.
     controls: AppliedControls,
@@ -161,8 +159,8 @@ fn output_lost<O: OutputAdapter>(state: &mut State<O>, mut output: Option<O>, er
         let _ = output.clear();
     }
     state.output = None;
-    if !matches!(state.status, SessionStatus::OutputLost(_)) {
-        state.status = SessionStatus::OutputLost(error);
+    if !matches!(state.status, PlayerStatus::OutputLost(_)) {
+        state.status = PlayerStatus::OutputLost(error);
     }
 }
 
@@ -269,8 +267,8 @@ impl<O: OutputAdapter> Coordinator<O> {
     pub(crate) fn with_admission(controls: AppliedControls, admission: Arc<AdmissionGate>) -> Self {
         let controls = controls.normalized();
         let (control_tx, _) = watch::channel(controls.clone());
-        let (status, _) = watch::channel(SessionStatus::Open);
-        let current = Arc::new(Mutex::new(SessionStatus::Open));
+        let (status, _) = watch::channel(PlayerStatus::Open);
+        let current = Arc::new(Mutex::new(PlayerStatus::Open));
         Self::with_admission_and_controls(
             controls,
             admission,
@@ -291,7 +289,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                 session: Mutex::new(State {
                     floor: StreamGeneration::initial(),
                     incarnation,
-                    status: SessionStatus::Open,
+                    status: PlayerStatus::Open,
                     output: None,
                     controls: controls.clone(),
                     desired_controls: controls,
@@ -338,15 +336,8 @@ impl<O: OutputAdapter> Coordinator<O> {
     }
     pub(crate) fn begin_install(&self) -> Result<InstallPermit<O>, InstallRejected> {
         let state = self.shared.session.lock();
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
-            return Err(if matches!(state.status, SessionStatus::Closed) {
-                InstallRejected::Closed
-            } else {
-                InstallRejected::Failed
-            });
+        if matches!(state.status, PlayerStatus::Closed) {
+            return Err(InstallRejected::Closed);
         }
         let incarnation = state.incarnation;
         let mut install_state = self.shared.install_state.lock();
@@ -370,10 +361,7 @@ impl<O: OutputAdapter> Coordinator<O> {
     pub(crate) fn release(&self) -> Result<(), OutputError> {
         let _diagnostics = DiagnosticScope::new();
         let mut state = self.shared.session.lock();
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
+        if matches!(state.status, PlayerStatus::Closed) {
             return Ok(());
         }
         state.incarnation = state.incarnation.advance();
@@ -389,7 +377,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         }
         Ok(())
     }
-    pub(crate) fn status(&self) -> SessionStatus {
+    pub(crate) fn status(&self) -> PlayerStatus {
         self.shared.session.lock().status.clone()
     }
     fn publish_status_locked(&self, state: &mut State<O>) {
@@ -398,7 +386,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         // A terminal lifecycle transition wins over any worker that admitted
         // work before the transition and only publishes after a callback or
         // cleanup completes. Never let that stale worker reopen the watch.
-        if matches!(*current, SessionStatus::Closed | SessionStatus::Failed(_)) {
+        if matches!(*current, PlayerStatus::Closed) {
             state.status = current.clone();
         }
         *current = state.status.clone();
@@ -416,10 +404,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         error: OutputError,
         already_advanced: bool,
     ) {
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
+        if matches!(state.status, PlayerStatus::Closed) {
             return;
         }
         if self.shared.admission.is_closed() {
@@ -427,7 +412,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                 let _ = output.clear();
             }
             state.output = None;
-            state.status = SessionStatus::Closed;
+            state.status = PlayerStatus::Closed;
             self.publish_status_locked(state);
             return;
         }
@@ -450,10 +435,7 @@ impl<O: OutputAdapter> Coordinator<O> {
     ) -> Result<(), OutputError> {
         let _diagnostics = DiagnosticScope::new();
         let mut state = self.shared.session.lock();
-        if let SessionStatus::Failed(error) = &state.status {
-            return Err(error.clone());
-        }
-        if matches!(state.status, SessionStatus::Closed) {
+        if matches!(state.status, PlayerStatus::Closed) {
             return Err(OutputError::Closed);
         }
         let Some((update, version)) = capture(state.control_version) else {
@@ -491,7 +473,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                 if self.shared.admission.is_closed() {
                     let _ = output.clear();
                     state.output = None;
-                    state.status = SessionStatus::Closed;
+                    state.status = PlayerStatus::Closed;
                     self.publish_status_locked(&mut state);
                     *self.shared.install_state.lock() = InstallState::Empty;
                     return Err(OutputError::Closed);
@@ -521,9 +503,9 @@ impl<O: OutputAdapter> Coordinator<O> {
         }
         if matches!(
             state.status,
-            SessionStatus::Open | SessionStatus::OutputLost(_)
+            PlayerStatus::Open | PlayerStatus::OutputLost(_)
         ) {
-            state.status = SessionStatus::Closed;
+            state.status = PlayerStatus::Closed;
             self.publish_status_locked(&mut state);
         }
         self.shared.admission.close();
@@ -531,11 +513,7 @@ impl<O: OutputAdapter> Coordinator<O> {
     pub(crate) fn boundary(&self, generation: StreamGeneration) -> Result<(), OutputError> {
         let _diagnostics = DiagnosticScope::new();
         let mut state = self.shared.session.lock();
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) || generation <= state.floor
-        {
+        if matches!(state.status, PlayerStatus::Closed) || generation <= state.floor {
             return Ok(());
         }
         state.floor = generation;
@@ -568,15 +546,8 @@ impl<O: OutputAdapter> InstallPermit<O> {
     ) -> Result<(), InstallRejected> {
         let _diagnostics = DiagnosticScope::new();
         let mut state = self.shared.session.lock();
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
-            return Err(if matches!(state.status, SessionStatus::Closed) {
-                InstallRejected::Closed
-            } else {
-                InstallRejected::Failed
-            });
+        if matches!(state.status, PlayerStatus::Closed) {
+            return Err(InstallRejected::Closed);
         }
         if state.incarnation != self.incarnation {
             return Err(InstallRejected::Superseded);
@@ -635,7 +606,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
         if *closed {
             drop(closed);
             let _ = output.clear();
-            state.status = SessionStatus::Closed;
+            state.status = PlayerStatus::Closed;
             *install_state = InstallState::Empty;
             return Err(InstallRejected::Closed);
         }
@@ -644,7 +615,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
         state.control_version = version;
         let _ = self.shared.controls.send_replace(state.controls.clone());
         state.output = Some(output);
-        state.status = SessionStatus::Open;
+        state.status = PlayerStatus::Open;
         Coordinator::from_shared(Arc::clone(&self.shared)).publish_status_locked(&mut state);
         drop(closed);
         *install_state = InstallState::Installed;
@@ -672,47 +643,41 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
     #[cfg(test)]
     pub(crate) fn commit(self, buffer: AudioBuffer) -> Result<(), CommitRejected> {
         let generation = self.generation;
-        self.commit_at_with_status(generation, buffer).0
+        self.commit_at(generation, buffer)
     }
-    pub(crate) fn commit_at_with_status(
+    pub(crate) fn commit_at(
         self,
         generation: StreamGeneration,
         buffer: AudioBuffer,
-    ) -> (Result<(), CommitRejected>, SessionStatus) {
+    ) -> Result<(), CommitRejected> {
         let _diagnostics = DiagnosticScope::new();
         let coordinator = Coordinator::from_shared(Arc::clone(&self.shared));
-        if let Err(error) = coordinator
+        coordinator
             .boundary(generation)
-            .map_err(CommitRejected::Output)
-        {
-            return (Err(error), coordinator.status());
-        }
+            .map_err(CommitRejected::Output)?;
         let mut state = self.shared.session.lock();
-        if matches!(
-            state.status,
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
-            return (Err(CommitRejected::Closed), state.status.clone());
+        if matches!(state.status, PlayerStatus::Closed) {
+            return Err(CommitRejected::Closed);
         }
-        if matches!(state.status, SessionStatus::OutputLost(_)) {
-            return (Err(CommitRejected::Obsolete), state.status.clone());
+        if matches!(state.status, PlayerStatus::OutputLost(_)) {
+            return Err(CommitRejected::Obsolete);
         }
         if self.stamp.incarnation != state.incarnation || self.generation != state.floor {
-            return (Err(CommitRejected::Obsolete), state.status.clone());
+            return Err(CommitRejected::Obsolete);
         }
         if self.shared.admission.is_closed() {
-            return (Err(CommitRejected::Closed), state.status.clone());
+            return Err(CommitRejected::Closed);
         }
         let Some(mut output) = state.output.take() else {
-            return (Err(CommitRejected::Obsolete), state.status.clone());
+            return Err(CommitRejected::Obsolete);
         };
         // Keep the session lock across the short, synchronous callback. This
         // serializes commit with boundary/clear and prevents stale reinsertion.
         let result = output.commit(buffer);
         if self.shared.admission.is_closed() {
             let _ = output.clear();
-            state.status = SessionStatus::Closed;
-            return (Err(CommitRejected::Closed), state.status.clone());
+            state.status = PlayerStatus::Closed;
+            return Err(CommitRejected::Closed);
         }
         let result = match result {
             Ok(()) => {
@@ -737,7 +702,7 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
                 Err(rejection)
             }
         };
-        (result, state.status.clone())
+        result
     }
 }
 
@@ -891,7 +856,7 @@ mod tests {
                 channels: 2,
             }))
         );
-        assert_eq!(coordinator.status(), SessionStatus::Open);
+        assert_eq!(coordinator.status(), PlayerStatus::Open);
         let next = coordinator.work(buffer(48_000, 2));
         assert_eq!(next.commit(buffer(48_000, 2)), Ok(()));
     }
@@ -997,7 +962,7 @@ mod tests {
         let work = c.work(buffer(48_000, 2));
         c.close();
         assert_eq!(work.commit(buffer(48_000, 2)), Err(CommitRejected::Closed));
-        assert_eq!(c.status(), SessionStatus::Closed);
+        assert_eq!(c.status(), PlayerStatus::Closed);
     }
     #[test]
     fn closed_control_update_rejects_before_capture() {
@@ -1018,39 +983,6 @@ mod tests {
             }
         });
         assert_eq!(result, Err(OutputError::Closed));
-        assert!(!captured.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn failed_control_update_returns_original_failure_before_capture() {
-        let c = coordinator(Arc::new(AtomicUsize::new(0)));
-        c.shared.session.lock().status =
-            SessionStatus::Failed(OutputError::Failed("original".into()));
-        let first = c.apply_controls_transaction(|_| {
-            Some((
-                ControlUpdate {
-                    volume: Some(25),
-                    ..ControlUpdate::default()
-                },
-                1,
-            ))
-        });
-        assert_eq!(first, Err(OutputError::Failed("original".into())));
-        let captured = Arc::new(AtomicBool::new(false));
-        let second = c.apply_controls_transaction({
-            let captured = Arc::clone(&captured);
-            move |_| {
-                captured.store(true, Ordering::SeqCst);
-                Some((
-                    ControlUpdate {
-                        volume: Some(30),
-                        ..ControlUpdate::default()
-                    },
-                    2,
-                ))
-            }
-        });
-        assert_eq!(second, Err(OutputError::Failed("original".into())));
         assert!(!captured.load(Ordering::SeqCst));
     }
 
@@ -1096,8 +1028,8 @@ mod tests {
         c.shared.admission.close();
         release_tx.send(()).unwrap();
         worker.join().unwrap();
-        assert_eq!(c.status(), SessionStatus::Closed);
-        assert!(!matches!(*status.borrow(), SessionStatus::OutputLost(_)));
+        assert_eq!(c.status(), PlayerStatus::Closed);
+        assert!(!matches!(*status.borrow(), PlayerStatus::OutputLost(_)));
         assert!(status.has_changed().unwrap());
     }
 
@@ -1114,7 +1046,7 @@ mod tests {
         assert_eq!(permit.install(failed), Err(InstallRejected::Failed));
         assert_eq!(c.status(), first);
         c.begin_install().unwrap().install(installable()).unwrap();
-        assert_eq!(c.status(), SessionStatus::Open);
+        assert_eq!(c.status(), PlayerStatus::Open);
         c.shared.session.lock().output.as_mut().unwrap().fail_commit =
             Some(OutputError::Failed("C".into()));
         assert_eq!(
@@ -1123,7 +1055,7 @@ mod tests {
         );
         assert_eq!(
             c.status(),
-            SessionStatus::OutputLost(OutputError::Failed("C".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("C".into()))
         );
     }
 
@@ -1142,7 +1074,7 @@ mod tests {
         assert_eq!(clears.load(Ordering::SeqCst), 1);
         assert!(matches!(
             c.status(),
-            SessionStatus::OutputLost(OutputError::Failed(_))
+            PlayerStatus::OutputLost(OutputError::Failed(_))
         ));
     }
     #[test]
@@ -1181,13 +1113,13 @@ mod tests {
         );
         c.close();
         assert_eq!(work.commit(buffer(48_000, 2)), Err(CommitRejected::Closed));
-        assert_eq!(c.status(), SessionStatus::Closed);
-        assert_eq!(*c.shared.lifecycle.current.lock(), SessionStatus::Closed);
-        assert_eq!(*status.borrow(), SessionStatus::Closed);
+        assert_eq!(c.status(), PlayerStatus::Closed);
+        assert_eq!(*c.shared.lifecycle.current.lock(), PlayerStatus::Closed);
+        assert_eq!(*status.borrow(), PlayerStatus::Closed);
         while status.has_changed().unwrap() {
             assert_ne!(
                 *status.borrow_and_update(),
-                SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+                PlayerStatus::OutputLost(OutputError::Failed("commit".into()))
             );
         }
         assert_eq!(clears.load(Ordering::SeqCst), 1);
@@ -1234,7 +1166,7 @@ mod tests {
             Err(OutputError::Failed("setter A".into()))
         );
         let state = c.shared.session.lock();
-        assert_eq!(state.status, SessionStatus::Open);
+        assert_eq!(state.status, PlayerStatus::Open);
         assert_eq!(state.controls.volume, 77);
         assert_eq!(state.desired_controls.volume, 77);
         assert!(matches!(
@@ -1254,7 +1186,7 @@ mod tests {
             c.work(buffer(44_100, 2)).commit(buffer(44_100, 2)),
             Err(CommitRejected::Output(OutputError::FormatMismatch { .. }))
         ));
-        assert_eq!(c.status(), SessionStatus::Open);
+        assert_eq!(c.status(), PlayerStatus::Open);
         assert_eq!(c.work(buffer(48_000, 2)).commit(buffer(48_000, 2)), Ok(()));
     }
     #[test]
@@ -1363,7 +1295,7 @@ mod tests {
         let permit = c.begin_install().unwrap();
         permit.install(installable()).unwrap();
         assert!(c.shared.session.lock().floor > StreamGeneration::initial());
-        c.shared.session.lock().status = SessionStatus::Closed;
+        c.shared.session.lock().status = PlayerStatus::Closed;
         assert!(matches!(c.begin_install(), Err(InstallRejected::Closed)));
     }
 }

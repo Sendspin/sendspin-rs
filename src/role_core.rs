@@ -6,8 +6,19 @@ use std::sync::{
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 
-use crate::audio::{CommitRejected, OutputError, SessionStatus};
+use crate::audio::{CommitRejected, OutputError};
 use crate::generation::StreamGeneration;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Retained lifecycle state of an artwork or visualizer session.
+pub enum RoleStatus {
+    /// The session accepts current output work.
+    Open,
+    /// The session was closed and rejects future work.
+    Closed,
+    /// A terminal output failure rejects future work.
+    Failed(OutputError),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BoundaryAction {
@@ -38,7 +49,7 @@ pub(crate) trait RoleAdapter: Send + 'static {
 
 struct State<A: RoleAdapter> {
     floor: StreamGeneration,
-    status: SessionStatus,
+    status: RoleStatus,
     closed: bool,
     output: Option<A>,
     cleaned: bool,
@@ -47,7 +58,7 @@ struct State<A: RoleAdapter> {
 pub(crate) struct Shared<A: RoleAdapter> {
     state: Mutex<State<A>>,
     pub urgent: watch::Sender<Urgent>,
-    pub status: watch::Sender<SessionStatus>,
+    pub status: watch::Sender<RoleStatus>,
     pub terminated: Arc<AtomicBool>,
 }
 
@@ -66,12 +77,12 @@ impl<A: RoleAdapter> Coordinator<A> {
         urgent: watch::Sender<Urgent>,
         terminated: Arc<AtomicBool>,
     ) -> Self {
-        let (status, _) = watch::channel(SessionStatus::Open);
+        let (status, _) = watch::channel(RoleStatus::Open);
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(State {
                     floor: StreamGeneration::initial(),
-                    status: SessionStatus::Open,
+                    status: RoleStatus::Open,
                     closed: false,
                     output: Some(output),
                     cleaned: false,
@@ -112,8 +123,7 @@ impl<A: RoleAdapter> Coordinator<A> {
         action: BoundaryAction,
     ) -> Result<(), OutputError> {
         let mut state = self.shared.state.lock();
-        if state.closed || !matches!(state.status, SessionStatus::Open) || generation <= state.floor
-        {
+        if state.closed || !matches!(state.status, RoleStatus::Open) || generation <= state.floor {
             return Ok(());
         }
         state.floor = generation;
@@ -141,9 +151,9 @@ impl<A: RoleAdapter> Coordinator<A> {
             return;
         }
         state.closed = true;
-        if matches!(state.status, SessionStatus::Open) {
-            state.status = SessionStatus::Closed;
-            let _ = self.shared.status.send_replace(SessionStatus::Closed);
+        if matches!(state.status, RoleStatus::Open) {
+            state.status = RoleStatus::Closed;
+            let _ = self.shared.status.send_replace(RoleStatus::Closed);
         }
         self.shared.terminated.store(true, Ordering::Release);
         if let Some(mut output) = state.output.take() {
@@ -161,10 +171,10 @@ impl<A: RoleAdapter> Coordinator<A> {
         let state = self.shared.state.lock();
         self.shared.terminated.load(Ordering::Acquire)
             || state.closed
-            || !matches!(state.status, SessionStatus::Open)
+            || !matches!(state.status, RoleStatus::Open)
     }
 
-    pub fn status_watch(&self) -> watch::Receiver<SessionStatus> {
+    pub fn status_watch(&self) -> watch::Receiver<RoleStatus> {
         self.shared.status.subscribe()
     }
 
@@ -174,7 +184,7 @@ impl<A: RoleAdapter> Coordinator<A> {
 
     pub fn fail(&self, error: OutputError) {
         let mut state = self.shared.state.lock();
-        if state.closed || !matches!(state.status, SessionStatus::Open) {
+        if state.closed || !matches!(state.status, RoleStatus::Open) {
             return;
         }
         if !state.cleaned {
@@ -183,7 +193,7 @@ impl<A: RoleAdapter> Coordinator<A> {
                 state.cleaned = true;
             }
         }
-        state.status = SessionStatus::Failed(error.clone());
+        state.status = RoleStatus::Failed(error.clone());
         let _ = self.shared.status.send_replace(state.status.clone());
         self.shared.terminated.store(true, Ordering::Release);
         self.shared
@@ -203,7 +213,7 @@ impl<A: RoleAdapter> Work<A> {
         let mut state = self.shared.state.lock();
         if self.shared.terminated.load(Ordering::Acquire)
             || state.closed
-            || !matches!(state.status, SessionStatus::Open)
+            || !matches!(state.status, RoleStatus::Open)
         {
             return Err(CommitRejected::Closed);
         }
@@ -230,14 +240,14 @@ impl<A: RoleAdapter> Work<A> {
 }
 
 fn fail<A: RoleAdapter>(state: &mut State<A>, mut output: A, error: OutputError) {
-    if !matches!(state.status, SessionStatus::Open) || state.closed {
+    if !matches!(state.status, RoleStatus::Open) || state.closed {
         return;
     }
     if !state.cleaned {
         let _ = output.cleanup();
         state.cleaned = true;
     }
-    state.status = SessionStatus::Failed(error);
+    state.status = RoleStatus::Failed(error);
 }
 
 pub(crate) fn advance(generation: &Mutex<StreamGeneration>) -> StreamGeneration {

@@ -3,7 +3,7 @@
 use sendspin::audio::decode::{Decoder, StreamDecoder};
 use sendspin::audio::{
     AudioBuffer, AudioFormat, CommitRejected, InstallRejected, PlayerEvent, PlayerSession,
-    SessionStatus, SyncedPlayer, SyncedPlayerConfig,
+    PlayerStatus, SyncedPlayer, SyncedPlayerConfig,
 };
 use sendspin::protocol::messages::{
     AudioFormatSpec, PlayerState, PlayerStateCommand, PlayerV1Support,
@@ -92,13 +92,10 @@ async fn receive_audio(
             }
         }
     }
-    let status = session.status().borrow().clone();
-    match status {
-        SessionStatus::Closed => Ok(()),
-        SessionStatus::Failed(error) => Err(format!("player session failed: {error}").into()),
-        SessionStatus::Open | SessionStatus::OutputLost(_) => {
-            Err("player event stream ended while still open".into())
-        }
+    if *session.status().borrow() == PlayerStatus::Closed {
+        Ok(())
+    } else {
+        Err("player event stream ended while still open".into())
     }
 }
 

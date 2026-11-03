@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch, Notify};
 
 use super::player_session::{
     AppliedControls, CommitRejected, ControlUpdate, Coordinator, InstallRejected, Lifecycle,
-    OutputAdapter, OutputError, SessionStatus,
+    OutputAdapter, OutputError, PlayerStatus,
 };
 use super::synced_player::PlaybackControl;
 use super::AudioBuffer;
@@ -98,8 +98,8 @@ struct UrgentState {
 }
 
 struct SessionFence {
-    status: watch::Sender<SessionStatus>,
-    status_value: Arc<Mutex<SessionStatus>>,
+    status: watch::Sender<PlayerStatus>,
+    status_value: Arc<Mutex<PlayerStatus>>,
     lifecycle: Arc<Lifecycle>,
     controls: watch::Sender<AppliedControls>,
     urgent: watch::Sender<UrgentState>,
@@ -117,19 +117,17 @@ impl SessionFence {
         self.cancelled.store(true, Ordering::Release);
         self.cancel.notify_waiters();
     }
-    fn publish_terminal(&self, proposed: SessionStatus) {
-        let _transition = self.lifecycle.transition.lock();
-        let mut status = self.status_value.lock();
-        if matches!(*status, SessionStatus::Closed | SessionStatus::Failed(_)) {
-            return;
-        }
-        *status = proposed.clone();
-        let _ = self.status.send_replace(proposed);
-    }
     fn close(&self) {
         self.cancel.notify_waiters();
         self.admission.close();
-        self.publish_terminal(SessionStatus::Closed);
+        {
+            let _transition = self.lifecycle.transition.lock();
+            let mut status = self.status_value.lock();
+            if !matches!(*status, PlayerStatus::Closed) {
+                *status = PlayerStatus::Closed;
+                let _ = self.status.send_replace(PlayerStatus::Closed);
+            }
+        }
         self.urgent.send_modify(|urgent| urgent.closed = true);
         self.cancel();
     }
@@ -189,10 +187,7 @@ impl AudioWork {
     /// Output failure detaches as `OutputLost`, rejecting admitted work; recovery needs new output/work.
     /// Clear/end/release or closure reject older work as `Obsolete` or `Closed`.
     pub fn commit(mut self, prepared: AudioBuffer) -> Result<(), CommitRejected> {
-        if matches!(
-            *self.fence.status_value.lock(),
-            SessionStatus::Closed | SessionStatus::Failed(_)
-        ) {
+        if matches!(*self.fence.status_value.lock(), PlayerStatus::Closed) {
             return Err(CommitRejected::Closed);
         }
         let receipt_generation = self.generation;
@@ -341,8 +336,8 @@ impl PlayerReceiver {
     pub(crate) fn channel(initial: AppliedControls) -> (Self, PlayerProducer) {
         let (tx, rx) = mpsc::unbounded_channel();
         let controls = initial.normalized();
-        let (status, _) = watch::channel(SessionStatus::Open);
-        let status_value = Arc::new(Mutex::new(SessionStatus::Open));
+        let (status, _) = watch::channel(PlayerStatus::Open);
+        let status_value = Arc::new(Mutex::new(PlayerStatus::Open));
         let lifecycle = Arc::new(Lifecycle::new(status.clone(), Arc::clone(&status_value)));
         let (control_tx, _) = watch::channel(controls.clone());
         let (urgent, _) = watch::channel(UrgentState {
@@ -423,7 +418,7 @@ impl PlayerReceiver {
         if initial.closed
             || !matches!(
                 *self.fence.status_value.lock(),
-                SessionStatus::Open | SessionStatus::OutputLost(_)
+                PlayerStatus::Open | PlayerStatus::OutputLost(_)
             )
         {
             coordinator.close();
@@ -461,7 +456,7 @@ impl PlayerReceiver {
         if initial.closed
             || !matches!(
                 *fence.status_value.lock(),
-                SessionStatus::Open | SessionStatus::OutputLost(_)
+                PlayerStatus::Open | PlayerStatus::OutputLost(_)
             )
         {
             coordinator.close();
@@ -554,7 +549,7 @@ impl Driver {
                         if changed.is_err()
                             || matches!(
                                 *status.borrow(),
-                                SessionStatus::Closed | SessionStatus::Failed(_)
+                                PlayerStatus::Closed
                             )
                         {
                             break;
@@ -595,12 +590,8 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
     /// a fresh reservation. Only `Closed` is terminal for the player session.
     pub fn install(mut self, output: O) -> Result<(), InstallRejected> {
         let status = self.fence.status_value.lock().clone();
-        if !matches!(status, SessionStatus::Open | SessionStatus::OutputLost(_)) {
-            return Err(match status {
-                SessionStatus::Closed => InstallRejected::Closed,
-                SessionStatus::Failed(_) => InstallRejected::Failed,
-                SessionStatus::Open | SessionStatus::OutputLost(_) => unreachable!(),
-            });
+        if matches!(status, PlayerStatus::Closed) {
+            return Err(InstallRejected::Closed);
         }
         let urgent = self.fence.urgent.borrow().clone();
         let current_controls = self.fence.controls.borrow().clone();
@@ -620,8 +611,8 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
             );
         if result.is_ok() {
             let status = Coordinator::from_shared(Arc::clone(&self.shared)).status();
-            if matches!(status, SessionStatus::Open)
-                && matches!(*self.fence.status_value.lock(), SessionStatus::Closed)
+            if matches!(status, PlayerStatus::Open)
+                && matches!(*self.fence.status_value.lock(), PlayerStatus::Closed)
             {
                 Coordinator::from_shared(Arc::clone(&self.shared)).close();
                 result = Err(InstallRejected::Closed);
@@ -634,7 +625,7 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
 /// Session that accepts player events before and after output installation.
 pub struct PlayerSession<O: PlayerOutput = PlaybackControl> {
     receiver: PlayerReceiver,
-    status: watch::Receiver<SessionStatus>,
+    status: watch::Receiver<PlayerStatus>,
     coordinator: Coordinator<OutputAdapterHandle<O>>,
     driver: Option<Driver>,
 }
@@ -647,12 +638,8 @@ impl<O: PlayerOutput> PlayerSession<O> {
     /// consumes that attempt and recovery requires a fresh reservation.
     pub fn begin_output_install(&self) -> Result<OutputInstallPermit<O>, InstallRejected> {
         let status = self.receiver.fence.status_value.lock().clone();
-        if !matches!(status, SessionStatus::Open | SessionStatus::OutputLost(_)) {
-            return Err(match status {
-                SessionStatus::Closed => InstallRejected::Closed,
-                SessionStatus::Failed(_) => InstallRejected::Failed,
-                SessionStatus::Open | SessionStatus::OutputLost(_) => unreachable!(),
-            });
+        if matches!(status, PlayerStatus::Closed) {
+            return Err(InstallRejected::Closed);
         }
         let coordinator = &self.coordinator;
         let boundary = *self.receiver.fence.boundary.lock();
@@ -747,11 +734,11 @@ impl<O: PlayerOutput> PlayerSession<O> {
             {
                 let status = self.status.borrow_and_update();
                 match &*status {
-                    SessionStatus::Closed | SessionStatus::Failed(_) => return None,
-                    SessionStatus::OutputLost(error) if status.has_changed() => {
+                    PlayerStatus::Closed => return None,
+                    PlayerStatus::OutputLost(error) if status.has_changed() => {
                         return Some(PlayerEvent::OutputLost(error.clone()));
                     }
-                    SessionStatus::Open | SessionStatus::OutputLost(_) => {}
+                    PlayerStatus::Open | PlayerStatus::OutputLost(_) => {}
                 }
             }
             let receiver = &mut self.receiver;
@@ -785,13 +772,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
                         generation,
                         chunk,
                         Arc::clone(&receiver.fence),
-                        |work, generation, buffer| {
-                            let (result, status) = work.commit_at_with_status(generation, buffer);
-                            if let SessionStatus::Failed(error) = status {
-                                return Err(CommitRejected::Output(error));
-                            }
-                            result
-                        },
+                        |work, generation, buffer| work.commit_at(generation, buffer),
                     )));
                 }
                 RawEvent::Start(config) => return Some(PlayerEvent::Start(config)),
@@ -809,7 +790,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
         }
     }
     /// Subscribes to retained lifecycle status without polling `recv`.
-    pub fn status(&self) -> watch::Receiver<SessionStatus> {
+    pub fn status(&self) -> watch::Receiver<PlayerStatus> {
         self.receiver.fence.status.subscribe()
     }
     /// Subscribes to the latest applied control state.
@@ -1184,7 +1165,7 @@ mod tests {
         let actual = Arc::clone(&output.controls);
         output.setter_gate_enabled.store(false, Ordering::Release);
         let session = Arc::new(receiver.attach_with_driver_gate(output, Arc::clone(&driver_gate)));
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
         calls.lock().clear();
         setter_gate_enabled.store(true, Ordering::Release);
 
@@ -1228,7 +1209,7 @@ mod tests {
             .is_ok());
         first.join().unwrap();
         second.join().unwrap();
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
 
         driver_gate.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1267,7 +1248,7 @@ mod tests {
         );
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("commit".into()))
         );
         session
             .update_controls(ControlUpdate {
@@ -1290,7 +1271,7 @@ mod tests {
         ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
     }
 
     #[tokio::test]
@@ -1484,7 +1465,7 @@ mod tests {
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
@@ -1549,7 +1530,7 @@ mod tests {
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
@@ -1567,7 +1548,7 @@ mod tests {
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::FormatMismatch { .. })
+            PlayerStatus::OutputLost(OutputError::FormatMismatch { .. })
         ));
     }
 
@@ -1585,7 +1566,7 @@ mod tests {
             work.commit(buffer()),
             Err(CommitRejected::Output(OutputError::FormatMismatch { .. }))
         ));
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -1608,7 +1589,7 @@ mod tests {
             work.commit(buffer()),
             Err(CommitRejected::Output(OutputError::FormatMismatch { .. }))
         ));
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -1646,10 +1627,10 @@ mod tests {
         let controls_rx = session.controls();
         let mut status = session.status();
         producer.set_volume(12);
-        while matches!(*status.borrow(), SessionStatus::Open) {
+        while matches!(*status.borrow(), PlayerStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
+        assert!(matches!(*status.borrow(), PlayerStatus::OutputLost(_)));
         assert_eq!(controls_rx.borrow().volume, 80);
     }
 
@@ -1798,10 +1779,10 @@ mod tests {
         let session = receiver.attach(failing_clear);
         let mut status = session.status();
         producer.clear().unwrap();
-        while matches!(*status.borrow(), SessionStatus::Open) {
+        while matches!(*status.borrow(), PlayerStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
+        assert!(matches!(*status.borrow(), PlayerStatus::OutputLost(_)));
 
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing_setter = output();
@@ -1812,10 +1793,10 @@ mod tests {
             volume: 12,
             ..controls()
         });
-        while matches!(*status.borrow(), SessionStatus::Open) {
+        while matches!(*status.borrow(), PlayerStatus::Open) {
             status.changed().await.unwrap();
         }
-        assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
+        assert!(matches!(*status.borrow(), PlayerStatus::OutputLost(_)));
     }
 
     #[tokio::test]
@@ -1966,7 +1947,7 @@ mod tests {
         let status = session.status();
         assert_eq!(
             *status.borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("commit".into()))
         );
         producer
             .start(StreamPlayerConfig {
@@ -1983,9 +1964,9 @@ mod tests {
         ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
         session.shutdown().await;
-        assert_eq!(*status.borrow(), SessionStatus::Closed);
+        assert_eq!(*status.borrow(), PlayerStatus::Closed);
     }
 
     #[tokio::test]
@@ -2008,7 +1989,7 @@ mod tests {
         );
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("commit".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("commit".into()))
         );
         assert_eq!(stale.commit(buffer()), Err(CommitRejected::Obsolete));
         producer
@@ -2026,7 +2007,7 @@ mod tests {
         ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("fresh audio event")
@@ -2164,7 +2145,7 @@ mod tests {
             .await
             .expect("driver cleanup must complete");
         assert_eq!(output.clears.load(Ordering::SeqCst), 1);
-        assert_eq!(*status.borrow(), SessionStatus::Closed);
+        assert_eq!(*status.borrow(), PlayerStatus::Closed);
         drop(session);
         drop(output);
         assert!(weak.upgrade().is_none());
@@ -2185,7 +2166,7 @@ mod tests {
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
@@ -2198,7 +2179,7 @@ mod tests {
         assert_eq!(session.install(failing), Err(InstallRejected::Failed));
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed(ref error)) if error == "volume"
+            PlayerStatus::OutputLost(OutputError::Failed(ref error)) if error == "volume"
         ));
     }
 
@@ -2254,7 +2235,7 @@ mod tests {
         );
         assert_eq!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(OutputError::Failed("clear".into()))
+            PlayerStatus::OutputLost(OutputError::Failed("clear".into()))
         );
     }
 
@@ -2320,7 +2301,7 @@ mod tests {
         assert_eq!(session.install(failing), Err(InstallRejected::Failed));
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(_)
+            PlayerStatus::OutputLost(_)
         ));
         timeout(Duration::from_secs(5), session.shutdown())
             .await
@@ -2342,7 +2323,7 @@ mod tests {
         let controls_watch = session.controls();
         producer.set_volume(70);
         timeout(Duration::from_secs(5), async {
-            while !matches!(*session.status().borrow(), SessionStatus::OutputLost(_)) {
+            while !matches!(*session.status().borrow(), PlayerStatus::OutputLost(_)) {
                 session.status().changed().await.unwrap();
             }
         })
@@ -2372,7 +2353,7 @@ mod tests {
         let mut session = receiver.attach(failing);
         producer.set_volume(70);
         timeout(Duration::from_secs(5), async {
-            while !matches!(*session.status().borrow(), SessionStatus::OutputLost(_)) {
+            while !matches!(*session.status().borrow(), PlayerStatus::OutputLost(_)) {
                 session.status().changed().await.unwrap();
             }
         })
@@ -2397,10 +2378,10 @@ mod tests {
         let permit = session.begin_output_install().unwrap();
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(_)
+            PlayerStatus::OutputLost(_)
         ));
         permit.install(output()).unwrap();
-        assert_eq!(*session.status().borrow(), SessionStatus::Open);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Open);
     }
 
     #[tokio::test]
@@ -2409,10 +2390,10 @@ mod tests {
         let mut session = receiver.attach_empty::<FakeOutput>();
         let status = session.status();
         session.install(output()).unwrap();
-        assert_eq!(*status.borrow(), SessionStatus::Open);
+        assert_eq!(*status.borrow(), PlayerStatus::Open);
         producer.close();
         session.shutdown().await;
-        assert_eq!(*status.borrow(), SessionStatus::Closed);
+        assert_eq!(*status.borrow(), PlayerStatus::Closed);
     }
 
     #[tokio::test]
@@ -2430,13 +2411,13 @@ mod tests {
         let error = c.release().unwrap_err();
         assert_eq!(error, OutputError::Failed("clear".into()));
         assert_eq!(c.incarnation(), expected);
-        assert_eq!(c.status(), SessionStatus::OutputLost(error.clone()));
+        assert_eq!(c.status(), PlayerStatus::OutputLost(error.clone()));
         assert_eq!(held.commit(buffer()), Err(CommitRejected::Obsolete));
         c.begin_install()
             .unwrap()
             .install(OutputAdapterHandle(output()))
             .unwrap();
-        assert_eq!(c.status(), SessionStatus::Open);
+        assert_eq!(c.status(), PlayerStatus::Open);
         assert_eq!(c.incarnation(), expected);
     }
 
@@ -2462,7 +2443,7 @@ mod tests {
         );
         assert!(matches!(
             *session.status().borrow(),
-            SessionStatus::OutputLost(_)
+            PlayerStatus::OutputLost(_)
         ));
         producer
             .start(StreamPlayerConfig {
@@ -2495,6 +2476,6 @@ mod tests {
         producer.close();
         release_tx.send(()).unwrap();
         assert_eq!(install.join().unwrap(), Err(InstallRejected::Closed));
-        assert_eq!(*session.status().borrow(), SessionStatus::Closed);
+        assert_eq!(*session.status().borrow(), PlayerStatus::Closed);
     }
 }

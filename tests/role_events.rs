@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::audio::decode::{Decoder, OpusDecoder, PcmDecoder};
 use sendspin::audio::{
-    AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput, SessionStatus,
+    AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput, PlayerStatus,
 };
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
@@ -1258,7 +1258,7 @@ async fn dropped_connection_guard_closes_session_and_rejects_held_work() {
         .unwrap()
         .is_ok());
     let status = watch.borrow().clone();
-    assert_eq!(status, SessionStatus::Closed);
+    assert_eq!(status, PlayerStatus::Closed);
     assert!(matches!(
         work.commit(event_buffer(4, Codec::Pcm)),
         Err(sendspin::audio::CommitRejected::Closed)

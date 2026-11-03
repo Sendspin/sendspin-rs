@@ -24,7 +24,7 @@ pub use player_api::{
     AudioWork, OutputInstallPermit, PlayerEvent, PlayerOutput, PlayerReceiver, PlayerSession,
 };
 pub use player_session::{
-    AppliedControls, CommitRejected, ControlUpdate, InstallRejected, OutputError, SessionStatus,
+    AppliedControls, CommitRejected, ControlUpdate, InstallRejected, OutputError, PlayerStatus,
 };
 pub use pool::BufferPool;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};

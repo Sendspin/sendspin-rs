@@ -2,6 +2,7 @@ use crate::audio::{CommitRejected, OutputError};
 use crate::generation::StreamGeneration;
 use crate::protocol::client::{ArtworkChunk, VisualizerChunk};
 use crate::protocol::messages::{StreamArtworkConfig, StreamVisualizerConfig};
+pub use crate::role_core::RoleStatus;
 use crate::role_core::{self, BoundaryAction, Coordinator, ProducerError, RoleAdapter};
 use parking_lot::Mutex;
 use std::fmt;
@@ -229,7 +230,7 @@ impl Drop for ArtworkProducer {
 }
 impl<O: ArtworkOutput> ArtworkSession<O> {
     /// Subscribes to retained lifecycle status without polling `recv`.
-    pub fn status(&self) -> tokio::sync::watch::Receiver<crate::audio::SessionStatus> {
+    pub fn status(&self) -> tokio::sync::watch::Receiver<RoleStatus> {
         self.coordinator.status_watch()
     }
     /// Waits for the next artwork event; returns `None` after shutdown or output failure.
@@ -250,7 +251,7 @@ impl<O: ArtworkOutput> ArtworkSession<O> {
             let r = tokio::select! {
                 biased;
                 changed = status.changed() => {
-                    if changed.is_err() || !matches!(*status.borrow(), crate::audio::SessionStatus::Open) { return None; }
+                    if changed.is_err() || !matches!(*status.borrow(), RoleStatus::Open) { return None; }
                     return None;
                 },
                 r = self.rx.recv() => r?,
@@ -480,7 +481,7 @@ impl Drop for VisualizerProducer {
 }
 impl<O: VisualizerOutput> VisualizerSession<O> {
     /// Subscribes to retained lifecycle status without polling `recv`.
-    pub fn status(&self) -> tokio::sync::watch::Receiver<crate::audio::SessionStatus> {
+    pub fn status(&self) -> tokio::sync::watch::Receiver<RoleStatus> {
         self.coordinator.status_watch()
     }
     /// Waits for the next visualizer event; returns `None` after shutdown or output failure.
@@ -501,7 +502,7 @@ impl<O: VisualizerOutput> VisualizerSession<O> {
             let r = tokio::select! {
                 biased;
                 changed = status.changed() => {
-                    if changed.is_err() || !matches!(*status.borrow(), crate::audio::SessionStatus::Open) { return None; }
+                    if changed.is_err() || !matches!(*status.borrow(), RoleStatus::Open) { return None; }
                     return None;
                 },
                 r = self.rx.recv() => r?,
@@ -600,7 +601,7 @@ fn driver<A: RoleAdapter>(
                         if changed.is_err() { break; }
                     }
                     changed = status.changed() => {
-                        if changed.is_err() || !matches!(*status.borrow(), crate::audio::SessionStatus::Open) {
+                        if changed.is_err() || !matches!(*status.borrow(), RoleStatus::Open) {
                             break;
                         }
                     }
@@ -777,7 +778,7 @@ mod tests {
         assert!(pending.await.is_none());
         assert_eq!(
             *session.status().borrow(),
-            crate::audio::SessionStatus::Failed(error.clone())
+            RoleStatus::Failed(error.clone())
         );
         assert_eq!(
             producer.start(art_config()),
@@ -791,10 +792,7 @@ mod tests {
             producer.end(),
             Err(crate::role_core::ProducerError::ReceiverClosed)
         );
-        assert_eq!(
-            *session.status().borrow(),
-            crate::audio::SessionStatus::Failed(error)
-        );
+        assert_eq!(*session.status().borrow(), RoleStatus::Failed(error));
     }
 
     #[tokio::test]
@@ -960,10 +958,7 @@ mod tests {
             work.commit(Prepared(vec![1])),
             Err(CommitRejected::Output(first.clone()))
         );
-        assert_eq!(
-            *session.status().borrow(),
-            crate::audio::SessionStatus::Failed(first)
-        );
+        assert_eq!(*session.status().borrow(), RoleStatus::Failed(first));
         assert!(session.recv().await.is_none());
         assert_eq!(&*events.lock(), &["commit", "end"]);
         session.shutdown().await;
@@ -987,11 +982,11 @@ mod tests {
             Err(CommitRejected::Output(first.clone()))
         );
         let status = session.status();
-        assert_eq!(*status.borrow(), crate::audio::SessionStatus::Failed(first));
+        assert_eq!(*status.borrow(), RoleStatus::Failed(first));
         session.shutdown().await;
         assert_eq!(
             *status.borrow(),
-            crate::audio::SessionStatus::Failed(OutputError::Failed("commit-first".into()))
+            RoleStatus::Failed(OutputError::Failed("commit-first".into()))
         );
     }
 
@@ -1016,10 +1011,7 @@ mod tests {
             work.commit(Prepared(vec![1])),
             Err(CommitRejected::Output(error.clone()))
         );
-        assert_eq!(
-            *session.status().borrow(),
-            crate::audio::SessionStatus::Failed(error)
-        );
+        assert_eq!(*session.status().borrow(), RoleStatus::Failed(error));
         assert!(session.recv().await.is_none());
         assert_eq!(&*events.lock(), &["commit", "end"]);
         session.shutdown().await;
@@ -1063,10 +1055,7 @@ mod tests {
             producer.end(),
             Err(crate::role_core::ProducerError::ReceiverClosed)
         );
-        assert_eq!(
-            *session.status().borrow(),
-            crate::audio::SessionStatus::Failed(error)
-        );
+        assert_eq!(*session.status().borrow(), RoleStatus::Failed(error));
         assert!(session.recv().await.is_none());
         assert_eq!(&*events.lock(), &["clear", "end"]);
         session.shutdown().await;
@@ -1088,7 +1077,7 @@ mod tests {
             .await
             .expect("driver did not publish failure")
             .unwrap();
-        assert_eq!(*status.borrow(), crate::audio::SessionStatus::Failed(error));
+        assert_eq!(*status.borrow(), RoleStatus::Failed(error));
         assert!(session
             .driver
             .as_ref()
@@ -1161,7 +1150,7 @@ mod tests {
             .await
             .expect("status watch must observe producer drop")
             .unwrap();
-        assert_eq!(*status.borrow(), crate::audio::SessionStatus::Closed);
+        assert_eq!(*status.borrow(), RoleStatus::Closed);
         assert_eq!(&*events.lock(), &["end"]);
         drop(session);
         assert!(weak.upgrade().is_none());
