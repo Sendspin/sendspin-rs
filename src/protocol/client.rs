@@ -273,6 +273,9 @@ impl WsSender {
     }
 
     /// Send a partial player state update, merging it into the retained state.
+    ///
+    /// With automatic reporting, later reports take volume, mute, and static delay
+    /// from the session controls, so change those through `PlayerSession::update_controls`.
     pub async fn set_player_state(&self, player: PlayerState) -> Result<(), Error> {
         let Some(reporter) = &self.reporter else {
             return self
@@ -318,10 +321,11 @@ impl WsSender {
     /// Tell the server this client's clock filter has converged enough to resume
     /// synchronized playback scheduling.
     ///
-    /// Include player state when volume, mute, or static delay may have changed
-    /// while the external source owned the device. Hardware/OS mixer changes
-    /// must be read through platform APIs; this library only tracks its own
-    /// software [`GainControl`](crate::audio::GainControl).
+    /// Apply volume, mute, or static delay that changed while the external source
+    /// owned the device through [`PlayerSession::update_controls`](crate::audio::PlayerSession::update_controls)
+    /// first, since automatic reports take these fields from the session controls.
+    /// Hardware/OS mixer changes must be read through platform APIs; this library
+    /// only tracks its own software [`GainControl`](crate::audio::GainControl).
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
         let Some(reporter) = &self.reporter else {
             return self
