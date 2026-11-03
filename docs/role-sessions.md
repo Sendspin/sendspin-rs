@@ -42,8 +42,8 @@ Work is one-shot: obsolete, closed, or output-rejected work returns the standard
 does not require application sequence counters. Keep output callbacks synchronous, short,
 nonblocking, serialized, and nonreentrant.
 
-`OutputLost(error)` means the player output was detached after a recoverable output failure;
-install a fresh output to recover. `Closed` means the session has ended. A player
+`recv` returns `PlayerEvent::OutputLost(error)` once when the player output was detached after
+a recoverable output failure. Install a fresh output to recover. `Closed` means the session has ended. A player
 `OutputError::Failed` or callback-related `CommitRejected::Output` failure detaches the output
 and rejects admitted work until recovery; `FormatMismatch` rejects only that item. An
 `InstallRejected::Failed` result consumes its permit and requires a fresh reservation. `Failed`

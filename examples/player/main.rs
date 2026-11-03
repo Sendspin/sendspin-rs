@@ -14,14 +14,6 @@ use std::error::Error;
 
 type SharedClock = std::sync::Arc<parking_lot::Mutex<ClockSync>>;
 
-fn is_closed(status: SessionStatus) -> Result<bool, Box<dyn Error>> {
-    match status {
-        SessionStatus::Open | SessionStatus::OutputLost(_) => Ok(false),
-        SessionStatus::Closed => Ok(true),
-        SessionStatus::Failed(error) => Err(format!("player session failed: {error}").into()),
-    }
-}
-
 fn install_output(
     session: &mut PlayerSession,
     format: &AudioFormat,
@@ -54,35 +46,16 @@ async fn receive_audio(
     clock_sync: SharedClock,
     output: &mut Option<SyncedPlayer>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut status = session.status();
     let mut decoder: Option<StreamDecoder> = None;
-    loop {
-        let event = tokio::select! {
-            biased;
-            changed = status.changed() => {
-                let current = status.borrow_and_update().clone();
-                if let SessionStatus::OutputLost(error) = &current {
-                    log::warn!("Audio output lost, reopening: {error}");
-                    drop(output.take());
-                    if let Some(state) = decoder.as_ref() {
-                        install_output(session, state.format(), &clock_sync, output)?;
-                    }
-                }
-                if changed.is_err() || is_closed(current)? {
-                    None
-                } else {
-                    continue;
-                }
-            }
-            event = session.recv() => event,
-        };
-        let Some(event) = event else {
-            if is_closed(status.borrow().clone())? {
-                break;
-            }
-            return Err("player event stream ended while still open".into());
-        };
+    while let Some(event) = session.recv().await {
         match event {
+            PlayerEvent::OutputLost(error) => {
+                log::warn!("Audio output lost, reopening: {error}");
+                drop(output.take());
+                if let Some(state) = decoder.as_ref() {
+                    install_output(session, state.format(), &clock_sync, output)?;
+                }
+            }
             PlayerEvent::Start(config) => {
                 let state = StreamDecoder::new(&config)?;
                 // Keep buffered audio playing when the new format fits the open device.
@@ -105,7 +78,7 @@ async fn receive_audio(
                     samples,
                     format: state.format().clone(),
                 };
-                // A failed device shows up as `OutputLost` on the status watch.
+                // A failed device is reported as the next `OutputLost` event.
                 if let Err(CommitRejected::Output(error)) = work.commit(buffer) {
                     log::warn!("Audio output rejected a buffer: {error}");
                 }
@@ -119,7 +92,14 @@ async fn receive_audio(
             }
         }
     }
-    Ok(())
+    let status = session.status().borrow().clone();
+    match status {
+        SessionStatus::Closed => Ok(()),
+        SessionStatus::Failed(error) => Err(format!("player session failed: {error}").into()),
+        SessionStatus::Open | SessionStatus::OutputLost(_) => {
+            Err("player event stream ended while still open".into())
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]

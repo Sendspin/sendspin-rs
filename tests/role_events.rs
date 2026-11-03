@@ -691,6 +691,7 @@ async fn urgent_clear_volume_end_and_malformed_input_preserve_new_media() {
                 events.push("audio");
                 new_work = Some(work);
             }
+            Some(PlayerEvent::OutputLost(error)) => panic!("unexpected output loss: {error}"),
             None => panic!("session closed after malformed/boundary input"),
         }
     }

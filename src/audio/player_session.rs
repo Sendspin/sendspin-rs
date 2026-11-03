@@ -402,11 +402,11 @@ impl<O: OutputAdapter> Coordinator<O> {
             state.status = current.clone();
         }
         *current = state.status.clone();
-        let _ = self
-            .shared
-            .lifecycle
-            .status
-            .send_replace(state.status.clone());
+        self.shared.lifecycle.status.send_if_modified(|status| {
+            let modified = *status != state.status;
+            *status = state.status.clone();
+            modified
+        });
     }
 
     fn lose_output_locked(

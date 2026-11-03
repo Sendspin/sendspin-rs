@@ -225,6 +225,8 @@ pub enum PlayerEvent {
     Clear,
     /// Ends the current stream while allowing a later start.
     End,
+    /// Reports that the output was detached after a failure. Install a fresh output to recover.
+    OutputLost(OutputError),
 }
 
 impl fmt::Debug for PlayerEvent {
@@ -234,6 +236,7 @@ impl fmt::Debug for PlayerEvent {
             Self::Audio(work) => formatter.debug_tuple("Audio").field(work).finish(),
             Self::Clear => formatter.write_str("Clear"),
             Self::End => formatter.write_str("End"),
+            Self::OutputLost(error) => formatter.debug_tuple("OutputLost").field(error).finish(),
         }
     }
 }
@@ -439,8 +442,11 @@ impl PlayerReceiver {
             coordinator.close();
         }
         let driver = Driver::start(Arc::clone(&self.fence), shared);
+        let mut status = self.fence.status.subscribe();
+        status.mark_changed();
         PlayerSession {
             receiver: self,
+            status,
             coordinator,
             driver: Some(driver),
         }
@@ -477,8 +483,11 @@ impl PlayerReceiver {
             coordinator.close();
         }
         let driver = Driver::start(Arc::clone(&fence), shared);
+        let mut status = self.fence.status.subscribe();
+        status.mark_changed();
         PlayerSession {
             receiver: self,
+            status,
             coordinator,
             driver: Some(driver),
         }
@@ -646,6 +655,7 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
 /// Session that accepts player events before and after output installation.
 pub struct PlayerSession<O: PlayerOutput = PlaybackControl> {
     receiver: PlayerReceiver,
+    status: watch::Receiver<SessionStatus>,
     coordinator: Coordinator<OutputAdapterHandle<O>>,
     driver: Option<Driver>,
 }
@@ -748,19 +758,24 @@ impl<O: PlayerOutput> PlayerSession<O> {
     /// Work returned while no output is installed can be committed after the next
     /// installation, and committing it earlier returns `Obsolete`.
     ///
+    /// Each output loss is reported once, ahead of queued events.
+    ///
     /// Waiting is cancellation-safe and does not lose the next event. Terminal status
     /// returns `None` immediately without draining queued events; subsequent calls also
     /// return `None`.
     pub async fn recv(&mut self) -> Option<PlayerEvent> {
         loop {
-            let receiver = &mut self.receiver;
-            let mut status = receiver.fence.status.subscribe();
-            if matches!(
-                *status.borrow(),
-                SessionStatus::Closed | SessionStatus::Failed(_)
-            ) {
-                return None;
+            {
+                let status = self.status.borrow_and_update();
+                match &*status {
+                    SessionStatus::Closed | SessionStatus::Failed(_) => return None,
+                    SessionStatus::OutputLost(error) if status.has_changed() => {
+                        return Some(PlayerEvent::OutputLost(error.clone()));
+                    }
+                    SessionStatus::Open | SessionStatus::OutputLost(_) => {}
+                }
             }
+            let receiver = &mut self.receiver;
             let coordinator = &self.coordinator;
             let boundary = receiver.fence.urgent.borrow().boundary;
             if let Some(boundary) = boundary {
@@ -768,15 +783,11 @@ impl<O: PlayerOutput> PlayerSession<O> {
             }
             let event = tokio::select! {
                 biased;
-                changed = status.changed() => {
-                    if changed.is_err()
-                        || matches!(
-                            *status.borrow(),
-                            SessionStatus::Closed | SessionStatus::Failed(_)
-                        )
-                    {
+                changed = self.status.changed() => {
+                    if changed.is_err() {
                         return None;
                     }
+                    self.status.mark_changed();
                     continue;
                 },
                 event = receiver.rx.recv() => event?,
@@ -1300,6 +1311,10 @@ mod tests {
                 codec_header: None,
             })
             .unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(OutputError::Failed(_)))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
         assert_eq!(*session.status().borrow(), SessionStatus::Open);
@@ -1489,6 +1504,10 @@ mod tests {
         session.install(failing).unwrap();
         producer.audio(chunk()).unwrap();
         producer.clear().unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(_))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
@@ -1550,6 +1569,10 @@ mod tests {
         failing.fail_clear = true;
         let mut session = receiver.attach(failing, controls());
         producer.clear().unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(_))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
@@ -1564,6 +1587,10 @@ mod tests {
         failing.clear_format_mismatch = true;
         let mut session = receiver.attach(failing, controls());
         producer.clear().unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(_))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert!(matches!(
             *session.status().borrow(),
@@ -1828,6 +1855,35 @@ mod tests {
         assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
     }
 
+    #[tokio::test]
+    async fn recv_reports_output_loss_from_attach() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_volume = true;
+        let mut session = receiver.attach(failing, controls());
+        producer.audio(chunk()).unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(OutputError::Failed(_)))
+        ));
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Audio(_))));
+    }
+
+    #[tokio::test]
+    async fn failed_reinstall_does_not_repeat_output_loss() {
+        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let mut failing = output();
+        failing.fail_volume = true;
+        let mut session = receiver.attach(failing.clone(), controls());
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(_))
+        ));
+        assert_eq!(session.install(failing), Err(InstallRejected::Failed));
+        producer.audio(chunk()).unwrap();
+        assert!(matches!(session.recv().await, Some(PlayerEvent::Audio(_))));
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_work_keeps_generation_across_synchronous_clear() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
@@ -1958,6 +2014,10 @@ mod tests {
                 codec_header: None,
             })
             .unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(OutputError::Failed(_)))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
         assert_eq!(*session.status().borrow(), SessionStatus::Open);
@@ -1997,6 +2057,10 @@ mod tests {
                 codec_header: None,
             })
             .unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(OutputError::Failed(_)))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
         session.install(output()).unwrap();
         assert_eq!(*session.status().borrow(), SessionStatus::Open);
@@ -2151,6 +2215,10 @@ mod tests {
         let mut session = receiver.attach_empty::<FakeOutput>(controls());
         session.install(failing).unwrap();
         producer.clear().unwrap();
+        assert!(matches!(
+            session.recv().await,
+            Some(PlayerEvent::OutputLost(_))
+        ));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert_eq!(
             *session.status().borrow(),
@@ -2255,7 +2323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_pending_recv_gets_start_after_commit_loss() {
+    async fn public_pending_recv_wakes_with_output_loss() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
@@ -2265,24 +2333,19 @@ mod tests {
             panic!()
         };
         let pending = tokio::spawn(async move { session.recv().await });
+        tokio::task::yield_now().await;
         assert_eq!(
             work.commit(buffer()),
             Err(CommitRejected::Output(OutputError::Failed("commit".into())))
         );
-        producer
-            .start(StreamPlayerConfig {
-                codec: "pcm".into(),
-                sample_rate: 48_000,
-                channels: 2,
-                bit_depth: 16,
-                codec_header: None,
-            })
-            .unwrap();
         let event = timeout(Duration::from_secs(5), pending)
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(event, Some(PlayerEvent::Start(_))));
+        assert!(matches!(
+            event,
+            Some(PlayerEvent::OutputLost(OutputError::Failed(_)))
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]
