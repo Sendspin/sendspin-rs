@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use super::diagnostics::{clear_diagnostic_observer, install_diagnostic_observer};
-use super::diagnostics::{record_playback_diagnostic, PlaybackDiagnostic};
+use super::diagnostics::{
+    logs_clear, logs_enqueue, record_playback_diagnostic, PlaybackDiagnostic,
+};
 
 /// Callback for post-processing audio samples before output.
 ///
@@ -1076,12 +1078,17 @@ impl PlaybackControl {
         let diagnostic = {
             let mut queue = self.queue.lock();
             queue.enqueue(buffer);
+            // The audio callback contends on this lock, so walk the queue only for logged samples.
+            let queued_us = if logs_enqueue(queue.enqueue_count) {
+                queue.queued_duration_us(self.format.channels as usize, self.format.sample_rate)
+            } else {
+                0
+            };
             PlaybackDiagnostic::Enqueued {
                 timestamp,
                 duration_us,
                 enqueue_count: queue.enqueue_count,
-                queued_us: queue
-                    .queued_duration_us(self.format.channels as usize, self.format.sample_rate),
+                queued_us,
                 buffers: queue.buffer_count(),
                 cursor_us: queue.cursor_us,
                 reset: queue.playback_reset_generation,
@@ -1095,9 +1102,13 @@ impl PlaybackControl {
     pub fn clear(&self) -> Result<(), crate::audio::OutputError> {
         let diagnostic = {
             let mut queue = self.queue.lock();
+            let queued_us = if logs_clear() {
+                queue.queued_duration_us(self.format.channels as usize, self.format.sample_rate)
+            } else {
+                0
+            };
             let diagnostic = PlaybackDiagnostic::Cleared {
-                queued_us: queue
-                    .queued_duration_us(self.format.channels as usize, self.format.sample_rate),
+                queued_us,
                 buffers: queue.buffer_count(),
                 cursor_us: queue.cursor_us,
                 reset: queue.playback_reset_generation,

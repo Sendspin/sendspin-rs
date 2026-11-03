@@ -90,6 +90,15 @@ impl Drop for DiagnosticScope {
     }
 }
 
+// Check only the global level, since callers may hold the playback queue lock.
+pub(crate) fn logs_enqueue(enqueue_count: u64) -> bool {
+    log::max_level() >= log::LevelFilter::Trace && should_log_sample(enqueue_count)
+}
+
+pub(crate) fn logs_clear() -> bool {
+    log::max_level() >= log::LevelFilter::Debug
+}
+
 pub(crate) fn record_playback_diagnostic(diagnostic: PlaybackDiagnostic) {
     let deferred = STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -165,7 +174,7 @@ fn emit_playback_diagnostic(diagnostic: PlaybackDiagnostic) {
             cursor_us,
             reset,
         } => {
-            if log::log_enabled!(log::Level::Trace) && should_log_sample(enqueue_count) {
+            if logs_enqueue(enqueue_count) {
                 log::trace!("Audio buffer enqueued: enqueue={enqueue_count}, ts={timestamp}µs, duration={:.1}ms, queued={:.1}ms, buffers={buffers}, cursor={cursor_us}µs, playback_reset_generation={reset:?}", duration_us as f64 / 1000.0, queued_us as f64 / 1000.0);
             }
         }
@@ -175,7 +184,7 @@ fn emit_playback_diagnostic(diagnostic: PlaybackDiagnostic) {
             cursor_us,
             reset,
         } => {
-            if log::log_enabled!(log::Level::Debug) {
+            if logs_clear() {
                 log::debug!("Cleared playback queue: queued={:.1}ms, buffers={buffers}, cursor={cursor_us}µs, playback_reset_generation={reset:?}", queued_us as f64 / 1000.0);
             }
         }
