@@ -622,7 +622,7 @@ impl Drop for Driver {
     }
 }
 
-/// One-shot reservation for installing lazy output.
+/// One-shot reservation for installing an output.
 pub struct OutputInstallPermit<O: PlayerOutput> {
     permit: Option<super::player_session::InstallPermit<OutputAdapterHandle<O>>>,
     shared: Arc<super::player_session::Shared<OutputAdapterHandle<O>>>,
@@ -902,7 +902,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
             static_delay_ms: Some(controls.static_delay_ms),
         })
     }
-    /// Closes the lazy session and joins its control driver.
+    /// Closes the session and joins its control driver.
     pub async fn shutdown(mut self) {
         self.receiver.fence.close();
         self.receiver.rx.close();

@@ -220,7 +220,7 @@ impl AdmissionGate {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LazyState {
+enum InstallState {
     Initial,
     Reserved(u64),
     Installed,
@@ -254,7 +254,7 @@ pub(crate) struct Shared<O> {
     controls: watch::Sender<AppliedControls>,
     lifecycle: Arc<Lifecycle>,
     admission: Arc<AdmissionGate>,
-    lazy: Mutex<LazyState>,
+    install_state: Mutex<InstallState>,
     next_reservation: Mutex<u64>,
 }
 pub(crate) struct Coordinator<O> {
@@ -337,7 +337,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                 controls: control_tx,
                 lifecycle,
                 admission,
-                lazy: Mutex::new(LazyState::Initial),
+                install_state: Mutex::new(InstallState::Initial),
                 next_reservation: Mutex::new(0),
             }),
         }
@@ -381,19 +381,19 @@ impl<O: OutputAdapter> Coordinator<O> {
             });
         }
         let incarnation = state.incarnation;
-        let mut lazy = self.shared.lazy.lock();
+        let mut install_state = self.shared.install_state.lock();
         let reservation = {
             let mut next = self.shared.next_reservation.lock();
             *next = next.wrapping_add(1);
             *next
         };
-        match *lazy {
-            LazyState::Initial => *lazy = LazyState::Reserved(reservation),
-            LazyState::Detached => *lazy = LazyState::ReservedDetached(reservation),
-            LazyState::Reserved(_) | LazyState::ReservedDetached(_) => {
+        match *install_state {
+            InstallState::Initial => *install_state = InstallState::Reserved(reservation),
+            InstallState::Detached => *install_state = InstallState::ReservedDetached(reservation),
+            InstallState::Reserved(_) | InstallState::ReservedDetached(_) => {
                 return Err(InstallRejected::Reserved)
             }
-            LazyState::Installed => return Err(InstallRejected::AlreadyInstalled),
+            InstallState::Installed => return Err(InstallRejected::AlreadyInstalled),
         }
         Ok(InstallPermit {
             shared: Arc::clone(&self.shared),
@@ -415,7 +415,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         self.shared.admission.detach();
         state.incarnation = next;
         let mut output = state.output.take();
-        *self.shared.lazy.lock() = LazyState::Detached;
+        *self.shared.install_state.lock() = InstallState::Detached;
         drop(state);
         let result = output.as_mut().map_or(Ok(()), |output| output.clear());
         if let Err(error) = result {
@@ -538,7 +538,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                     state.output = None;
                     state.status = SessionStatus::Closed;
                     self.publish_status_locked(&mut state);
-                    *self.shared.lazy.lock() = LazyState::Detached;
+                    *self.shared.install_state.lock() = InstallState::Detached;
                     return Err(OutputError::Failed("session is closed".into()));
                 }
                 state.controls = controls;
@@ -549,7 +549,7 @@ impl<O: OutputAdapter> Coordinator<O> {
             }
             Err(error) => {
                 self.lose_output_locked(&mut state, None, error.clone(), false);
-                *self.shared.lazy.lock() = LazyState::Detached;
+                *self.shared.install_state.lock() = InstallState::Detached;
                 self.publish_status_locked(&mut state);
                 drop(state);
                 let _ = output.clear();
@@ -587,7 +587,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         if let Some(mut output) = state.output.take() {
             if let Err(error) = output.clear() {
                 self.lose_output_locked(&mut state, Some(output), error.clone(), false);
-                *self.shared.lazy.lock() = LazyState::Detached;
+                *self.shared.install_state.lock() = InstallState::Detached;
                 return Err(error);
             }
             state.output = Some(output);
@@ -626,10 +626,10 @@ impl<O: OutputAdapter> InstallPermit<O> {
         if state.incarnation != self.incarnation {
             return Err(InstallRejected::Superseded);
         }
-        let mut lazy = self.shared.lazy.lock();
+        let mut install_state = self.shared.install_state.lock();
         let reservation_matches = matches!(
-            *lazy,
-            LazyState::Reserved(id) | LazyState::ReservedDetached(id) if id == self.reservation
+            *install_state,
+            InstallState::Reserved(id) | InstallState::ReservedDetached(id) if id == self.reservation
         );
         if !reservation_matches {
             return Err(InstallRejected::AlreadyInstalled);
@@ -657,7 +657,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
                 error,
                 false,
             );
-            *lazy = LazyState::Detached;
+            *install_state = InstallState::Detached;
             return Err(InstallRejected::Failed);
         }
         let retained_boundary = current_boundary();
@@ -672,7 +672,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
                     error,
                     false,
                 );
-                *lazy = LazyState::Detached;
+                *install_state = InstallState::Detached;
                 return Err(InstallRejected::Failed);
             }
         }
@@ -681,7 +681,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
             drop(gate);
             let _ = output.clear();
             state.status = SessionStatus::Closed;
-            *lazy = LazyState::Detached;
+            *install_state = InstallState::Detached;
             return Err(InstallRejected::Closed);
         }
         state.controls = controls.clone();
@@ -693,7 +693,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
         gate.state = AdmissionState::Open(state.incarnation);
         Coordinator::from_shared(Arc::clone(&self.shared)).publish_status_locked(&mut state);
         drop(gate);
-        *lazy = LazyState::Installed;
+        *install_state = InstallState::Installed;
         self.consumed = true;
         Ok(())
     }
@@ -704,11 +704,11 @@ impl<O> Drop for InstallPermit<O> {
         if self.consumed {
             return;
         }
-        let mut lazy = self.shared.lazy.lock();
-        match *lazy {
-            LazyState::Reserved(id) if id == self.reservation => *lazy = LazyState::Initial,
-            LazyState::ReservedDetached(id) if id == self.reservation => {
-                *lazy = LazyState::Detached
+        let mut install_state = self.shared.install_state.lock();
+        match *install_state {
+            InstallState::Reserved(id) if id == self.reservation => *install_state = InstallState::Initial,
+            InstallState::ReservedDetached(id) if id == self.reservation => {
+                *install_state = InstallState::Detached
             }
             _ => {}
         }
@@ -784,7 +784,7 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
                     error,
                     false,
                 );
-                *self.shared.lazy.lock() = LazyState::Detached;
+                *self.shared.install_state.lock() = InstallState::Detached;
                 Err(rejection)
             }
         };
@@ -1276,7 +1276,7 @@ mod tests {
         assert_eq!(state.status, SessionStatus::Open);
         assert_eq!(state.controls.volume, 77);
         assert_eq!(state.desired_controls.volume, 77);
-        assert!(matches!(*c.shared.lazy.lock(), LazyState::Installed));
+        assert!(matches!(*c.shared.install_state.lock(), InstallState::Installed));
         assert_eq!(state.output.as_ref().unwrap().controls.volume, 77);
         drop(state);
         assert_eq!(c.work(buffer(48_000, 2)).commit(buffer(48_000, 2)), Ok(()));
