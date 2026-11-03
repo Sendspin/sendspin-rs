@@ -1,4 +1,4 @@
-// ABOUTME: Minimal Sendspin player using the public lazy-session API
+// ABOUTME: Minimal Sendspin player using the public player session API
 
 use sendspin::audio::decode::{Decoder, StreamDecoder};
 use sendspin::audio::{
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     drop(conn.artwork);
     drop(conn.visualizer);
     drop(conn.messages);
-    let mut session = conn.player.attach_lazy(AppliedControls {
+    let mut session: PlayerSession = conn.player.attach_empty(AppliedControls {
         volume: 100,
         muted: false,
         static_delay_ms: 0,

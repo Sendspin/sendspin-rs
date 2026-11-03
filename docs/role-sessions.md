@@ -21,14 +21,13 @@ fn attach<O: PlayerOutput>(receiver: PlayerReceiver, output: O) -> PlayerSession
 }
 ```
 
-`attach_empty(initial_controls)` creates a generic `PlayerSession<O>` without an output.
-Call `begin_output_install`, then install the output with the returned permit. The
-`attach_lazy(initial_controls)` convenience has the same behavior with the built-in
-`PlaybackControl`. `initial_controls` seeds the snapshot; commands received before attachment
-overlay it per field. Controls remain observable and updatable while detached; installation
-replays retained controls before admitting work. Audio work received while no output is
-installed can be committed after the next installation, and committing it earlier returns
-`Obsolete`. `release_output` only invalidates work already returned by `recv`.
+`attach_empty(initial_controls)` creates a generic `PlayerSession<O>` without an output, and a
+plain `PlayerSession` uses the built-in `PlaybackControl`. Call `begin_output_install`, then
+install the output with the returned permit. `initial_controls` seeds the snapshot; commands
+received before attachment overlay it per field. Controls remain observable and updatable while
+detached; installation replays retained controls before admitting work. Audio work received
+while no output is installed can be committed after the next installation, and committing it
+earlier returns `Obsolete`. `release_output` only invalidates work already returned by `recv`.
 
 ## Decoding
 

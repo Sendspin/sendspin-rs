@@ -432,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn receive_sinks_keep_stream_audio_across_release_and_reinstall() {
         let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach_lazy(controls());
+        let mut session = receiver.attach_empty::<crate::audio::PlaybackControl>(controls());
         let format = crate::audio::AudioFormat {
             codec: crate::audio::Codec::Pcm,
             sample_rate: 48_000,

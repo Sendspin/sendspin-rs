@@ -452,38 +452,6 @@ impl PlayerReceiver {
         self,
         initial_controls: AppliedControls,
     ) -> PlayerSession<O> {
-        self.attach_empty_impl(initial_controls)
-    }
-    /// Creates a `PlaybackControl` session whose output can be installed later.
-    pub fn attach_lazy(self, initial_controls: AppliedControls) -> PlayerSession<PlaybackControl> {
-        self.attach_empty(initial_controls)
-    }
-
-    #[cfg(test)]
-    fn attach_with_driver_gate<O: PlayerOutput>(
-        self,
-        output: O,
-        initial_controls: AppliedControls,
-        gate: Arc<Notify>,
-    ) -> PlayerSession<O> {
-        *self.fence.driver_start_gate.lock() = Some(gate);
-        self.attach(output, initial_controls)
-    }
-
-    #[cfg(test)]
-    fn attach_empty_with_driver_gate<O: PlayerOutput>(
-        self,
-        initial_controls: AppliedControls,
-        gate: Arc<Notify>,
-    ) -> PlayerSession<O> {
-        *self.fence.driver_start_gate.lock() = Some(gate);
-        self.attach_empty_impl::<O>(initial_controls)
-    }
-
-    fn attach_empty_impl<O: PlayerOutput>(
-        self,
-        initial_controls: AppliedControls,
-    ) -> PlayerSession<O> {
         let mut controls = initial_controls.normalized();
         self.fence.urgent.borrow().commands.apply(&mut controls);
         let fence = Arc::clone(&self.fence);
@@ -514,6 +482,27 @@ impl PlayerReceiver {
             coordinator,
             driver: Some(driver),
         }
+    }
+
+    #[cfg(test)]
+    fn attach_with_driver_gate<O: PlayerOutput>(
+        self,
+        output: O,
+        initial_controls: AppliedControls,
+        gate: Arc<Notify>,
+    ) -> PlayerSession<O> {
+        *self.fence.driver_start_gate.lock() = Some(gate);
+        self.attach(output, initial_controls)
+    }
+
+    #[cfg(test)]
+    fn attach_empty_with_driver_gate<O: PlayerOutput>(
+        self,
+        initial_controls: AppliedControls,
+        gate: Arc<Notify>,
+    ) -> PlayerSession<O> {
+        *self.fence.driver_start_gate.lock() = Some(gate);
+        self.attach_empty::<O>(initial_controls)
     }
 }
 
