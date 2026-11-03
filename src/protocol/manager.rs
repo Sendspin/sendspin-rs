@@ -160,9 +160,11 @@ struct Incumbent {
 /// ```no_run
 /// # use sendspin::{ConnectionManager, ProtocolClientBuilder};
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// # let player_support: sendspin::protocol::messages::PlayerV1Support = todo!();
 /// let listener = ProtocolClientBuilder::builder()
 ///     .client_id(uuid::Uuid::new_v4().to_string())
 ///     .name("Kitchen Speaker".to_string())
+///     .player_v1_support(player_support)
 ///     .build()
 ///     .listen("0.0.0.0:8927")
 ///     .await?;

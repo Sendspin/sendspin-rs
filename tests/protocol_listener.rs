@@ -6,8 +6,8 @@ use sendspin::audio::decode::{Decoder, PcmDecoder};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message, PlayerState,
-    ServerHello, StreamPlayerConfig, StreamStart,
+    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message,
+    PlayerState, PlayerV1Support, ServerHello, StreamPlayerConfig, StreamStart,
 };
 use sendspin::ProtocolClientBuilder;
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,20 @@ impl PlayerOutput for ListenerOutput {
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, WebSocketStream};
+
+fn player_support() -> PlayerV1Support {
+    let format = |codec: &str, bit_depth| AudioFormatSpec {
+        codec: codec.into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth,
+    };
+    PlayerV1Support {
+        supported_formats: vec![format("opus", 16), format("pcm", 24), format("pcm", 16)],
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec![],
+    }
+}
 
 /// Test peer that plays the protocol-server role over an already-connected
 /// WebSocket stream: replies to `client/hello` with `server/hello`, then
@@ -151,6 +165,7 @@ async fn test_listen_role_session_delivers_player_events() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("listener-role".to_string())
         .name("Listener Role".to_string())
+        .player_v1_support(player_support())
         .build();
     let (url, listener) = bind_listener(builder).await;
     let peer = tokio::spawn(async move {
@@ -231,6 +246,7 @@ async fn test_listen_accepts_and_drives_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-inbound".to_string())
         .name("Test Inbound".to_string())
+        .player_v1_support(player_support())
         .initial_player_state(PlayerState {
             volume: Some(60),
             muted: Some(false),
@@ -297,6 +313,7 @@ async fn test_listen_path_match_accepts() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path".to_string())
         .name("Test Path".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -337,6 +354,7 @@ async fn test_listen_path_normalizes_missing_leading_slash() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path-norm".to_string())
         .name("Test Path Norm".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -372,6 +390,7 @@ async fn test_listen_path_mismatch_rejects_but_listener_survives() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path-reject".to_string())
         .name("Test Path Reject".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -421,6 +440,7 @@ async fn test_listen_local_addr_resolves_ephemeral_port() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-local-addr".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let listener = builder.listen("127.0.0.1:0").await.expect("listen");
     let addr = listener.local_addr().expect("local_addr");
@@ -438,6 +458,7 @@ async fn test_listen_send_message_fails_after_disconnect() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-listen-disc".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let (url, listener) = bind_listener(builder).await;
 
@@ -489,6 +510,7 @@ async fn test_listen_accept_pending_when_peer_stalls_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-stall".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let (url, listener) = bind_listener(builder).await;
 
@@ -528,6 +550,7 @@ async fn test_listen_tls_terminates_and_drives_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-tls".to_string())
         .name("Test TLS".to_string())
+        .player_v1_support(player_support())
         .build();
     let listener = builder
         .listen("127.0.0.1:0")

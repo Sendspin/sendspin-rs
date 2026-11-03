@@ -15,6 +15,20 @@ use sendspin::ProtocolClientBuilder;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
+fn player_support() -> PlayerV1Support {
+    let format = |codec: &str, bit_depth| AudioFormatSpec {
+        codec: codec.into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth,
+    };
+    PlayerV1Support {
+        supported_formats: vec![format("opus", 16), format("pcm", 24), format("pcm", 16)],
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec![],
+    }
+}
+
 #[derive(Clone, Default)]
 struct TestOutput;
 impl PlayerOutput for TestOutput {
@@ -254,6 +268,7 @@ async fn test_connect_without_player_state_sends_state_without_player() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let _client = builder.connect(&url).await.unwrap();
@@ -280,6 +295,7 @@ async fn test_no_player_sender_can_send_sync_state_without_reporter() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -315,6 +331,7 @@ async fn test_connect_can_send_initial_external_source_state() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .initial_sync_state(ClientSyncState::ExternalSource)
         .build();
 
@@ -342,6 +359,7 @@ async fn test_connect_initial_external_source_preserves_player_state() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .initial_sync_state(ClientSyncState::ExternalSource)
         .initial_player_state(PlayerState {
             volume: Some(23),
@@ -380,6 +398,7 @@ async fn test_disconnect_sends_goodbye() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -408,6 +427,7 @@ async fn test_sender_emits_stream_request_format() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -447,6 +467,7 @@ async fn test_sender_emits_artwork_stream_request_format() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -488,6 +509,7 @@ async fn test_sender_rejects_empty_stream_request_format() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -519,6 +541,7 @@ async fn test_sender_rejects_request_format_before_stream_start() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -610,6 +633,7 @@ async fn test_sender_rejects_player_request_after_stream_end() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -653,6 +677,7 @@ async fn test_sender_rejects_artwork_request_without_artwork_stream() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -692,6 +717,7 @@ async fn test_disconnect_closes_socket_and_stops_background_tasks() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -740,6 +766,7 @@ async fn test_connection_disconnect_sends_goodbye_and_closes() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -858,6 +885,7 @@ async fn test_enter_external_source_sends_external_source_state() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -879,6 +907,7 @@ async fn test_exit_external_source_sends_synchronized_state() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -903,6 +932,7 @@ async fn test_exit_external_source_sends_full_player_state() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1139,6 +1169,7 @@ async fn test_no_controller_when_role_not_declared() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1227,6 +1258,7 @@ async fn test_clock_sync_getter_returns_shared_handle() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1299,6 +1331,7 @@ async fn test_message_router_forwards_binary_artwork() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1343,6 +1376,7 @@ async fn test_message_router_forwards_binary_visualizer() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1461,6 +1495,7 @@ async fn test_message_router_forwards_text_messages() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await
@@ -1596,6 +1631,7 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
     let client = ProtocolClientBuilder::builder()
         .client_id("test-client".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build()
         .connect(&url)
         .await

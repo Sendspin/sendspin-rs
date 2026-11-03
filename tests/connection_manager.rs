@@ -6,7 +6,9 @@ use sendspin::audio::decode::{Decoder, PcmDecoder};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::manager::{ConnectionManager, ManagerConfig};
-use sendspin::protocol::messages::{ConnectionReason, GoodbyeReason, Message, ServerHello};
+use sendspin::protocol::messages::{
+    AudioFormatSpec, ConnectionReason, GoodbyeReason, Message, PlayerV1Support, ServerHello,
+};
 use sendspin::ProtocolClientBuilder;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,6 +50,20 @@ impl PlayerOutput for ManagerOutput {
 
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+fn player_support() -> PlayerV1Support {
+    let format = |codec: &str, bit_depth| AudioFormatSpec {
+        codec: codec.into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth,
+    };
+    PlayerV1Support {
+        supported_formats: vec![format("opus", 16), format("pcm", 24), format("pcm", 16)],
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec![],
+    }
+}
 
 /// A test protocol-server: dials the manager's listener, answers
 /// `client/hello` with a `server/hello` carrying the given identity, and
@@ -123,6 +139,7 @@ async fn manager(config: Option<ManagerConfig>) -> (String, ConnectionManager) {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-managed-client".to_string())
         .name("Managed Client".to_string())
+        .player_v1_support(player_support())
         .build();
     let listener = builder.listen("127.0.0.1:0").await.expect("listen failed");
     let mgr = match config {

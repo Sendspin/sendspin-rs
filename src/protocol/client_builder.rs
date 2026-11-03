@@ -3,8 +3,8 @@
 use crate::error::Error;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
-    PlayerState, PlayerV1Support, VisualizerV1Support,
+    ArtworkV1Support, ClientHello, ClientState, ClientSyncState, DeviceInfo, PlayerState,
+    PlayerV1Support, VisualizerV1Support,
 };
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
@@ -39,44 +39,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
     fn from(raw: ProtocolClientBuilderRaw) -> Self {
         // Build supported_roles based on which supports are configured
         let mut supported_roles = Vec::new();
-        let has_explicit_role = raw.player_v1_support.is_some()
-            || raw.artwork_v1_support.is_some()
-            || raw.visualizer_v1_support.is_some()
-            || raw.metadata
-            || raw.controller
-            || raw.color;
-
-        // Default to player@v1 if no roles were explicitly configured
-        let player_v1_support = if has_explicit_role {
-            raw.player_v1_support
-        } else {
-            Some(PlayerV1Support {
-                supported_formats: vec![
-                    AudioFormatSpec {
-                        codec: "opus".to_string(),
-                        channels: 2,
-                        sample_rate: 48000,
-                        bit_depth: 16,
-                    },
-                    AudioFormatSpec {
-                        codec: "pcm".to_string(),
-                        channels: 2,
-                        sample_rate: 48000,
-                        bit_depth: 24,
-                    },
-                    AudioFormatSpec {
-                        codec: "pcm".to_string(),
-                        channels: 2,
-                        sample_rate: 48000,
-                        bit_depth: 16,
-                    },
-                ],
-                buffer_capacity: 50 * 1024 * 1024,
-                supported_commands: vec!["volume".to_string(), "mute".to_string()],
-            })
-        };
-
-        if player_v1_support.is_some() {
+        if raw.player_v1_support.is_some() {
             supported_roles.push("player@v1".to_string());
         }
         if raw.artwork_v1_support.is_some() {
@@ -103,7 +66,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             software_version: raw.software_version,
             mac_address: raw.mac_address,
             supported_roles,
-            player_v1_support,
+            player_v1_support: raw.player_v1_support,
             clock: Arc::new(DefaultClock::new()),
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
@@ -230,7 +193,7 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts();
+        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
         ProtocolClient::connect(request, hello, initial_state, clock, automatic_player_state).await
     }
 
@@ -245,7 +208,7 @@ impl ProtocolClientBuilder {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts();
+        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
         ProtocolClient::drive(
             ws_stream,
             hello,
@@ -259,6 +222,7 @@ impl ProtocolClientBuilder {
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
     /// inbound WebSocket peers. The builder is cloned per accepted peer.
     pub async fn listen<A: ToSocketAddrs>(self, addr: A) -> Result<ProtocolListener, Error> {
+        self.validate()?;
         let tcp = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Connection(format!("TCP bind failed: {e}")))?;
@@ -270,7 +234,17 @@ impl ProtocolClientBuilder {
         Ok(ProtocolListener::new(tcp, self))
     }
 
-    fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>, bool) {
+    fn validate(&self) -> Result<(), Error> {
+        if self.supported_roles.is_empty() {
+            return Err(Error::Protocol(
+                "the client builder has no roles enabled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_parts(self) -> Result<(ClientHello, ClientState, Arc<dyn Clock>, bool), Error> {
+        self.validate()?;
         let hello = ClientHello {
             client_id: self.client_id,
             name: self.name,
@@ -292,11 +266,11 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        (
+        Ok((
             hello,
             initial_state,
             self.clock,
             self.automatic_player_state,
-        )
+        ))
     }
 }

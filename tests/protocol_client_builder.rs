@@ -1,3 +1,4 @@
+use sendspin::error::Error;
 use sendspin::protocol::client_builder::ProtocolClientBuilder;
 use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerV1Support,
@@ -128,39 +129,17 @@ fn test_supported_roles_with_multiple_supports() {
     );
 }
 
-#[test]
-fn test_default_player_v1_support_applied_at_build_time() {
-    // When no player support is explicitly set, the builder has default player@v1 support
+#[tokio::test]
+async fn test_builder_without_roles_is_rejected() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test".to_string())
         .name("Test Client".to_string())
         .build();
-
-    // Default player@v1 role is present
-    assert_eq!(builder.supported_roles(), &["player@v1"]);
-
-    // Default player support is applied
-    let support = builder
-        .player_v1_support()
-        .expect("should have default player support");
-    assert_eq!(support.supported_formats.len(), 3);
-    assert_eq!(support.supported_formats[0].codec, "opus");
-    assert_eq!(support.supported_formats[0].channels, 2);
-    assert_eq!(support.supported_formats[0].sample_rate, 48000);
-    assert_eq!(support.supported_formats[0].bit_depth, 16);
-    assert_eq!(support.supported_formats[1].codec, "pcm");
-    assert_eq!(support.supported_formats[1].channels, 2);
-    assert_eq!(support.supported_formats[1].sample_rate, 48000);
-    assert_eq!(support.supported_formats[1].bit_depth, 24);
-    assert_eq!(support.supported_formats[2].codec, "pcm");
-    assert_eq!(support.supported_formats[2].channels, 2);
-    assert_eq!(support.supported_formats[2].sample_rate, 48000);
-    assert_eq!(support.supported_formats[2].bit_depth, 16);
-    assert_eq!(support.buffer_capacity, 50 * 1024 * 1024); // 50 MB
-    assert_eq!(
-        support.supported_commands,
-        vec!["volume".to_string(), "mute".to_string()]
-    );
+    assert!(builder.supported_roles().is_empty());
+    assert!(matches!(
+        builder.listen("127.0.0.1:0").await,
+        Err(Error::Protocol(_))
+    ));
 }
 
 #[test]

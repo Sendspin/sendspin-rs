@@ -5,10 +5,10 @@ use sendspin::audio::{
 };
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ArtworkSource, ClientSyncState, ConnectionReason, ImageFormat, Message, PlayerCommand,
-    PlayerCommandType, PlayerState, PlayerStateCommand, ServerCommand, ServerHello,
-    StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
-    StreamStart, StreamVisualizerConfig, VisualizerDataType,
+    ArtworkSource, AudioFormatSpec, ClientSyncState, ConnectionReason, ImageFormat, Message,
+    PlayerCommand, PlayerCommandType, PlayerState, PlayerStateCommand, PlayerV1Support,
+    ServerCommand, ServerHello, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear,
+    StreamEnd, StreamPlayerConfig, StreamStart, StreamVisualizerConfig, VisualizerDataType,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
 use sendspin::{Clock, ProtocolClientBuilder};
@@ -19,6 +19,20 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::{tungstenite::Message as WsMessage, WebSocketStream};
+
+fn player_support() -> PlayerV1Support {
+    let format = |codec: &str, bit_depth| AudioFormatSpec {
+        codec: codec.into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth,
+    };
+    PlayerV1Support {
+        supported_formats: vec![format("opus", 16), format("pcm", 24), format("pcm", 16)],
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec![],
+    }
+}
 
 #[derive(Clone, Default)]
 struct Events(Arc<Mutex<Vec<String>>>);
@@ -264,6 +278,7 @@ async fn fixture_with(
     let builder = ProtocolClientBuilder::builder()
         .client_id("role-events".into())
         .name("Role events".into())
+        .player_v1_support(player_support())
         .automatic_player_state(automatic_player_state);
     let builder = match initial_player_state {
         Some(player) => builder.initial_player_state(player).build(),
