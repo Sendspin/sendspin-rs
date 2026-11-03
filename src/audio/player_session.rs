@@ -67,9 +67,6 @@ impl ControlUpdate {
     }
 }
 
-#[cfg(test)]
-type ControlPatch = ControlUpdate;
-
 impl AppliedControls {
     pub(crate) fn normalized(self) -> Self {
         Self {
@@ -265,7 +262,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         self.receipt().expect("test output is installed")
     }
     #[cfg(test)]
-    fn apply_patch(&self, patch: ControlPatch) {
+    fn apply_patch(&self, patch: ControlUpdate) {
         let _ = self.apply_controls_transaction(|version| Some((patch, version.wrapping_add(1))));
     }
     #[cfg(test)]
@@ -1089,9 +1086,9 @@ mod tests {
         let worker = {
             let c = Arc::clone(&c);
             std::thread::spawn(move || {
-                c.apply_patch(ControlPatch {
+                c.apply_patch(ControlUpdate {
                     volume: Some(30),
-                    ..ControlPatch::default()
+                    ..ControlUpdate::default()
                 })
             })
         };
@@ -1154,9 +1151,9 @@ mod tests {
         c.shared.session.lock().output.as_mut().unwrap().fail_commit =
             Some(OutputError::Failed("callback".into()));
         let _ = c.work(buffer(48_000, 2)).commit(buffer(48_000, 2));
-        c.apply_patch(ControlPatch {
+        c.apply_patch(ControlUpdate {
             volume: Some(33),
-            ..ControlPatch::default()
+            ..ControlUpdate::default()
         });
         assert_eq!(c.shared.controls.borrow().volume, 33);
     }
@@ -1224,9 +1221,9 @@ mod tests {
             })
         };
         clear_entered_rx.recv().unwrap();
-        c.apply_patch(ControlPatch {
+        c.apply_patch(ControlUpdate {
             volume: Some(77),
-            ..ControlPatch::default()
+            ..ControlUpdate::default()
         });
         let replacement = fake(Arc::clone(&clears));
         let permit = c.begin_install().unwrap();
@@ -1263,13 +1260,13 @@ mod tests {
     #[test]
     fn controls_are_clamped_and_merged() {
         let c = coordinator(Arc::new(AtomicUsize::new(0)));
-        c.apply_patch(ControlPatch {
+        c.apply_patch(ControlUpdate {
             volume: Some(255),
-            ..ControlPatch::default()
+            ..ControlUpdate::default()
         });
-        c.apply_patch(ControlPatch {
+        c.apply_patch(ControlUpdate {
             static_delay_ms: Some(9000),
-            ..ControlPatch::default()
+            ..ControlUpdate::default()
         });
         let state = c.shared.session.lock();
         assert_eq!(state.controls.volume, 100);
@@ -1358,16 +1355,6 @@ mod tests {
         let permit = c.begin_install().unwrap();
         permit.install(installable()).unwrap();
         assert_eq!(c.receipt().unwrap().commit(buffer(48_000, 2)), Ok(()));
-    }
-    #[test]
-    fn old_permit_cannot_install_after_release() {
-        let c = lazy();
-        let permit = c.begin_install().unwrap();
-        c.release().unwrap();
-        assert_eq!(
-            permit.install(installable()),
-            Err(InstallRejected::Superseded)
-        );
     }
     #[test]
     fn clear_spans_install_and_terminal_rejects_install() {

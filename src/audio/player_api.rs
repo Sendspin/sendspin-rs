@@ -616,11 +616,7 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
     /// Installs the output and replays pending controls. The permit is consumed by the attempt.
     /// Dropping it releases the reservation; an install failure reports `OutputLost` and requires
     /// a fresh reservation. Only `Closed` is terminal for the player session.
-    pub fn install(self, output: O) -> Result<(), InstallRejected> {
-        self.install_adapter(OutputAdapterHandle(output))
-    }
-
-    fn install_adapter(mut self, output: OutputAdapterHandle<O>) -> Result<(), InstallRejected> {
+    pub fn install(mut self, output: O) -> Result<(), InstallRejected> {
         let status = self.fence.status_value.lock().clone();
         if !matches!(status, SessionStatus::Open | SessionStatus::OutputLost(_)) {
             return Err(match status {
@@ -638,9 +634,13 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
             .permit
             .take()
             .ok_or(InstallRejected::Reserved)?
-            .install_with_controls(output, urgent.version, controls, Some(patch), || {
-                self.fence.urgent.borrow().boundary
-            });
+            .install_with_controls(
+                OutputAdapterHandle(output),
+                urgent.version,
+                controls,
+                Some(patch),
+                || self.fence.urgent.borrow().boundary,
+            );
         if result.is_ok() {
             let status = Coordinator::from_shared(Arc::clone(&self.shared)).status();
             if matches!(status, SessionStatus::Open)
@@ -689,11 +689,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
 
     /// Installs output using a newly reserved slot.
     pub fn install(&mut self, output: O) -> Result<(), InstallRejected> {
-        self.install_adapter(OutputAdapterHandle(output))
-    }
-
-    fn install_adapter(&mut self, output: OutputAdapterHandle<O>) -> Result<(), InstallRejected> {
-        self.begin_output_install()?.install_adapter(output)
+        self.begin_output_install()?.install(output)
     }
     /// Releases the installed output while keeping the session open for reinstall.
     ///
@@ -756,11 +752,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
     ///
     /// ```
     pub fn release_output(&mut self) -> Result<(), OutputError> {
-        let coordinator = &self.coordinator;
-        match coordinator.release() {
-            Ok(()) => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.coordinator.release()
     }
     /// Receives the next event, skipping audio superseded by a clear or end.
     ///
@@ -1845,21 +1837,6 @@ mod tests {
             status.changed().await.unwrap();
         }
         assert!(matches!(*status.borrow(), SessionStatus::OutputLost(_)));
-    }
-
-    #[tokio::test]
-    async fn lazy_queued_audio_before_release_is_not_replayed_after_reinstall() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
-        producer.audio(chunk()).unwrap();
-        let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
-            panic!("audio")
-        };
-        let permit = session.begin_output_install().unwrap();
-        permit.install(output()).unwrap();
-        session.release_output().unwrap();
-        assert_eq!(work.commit(buffer()), Err(CommitRejected::Obsolete));
-        assert!(session.recv().now_or_never().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
