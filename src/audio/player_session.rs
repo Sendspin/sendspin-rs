@@ -88,6 +88,9 @@ pub enum OutputError {
     /// The first failure is retained and cleanup errors are best-effort.
     #[error("output failed: {0}")]
     Failed(String),
+    /// The session is closed and accepts no further control changes.
+    #[error("session is closed")]
+    Closed,
     /// One media item does not match the output's sample rate or channel count.
     #[error("output format mismatch: expected {expected:?}, got {actual:?}")]
     FormatMismatch {
@@ -379,7 +382,7 @@ impl<O: OutputAdapter> Coordinator<O> {
             state.status,
             SessionStatus::Closed | SessionStatus::Failed(_)
         ) {
-            return Err(OutputError::Failed("session is terminal".into()));
+            return Ok(());
         }
         state.incarnation = state.incarnation.advance();
         let mut output = state.output.take();
@@ -459,7 +462,7 @@ impl<O: OutputAdapter> Coordinator<O> {
             return Err(error.clone());
         }
         if matches!(state.status, SessionStatus::Closed) {
-            return Err(OutputError::Failed("session is closed".into()));
+            return Err(OutputError::Closed);
         }
         let Some((update, version)) = capture(state.control_version) else {
             return Ok(());
@@ -499,7 +502,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                     state.status = SessionStatus::Closed;
                     self.publish_status_locked(&mut state);
                     *self.shared.install_state.lock() = InstallState::Detached;
-                    return Err(OutputError::Failed("session is closed".into()));
+                    return Err(OutputError::Closed);
                 }
                 state.controls = controls;
                 state.control_version = version;
@@ -1025,7 +1028,7 @@ mod tests {
                 ))
             }
         });
-        assert_eq!(result, Err(OutputError::Failed("session is closed".into())));
+        assert_eq!(result, Err(OutputError::Closed));
         assert!(!captured.load(Ordering::SeqCst));
     }
 
@@ -1080,7 +1083,7 @@ mod tests {
                 ))
             }
         });
-        assert_eq!(result, Err(OutputError::Failed("session is closed".into())));
+        assert_eq!(result, Err(OutputError::Closed));
         assert!(!captured.load(Ordering::SeqCst));
     }
 
