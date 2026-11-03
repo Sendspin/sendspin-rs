@@ -90,42 +90,11 @@ enum RawEvent {
     End(StreamGeneration),
 }
 
-#[derive(Clone, Copy, Default)]
-struct CommandPatch {
-    volume: Option<u8>,
-    muted: Option<bool>,
-    static_delay_ms: Option<u16>,
-}
-impl CommandPatch {
-    fn update(self) -> ControlUpdate {
-        ControlUpdate {
-            volume: self.volume,
-            muted: self.muted,
-            static_delay_ms: self.static_delay_ms,
-        }
-    }
-    fn apply_to(self, mut controls: AppliedControls) -> AppliedControls {
-        self.apply(&mut controls);
-        controls
-    }
-    fn apply(self, controls: &mut AppliedControls) {
-        if let Some(value) = self.volume {
-            controls.volume = value;
-        }
-        if let Some(value) = self.muted {
-            controls.muted = value;
-        }
-        if let Some(value) = self.static_delay_ms {
-            controls.static_delay_ms = value;
-        }
-        *controls = controls.clone().normalized();
-    }
-}
 #[derive(Clone)]
 struct UrgentState {
     version: u64,
     boundary: Option<StreamGeneration>,
-    commands: CommandPatch,
+    commands: ControlUpdate,
     closed: bool,
 }
 
@@ -285,7 +254,7 @@ impl PlayerProducer {
     pub(crate) fn set_controls(&self, controls: AppliedControls) {
         self.fence.urgent.send_modify(|urgent| {
             urgent.version = urgent.version.wrapping_add(1);
-            urgent.commands = CommandPatch {
+            urgent.commands = ControlUpdate {
                 volume: Some(controls.volume),
                 muted: Some(controls.muted),
                 static_delay_ms: Some(controls.static_delay_ms),
@@ -383,7 +352,7 @@ impl PlayerReceiver {
         let (urgent, _) = watch::channel(UrgentState {
             version: 0,
             boundary: None,
-            commands: CommandPatch::default(),
+            commands: ControlUpdate::default(),
             closed: false,
         });
         let admission = Arc::new(super::player_session::AdmissionGate::new(
@@ -454,12 +423,13 @@ impl PlayerReceiver {
         let initial = self.fence.urgent.borrow().clone();
         let latest = initial.clone();
         if let Ok(permit) = coordinator.begin_install() {
-            let latest_controls = latest.commands.apply_to(controls.clone());
+            let mut latest_controls = controls.clone();
+            latest.commands.apply(&mut latest_controls);
             let result = permit.install_with_controls(
                 OutputAdapterHandle(output),
                 latest.version,
                 latest_controls.clone(),
-                Some(latest.commands.update()),
+                Some(latest.commands),
                 || latest.boundary,
             );
             if result.is_err() {
@@ -607,8 +577,8 @@ impl Driver {
                     let mut captured = None;
                     fence.urgent.send_if_modified(|latest| {
                         if latest.version > control_version {
-                            captured = Some((latest.commands.update(), latest.version));
-                            latest.commands = CommandPatch::default();
+                            captured = Some((latest.commands, latest.version));
+                            latest.commands = ControlUpdate::default();
                             true
                         } else {
                             false
@@ -682,7 +652,7 @@ impl<O: PlayerOutput> OutputInstallPermit<O> {
         }
         let urgent = self.fence.urgent.borrow().clone();
         let current_controls = self.fence.controls.borrow().clone();
-        let patch = urgent.commands.update();
+        let patch = urgent.commands;
         let mut controls = current_controls;
         patch.apply(&mut controls);
         let mut result = self
@@ -919,7 +889,7 @@ impl<O: PlayerOutput> PlayerSession<O> {
                     },
                     urgent.version,
                 ));
-                urgent.commands = CommandPatch::default();
+                urgent.commands = ControlUpdate::default();
             });
             captured
         })
