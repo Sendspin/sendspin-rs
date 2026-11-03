@@ -378,7 +378,8 @@ impl PlayerReceiver {
     /// `initial_controls` is applied as the starting snapshot, then overlaid with
     /// any pre-attachment command for each named field; requested values are clamped
     /// when applied. Output callbacks are synchronous, short, nonblocking, serialized,
-    /// and must not reenter this session.
+    /// and must not reenter this session. If the output rejects the initial controls,
+    /// the session starts without an output and reports `OutputLost`.
     ///
     /// ```rust,no_run
     /// use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
