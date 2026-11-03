@@ -2,27 +2,56 @@
 
 use sendspin::audio::decode::{Decoder, StreamDecoder};
 use sendspin::audio::{
-    AppliedControls, AudioBuffer, CommitRejected, PlayerEvent, SessionStatus, SyncedPlayer,
-    SyncedPlayerConfig,
+    AppliedControls, AudioBuffer, AudioFormat, CommitRejected, InstallRejected, PlayerEvent,
+    PlayerSession, SessionStatus, SyncedPlayer, SyncedPlayerConfig,
 };
 use sendspin::protocol::messages::{
     AudioFormatSpec, PlayerState, PlayerStateCommand, PlayerV1Support,
 };
+use sendspin::sync::ClockSync;
 use sendspin::ProtocolClientBuilder;
 use std::error::Error;
 
-fn classify_status(status: SessionStatus) -> Result<bool, Box<dyn Error>> {
+type SharedClock = std::sync::Arc<parking_lot::Mutex<ClockSync>>;
+
+fn is_closed(status: SessionStatus) -> Result<bool, Box<dyn Error>> {
     match status {
-        SessionStatus::Open => Ok(false),
+        SessionStatus::Open | SessionStatus::OutputLost(_) => Ok(false),
         SessionStatus::Closed => Ok(true),
-        SessionStatus::OutputLost(error) => Err(format!("audio output lost: {error}").into()),
         SessionStatus::Failed(error) => Err(format!("player session failed: {error}").into()),
     }
 }
 
+fn install_output(
+    session: &mut PlayerSession,
+    format: &AudioFormat,
+    clock_sync: &SharedClock,
+    output: &mut Option<SyncedPlayer>,
+) -> Result<(), Box<dyn Error>> {
+    if let Err(error) = session.release_output() {
+        log::warn!("Failed to clear the previous audio output: {error}");
+    }
+    drop(output.take());
+    let player = SyncedPlayer::new(
+        format.clone(),
+        std::sync::Arc::clone(clock_sync),
+        SyncedPlayerConfig::new(),
+    )?;
+    match session
+        .begin_output_install()
+        .and_then(|permit| permit.install(player.control()))
+    {
+        Ok(()) => *output = Some(player),
+        // The next `recv` returns `None` and ends the loop.
+        Err(InstallRejected::Closed) => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 async fn receive_audio(
-    session: &mut sendspin::audio::PlayerSession,
-    clock_sync: std::sync::Arc<parking_lot::Mutex<sendspin::sync::ClockSync>>,
+    session: &mut PlayerSession,
+    clock_sync: SharedClock,
     output: &mut Option<SyncedPlayer>,
 ) -> Result<(), Box<dyn Error>> {
     let mut status = session.status();
@@ -31,35 +60,40 @@ async fn receive_audio(
         let event = tokio::select! {
             biased;
             changed = status.changed() => {
-                if changed.is_err() {
-                    classify_status(status.borrow().clone()).map(|_| None)
-                } else if classify_status(status.borrow().clone())? {
-                    Ok(None)
+                let current = status.borrow_and_update().clone();
+                if let SessionStatus::OutputLost(error) = &current {
+                    log::warn!("Audio output lost, reopening: {error}");
+                    drop(output.take());
+                    if let Some(state) = decoder.as_ref() {
+                        install_output(session, state.format(), &clock_sync, output)?;
+                    }
+                }
+                if changed.is_err() || is_closed(current)? {
+                    None
                 } else {
                     continue;
                 }
             }
-            event = session.recv() => Ok(event),
-        }?;
+            event = session.recv() => event,
+        };
         let Some(event) = event else {
-            if classify_status(status.borrow().clone())? {
+            if is_closed(status.borrow().clone())? {
                 break;
             }
             return Err("player event stream ended while still open".into());
         };
         match event {
             PlayerEvent::Start(config) => {
-                session.release_output()?;
-                drop(output.take());
                 let state = StreamDecoder::new(&config)?;
-                let player = SyncedPlayer::new(
-                    state.format().clone(),
-                    std::sync::Arc::clone(&clock_sync),
-                    SyncedPlayerConfig::new(),
-                )?;
-                session.begin_output_install()?.install(player.control())?;
+                // Keep buffered audio playing when the new format fits the open device.
+                let reusable = output.as_ref().is_some_and(|player| {
+                    player.format().sample_rate == state.format().sample_rate
+                        && player.format().channels == state.format().channels
+                });
+                if !reusable {
+                    install_output(session, state.format(), &clock_sync, output)?;
+                }
                 decoder = Some(state);
-                *output = Some(player);
             }
             PlayerEvent::Audio(work) => {
                 let Some(state) = decoder.as_ref() else {
@@ -71,10 +105,9 @@ async fn receive_audio(
                     samples,
                     format: state.format().clone(),
                 };
-                match work.commit(buffer) {
-                    Ok(()) => {}
-                    Err(CommitRejected::Obsolete | CommitRejected::Closed) => continue,
-                    Err(error) => return Err(error.into()),
+                // A failed device shows up as `OutputLost` on the status watch.
+                if let Err(CommitRejected::Output(error)) = work.commit(buffer) {
+                    log::warn!("Audio output rejected a buffer: {error}");
                 }
             }
             // The library already clears the output queue before publishing this event.
@@ -154,6 +187,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let conn = client.split();
     drop(conn.artwork);
     drop(conn.visualizer);
+    drop(conn.messages);
     let mut session = conn.player.attach_lazy(AppliedControls {
         volume: 100,
         muted: false,
