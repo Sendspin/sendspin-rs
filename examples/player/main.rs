@@ -2,8 +2,8 @@
 
 use sendspin::audio::decode::{Decoder, StreamDecoder};
 use sendspin::audio::{
-    AppliedControls, AudioBuffer, AudioFormat, CommitRejected, InstallRejected, PlayerEvent,
-    PlayerSession, SessionStatus, SyncedPlayer, SyncedPlayerConfig,
+    AudioBuffer, AudioFormat, CommitRejected, InstallRejected, PlayerEvent, PlayerSession,
+    SessionStatus, SyncedPlayer, SyncedPlayerConfig,
 };
 use sendspin::protocol::messages::{
     AudioFormatSpec, PlayerState, PlayerStateCommand, PlayerV1Support,
@@ -168,11 +168,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     drop(conn.artwork);
     drop(conn.visualizer);
     drop(conn.messages);
-    let mut session: PlayerSession = conn.player.attach_empty(AppliedControls {
-        volume: 100,
-        muted: false,
-        static_delay_ms: 0,
-    });
+    let mut session: PlayerSession = conn.player.attach_empty();
     let mut output = None;
     let result = receive_audio(&mut session, conn.clock_sync.clone(), &mut output).await;
     session.shutdown().await;

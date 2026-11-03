@@ -1,8 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sendspin::audio::decode::{Decoder, OpusDecoder, PcmDecoder};
 use sendspin::audio::{
-    AppliedControls, AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput,
-    SessionStatus,
+    AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput, SessionStatus,
 };
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
@@ -325,14 +324,7 @@ async fn queued_codec_transition(first: Codec) {
     let f = fixture().await;
     let mut split = f.client.split();
     let output = RecordedOutput::default();
-    let mut session = split.player.attach(
-        output.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(output.clone());
     let pcm_data = [0, 1, 2, 3];
     let opus_data = [0xff, 0x41, 0x03, 0xff, 0xfe, 0, 0, 0];
     let (first_codec, second_codec) = match first {
@@ -596,14 +588,7 @@ async fn urgent_clear_volume_end_and_malformed_input_preserve_new_media() {
     let f = fixture().await;
     let split = f.client.split();
     let (output, mut effects) = RecordedOutput::new();
-    let mut session = split.player.attach(
-        output.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(output.clone());
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
         .unwrap();
@@ -727,14 +712,7 @@ async fn preparation_worker_blocked_before_decode_does_not_block_urgent_controls
     let f = fixture().await;
     let split = f.client.split();
     let (output, mut effects) = RecordedOutput::new();
-    let mut session = split.player.attach(
-        output.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(output.clone());
     let mut controls = session.controls();
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
@@ -839,14 +817,7 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
     let mut split = f.client.split();
     assert_eq!(split.clock_sync.lock().rtt_micros(), None);
     f.clock.set(t1 + 1_000);
-    let mut session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(Events::default());
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
         .unwrap();
@@ -941,14 +912,7 @@ async fn reporter_waits_for_applied_output_and_preserves_initial_fields() {
         applied: Arc::new(Mutex::new(Vec::new())),
         gate_enabled: Arc::clone(&gate_enabled),
     };
-    let mut session = split.player.attach(
-        output,
-        AppliedControls {
-            volume: 80,
-            muted: false,
-            static_delay_ms: 7,
-        },
-    );
+    let mut session = split.player.attach(output);
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
         .unwrap();
@@ -999,14 +963,7 @@ async fn reporter_omits_disabled_fields_and_deduplicates_local_controls() {
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 3,
-        },
-    );
+    let session = split.player.attach(Events::default());
     f.server_tx
         .send(
             serde_json::to_string(&Message::ServerCommand(ServerCommand {
@@ -1054,14 +1011,7 @@ async fn external_source_suppresses_auto_reports_and_exit_merges_partial_state()
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 50,
-            muted: false,
-            static_delay_ms: 4,
-        },
-    );
+    let session = split.player.attach(Events::default());
     split.sender.enter_external_source().await.unwrap();
     assert_eq!(
         next_state(&mut f.observed).await.state,
@@ -1107,14 +1057,7 @@ async fn manual_partial_player_state_persists_into_next_automatic_report() {
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 60,
-            muted: false,
-            static_delay_ms: 1,
-        },
-    );
+    let session = split.player.attach(Events::default());
     split
         .sender
         .set_player_state(PlayerState {
@@ -1148,14 +1091,7 @@ async fn automatic_player_state_false_keeps_manual_marker_order_without_auto_rep
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 70,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let session = split.player.attach(Events::default());
     split
         .sender
         .set_player_state(PlayerState {
@@ -1193,14 +1129,7 @@ async fn raw_client_state_partial_patch_retains_full_state_for_next_auto_report(
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 60,
-            muted: false,
-            static_delay_ms: 1,
-        },
-    );
+    let session = split.player.attach(Events::default());
     split
         .sender
         .send_message(Message::ClientState(
@@ -1241,14 +1170,7 @@ async fn raw_external_source_state_suppresses_pending_control_report() {
     )
     .await;
     let split = f.client.split();
-    let session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 50,
-            muted: false,
-            static_delay_ms: 4,
-        },
-    );
+    let session = split.player.attach(Events::default());
     split
         .sender
         .send_message(Message::ClientState(
@@ -1310,14 +1232,7 @@ async fn dropped_connection_guard_closes_session_and_rejects_held_work() {
     let f = fixture().await;
     let split = f.client.split();
 
-    let mut session = split.player.attach(
-        Events::default(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(Events::default());
     let mut watch = session.status();
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())

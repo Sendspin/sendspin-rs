@@ -3,9 +3,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use sendspin::audio::decode::{Decoder, PcmDecoder};
-use sendspin::audio::{
-    AppliedControls, AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput,
-};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::manager::{ConnectionManager, ManagerConfig};
 use sendspin::protocol::messages::{ConnectionReason, GoodbyeReason, Message, ServerHello};
@@ -190,14 +188,7 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
         .unwrap()
         .unwrap();
     let output_a = ManagerOutput::default();
-    let mut session_a = conn_a.player.attach(
-        output_a.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session_a = conn_a.player.attach(output_a.clone());
     peer_a
         .writer
         .send(WsMessage::Text(
@@ -279,14 +270,7 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
         .unwrap()
         .unwrap();
     let output_b = ManagerOutput::default();
-    let mut session_b = conn_b.player.attach(
-        output_b.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session_b = conn_b.player.attach(output_b.clone());
     peer_b
         .writer
         .send(WsMessage::Text(

@@ -379,7 +379,7 @@ mod tests {
     #[tokio::test]
     async fn receive_sinks_preserve_encoded_audio_and_config_fifo() {
         let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach(FakePlayer, controls());
+        let mut session = receiver.attach(FakePlayer);
         sinks.dispatch_message(Message::StreamStart(StreamStart {
             player: Some(session_player_config("pcm")),
             artwork: None,
@@ -405,7 +405,7 @@ mod tests {
     #[tokio::test]
     async fn receive_sinks_clear_is_urgent_and_valid_command_is_not_forwarded() {
         let (mut sinks, receiver, _, _, mut messages) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach(FakePlayer, controls());
+        let mut session = receiver.attach(FakePlayer);
         sinks.dispatch_binary(BinaryFrame::Audio(audio(1, &[9])));
         sinks.dispatch_message(Message::StreamClear(StreamClear {
             roles: Some(vec!["player".into()]),
@@ -432,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn receive_sinks_keep_stream_audio_across_release_and_reinstall() {
         let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach_empty::<crate::audio::PlaybackControl>(controls());
+        let mut session = receiver.attach_empty::<crate::audio::PlaybackControl>();
         let format = crate::audio::AudioFormat {
             codec: crate::audio::Codec::Pcm,
             sample_rate: 48_000,
@@ -509,7 +509,7 @@ mod tests {
     async fn receive_sinks_disables_only_failed_artwork_role() {
         let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, mut messages) =
             ReceiveSinks::channel(controls());
-        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut player = player_receiver.attach(FakePlayer);
         let mut artwork = artwork_receiver.attach(FailingArtwork);
         let mut visualizer = visualizer_receiver.attach(FakeVisualizer);
         sinks.dispatch_message(Message::StreamStart(StreamStart {
@@ -584,7 +584,7 @@ mod tests {
     async fn receive_sinks_disables_only_failed_visualizer_role() {
         let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, mut messages) =
             ReceiveSinks::channel(controls());
-        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut player = player_receiver.attach(FakePlayer);
         let mut artwork = artwork_receiver.attach(FakeArtwork);
         let mut visualizer = visualizer_receiver.attach(FailingVisualizer);
         sinks.dispatch_message(Message::StreamStart(StreamStart {
@@ -670,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn receive_sinks_player_backlog_does_not_block_boundaries_controls_or_fallback() {
         let (mut sinks, receiver, _, _, mut messages) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach(FakePlayer, controls());
+        let mut session = receiver.attach(FakePlayer);
         let mut controls_rx = session.controls();
         for timestamp in 0..65 {
             sinks.dispatch_binary(BinaryFrame::Audio(audio(timestamp, &[timestamp as u8])));
@@ -710,7 +710,7 @@ mod tests {
         let (mut sinks, player_receiver, artwork_receiver, visualizer_receiver, _) =
             ReceiveSinks::channel(controls());
         drop(artwork_receiver);
-        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut player = player_receiver.attach(FakePlayer);
         let mut visualizer = visualizer_receiver.attach(FakeVisualizer);
         sinks.dispatch_message(Message::StreamStart(StreamStart {
             player: Some(session_player_config("pcm")),
@@ -731,7 +731,7 @@ mod tests {
     async fn dropped_messages_do_not_suppress_player_audio() {
         let (mut sinks, player_receiver, _, _, messages) = ReceiveSinks::channel(controls());
         drop(messages);
-        let mut player = player_receiver.attach(FakePlayer, controls());
+        let mut player = player_receiver.attach(FakePlayer);
         sinks.dispatch_message(Message::ServerState(
             crate::protocol::messages::ServerState {
                 metadata: None,

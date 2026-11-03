@@ -7,27 +7,24 @@ one role.
 ## Player session
 
 After `client.split()`, `conn.player` is a `PlayerReceiver`. Eager attachment supplies an
-output immediately and still takes the initial control snapshot:
+output immediately and starts from the controls in the builder's initial player state:
 
 ```rust,no_run
-use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
+use sendspin::audio::{PlayerOutput, PlayerReceiver, PlayerSession};
 
 fn attach<O: PlayerOutput>(receiver: PlayerReceiver, output: O) -> PlayerSession<O> {
-    receiver.attach(output, AppliedControls {
-        volume: 100,
-        muted: false,
-        static_delay_ms: 0,
-    })
+    receiver.attach(output)
 }
 ```
 
-`attach_empty(initial_controls)` creates a generic `PlayerSession<O>` without an output, and a
+`attach_empty()` creates a generic `PlayerSession<O>` without an output, and a
 plain `PlayerSession` uses the built-in `PlaybackControl`. Call `begin_output_install`, then
-install the output with the returned permit. `initial_controls` seeds the snapshot; commands
-received before attachment overlay it per field. Controls remain observable and updatable while
-detached; installation replays retained controls before admitting work. Audio work received
-while no output is installed can be committed after the next installation, and committing it
-earlier returns `Obsolete`. `release_output` only invalidates work already returned by `recv`.
+install the output with the returned permit. The builder's initial player state seeds the
+snapshot; commands received before attachment overlay it per field. Controls remain observable
+and updatable while detached; installation replays retained controls before admitting work.
+Audio work received while no output is installed can be committed after the next installation,
+and committing it earlier returns `Obsolete`. `release_output` only invalidates work already
+returned by `recv`.
 
 ## Decoding
 

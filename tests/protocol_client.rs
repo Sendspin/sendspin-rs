@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use sendspin::audio::{AppliedControls, AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
+use sendspin::audio::{AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::error::Error;
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
@@ -413,14 +413,7 @@ async fn test_sender_emits_stream_request_format() {
         .await
         .unwrap();
     let conn = client.split();
-    let mut player = conn.player.attach(
-        TestOutput,
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut player = conn.player.attach(TestOutput);
 
     discard_initial_state(&mut rx).await;
 
@@ -622,14 +615,7 @@ async fn test_sender_rejects_player_request_after_stream_end() {
         .await
         .unwrap();
     let conn = client.split();
-    let mut player = conn.player.attach(
-        TestOutput,
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut player = conn.player.attach(TestOutput);
 
     discard_initial_state(&mut rx).await;
 
@@ -672,14 +658,7 @@ async fn test_sender_rejects_artwork_request_without_artwork_stream() {
         .await
         .unwrap();
     let conn = client.split();
-    let mut player = conn.player.attach(
-        TestOutput,
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut player = conn.player.attach(TestOutput);
 
     discard_initial_state(&mut rx).await;
 
@@ -1283,14 +1262,7 @@ async fn test_message_router_forwards_binary_audio() {
         .await
         .unwrap();
     let conn = client.split();
-    let mut session = conn.player.attach(
-        TestOutput,
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = conn.player.attach(TestOutput);
 
     // Audio chunk: type byte, 8-byte big-endian timestamp, then payload.
     let audio_frame: Vec<u8> = vec![
@@ -1435,14 +1407,7 @@ async fn test_public_websocket_clear_commands_and_fallback() {
         .await
         .unwrap();
     let mut conn = client.split();
-    let mut player = conn.player.attach(
-        TestOutput,
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut player = conn.player.attach(TestOutput);
     discard_initial_state(&mut rx).await;
     server_tx.send(player_stream_start()).unwrap();
     assert!(matches!(player.recv().await, Some(PlayerEvent::Start(_))));

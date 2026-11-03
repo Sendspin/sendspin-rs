@@ -54,11 +54,7 @@ fn attach<O: sendspin::audio::PlayerOutput>(
     receiver: sendspin::audio::PlayerReceiver,
     output: O,
 ) -> sendspin::audio::PlayerSession<O> {
-    receiver.attach(output, sendspin::audio::AppliedControls {
-        volume: 100,
-        muted: false,
-        static_delay_ms: 0,
-    })
+    receiver.attach(output)
 }
 ```
 

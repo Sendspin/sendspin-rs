@@ -3,9 +3,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use sendspin::audio::decode::{Decoder, PcmDecoder};
-use sendspin::audio::{
-    AppliedControls, AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput,
-};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
     ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message, PlayerState,
@@ -166,14 +164,7 @@ async fn test_listen_role_session_delivers_player_events() {
     let (_roles, _rx, _reader, writer) = peer.await.expect("peer task");
     let split = client.split();
     let output = ListenerOutput::default();
-    let mut session = split.player.attach(
-        output.clone(),
-        AppliedControls {
-            volume: 100,
-            muted: false,
-            static_delay_ms: 0,
-        },
-    );
+    let mut session = split.player.attach(output.clone());
     let start = Message::StreamStart(StreamStart {
         player: Some(StreamPlayerConfig {
             codec: "pcm".into(),

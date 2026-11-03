@@ -378,35 +378,22 @@ impl PlayerReceiver {
     }
     /// Attaches an output and starts the urgent-control driver on the current Tokio runtime.
     ///
-    /// `initial_controls` is applied as the starting snapshot, then overlaid with
-    /// any pre-attachment command for each named field; requested values are clamped
-    /// when applied. Output callbacks are synchronous, short, nonblocking, serialized,
-    /// and must not reenter this session. If the output rejects the initial controls,
+    /// The starting controls come from the initial player state given to the client builder,
+    /// overlaid with any pre-attachment command for each named field; requested values are
+    /// clamped when applied. Unset fields start at volume 100, unmuted and no delay. Output
+    /// callbacks are synchronous, short, nonblocking, serialized, and must not reenter this
+    /// session. If the output rejects the initial controls,
     /// the session starts without an output and reports `OutputLost`.
     ///
     /// ```rust,no_run
-    /// use sendspin::audio::{AppliedControls, PlayerOutput, PlayerReceiver, PlayerSession};
+    /// use sendspin::audio::{PlayerOutput, PlayerReceiver, PlayerSession};
     ///
-    /// fn attach_player<O: PlayerOutput>(
-    ///     receiver: PlayerReceiver,
-    ///     output: O,
-    /// ) -> PlayerSession<O> {
-    ///     receiver.attach(
-    ///         output,
-    ///         AppliedControls {
-    ///             volume: 100,
-    ///             muted: false,
-    ///             static_delay_ms: 0,
-    ///         },
-    ///     )
+    /// fn attach_player<O: PlayerOutput>(receiver: PlayerReceiver, output: O) -> PlayerSession<O> {
+    ///     receiver.attach(output)
     /// }
     /// ```
-    pub fn attach<O: PlayerOutput>(
-        self,
-        output: O,
-        initial_controls: AppliedControls,
-    ) -> PlayerSession<O> {
-        let mut controls = initial_controls.normalized();
+    pub fn attach<O: PlayerOutput>(self, output: O) -> PlayerSession<O> {
+        let mut controls = self.fence.controls.borrow().clone();
         self.fence.urgent.borrow().commands.apply(&mut controls);
         let coordinator = Coordinator::<OutputAdapterHandle<O>>::with_admission_and_controls(
             controls.clone(),
@@ -452,13 +439,10 @@ impl PlayerReceiver {
         }
     }
     /// Creates a session with no output on the current Tokio runtime.
-    /// Initial controls are overlaid by pre-attachment commands and remain updatable.
+    /// The starting controls are taken as in [`Self::attach`] and remain updatable.
     /// Installation replays retained controls before admitting work.
-    pub fn attach_empty<O: PlayerOutput>(
-        self,
-        initial_controls: AppliedControls,
-    ) -> PlayerSession<O> {
-        let mut controls = initial_controls.normalized();
+    pub fn attach_empty<O: PlayerOutput>(self) -> PlayerSession<O> {
+        let mut controls = self.fence.controls.borrow().clone();
         self.fence.urgent.borrow().commands.apply(&mut controls);
         let fence = Arc::clone(&self.fence);
         let coordinator = Coordinator::<OutputAdapterHandle<O>>::with_admission_and_controls(
@@ -497,21 +481,16 @@ impl PlayerReceiver {
     fn attach_with_driver_gate<O: PlayerOutput>(
         self,
         output: O,
-        initial_controls: AppliedControls,
         gate: Arc<Notify>,
     ) -> PlayerSession<O> {
         *self.fence.driver_start_gate.lock() = Some(gate);
-        self.attach(output, initial_controls)
+        self.attach(output)
     }
 
     #[cfg(test)]
-    fn attach_empty_with_driver_gate<O: PlayerOutput>(
-        self,
-        initial_controls: AppliedControls,
-        gate: Arc<Notify>,
-    ) -> PlayerSession<O> {
+    fn attach_empty_with_driver_gate<O: PlayerOutput>(self, gate: Arc<Notify>) -> PlayerSession<O> {
         *self.fence.driver_start_gate.lock() = Some(gate);
-        self.attach_empty::<O>(initial_controls)
+        self.attach_empty::<O>()
     }
 }
 
@@ -1035,9 +1014,9 @@ mod tests {
     async fn receiver_can_attach_different_outputs_from_identical_type() {
         let (receiver_a, _) = PlayerReceiver::channel(controls());
         let (receiver_b, _) = PlayerReceiver::channel(controls());
-        let _session_a: PlayerSession<FakeOutput> = receiver_a.attach(output(), controls());
+        let _session_a: PlayerSession<FakeOutput> = receiver_a.attach(output());
         let _session_b: PlayerSession<AlternateOutput> =
-            receiver_b.attach(AlternateOutput(output()), controls());
+            receiver_b.attach(AlternateOutput(output()));
     }
 
     fn chunk() -> AudioChunk {
@@ -1074,7 +1053,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let calls = Arc::clone(&output.calls);
-        let session = receiver.attach(output, controls());
+        let session = receiver.attach(output);
         session
             .set_controls(AppliedControls {
                 volume: 25,
@@ -1099,7 +1078,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let calls = Arc::clone(&output.calls);
-        let session = receiver.attach(output, controls());
+        let session = receiver.attach(output);
         calls.lock().clear();
         session
             .update_controls(ControlUpdate {
@@ -1119,7 +1098,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let calls = Arc::clone(&output.calls);
-        let session = receiver.attach(output, controls());
+        let session = receiver.attach(output);
         calls.lock().clear();
         session
             .update_controls(ControlUpdate {
@@ -1142,8 +1121,7 @@ mod tests {
     async fn public_update_controls_does_not_lose_gated_server_command() {
         let driver_gate = Arc::new(Notify::new());
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session =
-            receiver.attach_with_driver_gate(output(), controls(), Arc::clone(&driver_gate));
+        let session = receiver.attach_with_driver_gate(output(), Arc::clone(&driver_gate));
         producer.set_volume(60);
         session
             .update_controls(ControlUpdate {
@@ -1162,8 +1140,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let output_state = Arc::clone(&output.controls);
-        let session =
-            receiver.attach_with_driver_gate(output, controls(), Arc::clone(&driver_gate));
+        let session = receiver.attach_with_driver_gate(output, Arc::clone(&driver_gate));
         let mut controls_rx = session.controls();
         producer.set_mute(true);
         producer.set_static_delay(37);
@@ -1206,11 +1183,7 @@ mod tests {
         let calls = Arc::clone(&output.calls);
         let actual = Arc::clone(&output.controls);
         output.setter_gate_enabled.store(false, Ordering::Release);
-        let session = Arc::new(receiver.attach_with_driver_gate(
-            output,
-            controls(),
-            Arc::clone(&driver_gate),
-        ));
+        let session = Arc::new(receiver.attach_with_driver_gate(output, Arc::clone(&driver_gate)));
         assert_eq!(*session.status().borrow(), SessionStatus::Open);
         calls.lock().clear();
         setter_gate_enabled.store(true, Ordering::Release);
@@ -1283,7 +1256,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio event")
@@ -1323,7 +1296,7 @@ mod tests {
     #[tokio::test]
     async fn blocked_output_creation_does_not_block_controls_or_end() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         producer.audio(chunk()).unwrap();
         let old_work = match session.recv().await {
             Some(PlayerEvent::Audio(work)) => work,
@@ -1370,7 +1343,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_public_session_replays_preinstall_work_and_rejects_old_work_after_release() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio event")
@@ -1401,7 +1374,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let applied = Arc::clone(&output.controls);
-        let session = receiver.attach(output, controls());
+        let session = receiver.attach(output);
         producer.set_volume(42);
         for _ in 0..100 {
             if applied.lock().volume == 42 {
@@ -1425,7 +1398,7 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
         let attach = std::thread::spawn(move || {
             let _entered = handle.enter();
-            receiver.attach(output, controls())
+            receiver.attach(output)
         });
         entered_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1461,7 +1434,7 @@ mod tests {
     async fn lazy_install_does_not_regress_controls_published_without_output() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(20);
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let mut control_watch = session.controls();
         loop {
             let volume = {
@@ -1500,7 +1473,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         session.install(failing).unwrap();
         producer.audio(chunk()).unwrap();
         producer.clear().unwrap();
@@ -1520,7 +1493,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(20);
         let gate = Arc::new(Notify::new());
-        let session = receiver.attach_empty_with_driver_gate(controls(), Arc::clone(&gate));
+        let session = receiver.attach_empty_with_driver_gate(Arc::clone(&gate));
         let permit = session.begin_output_install().unwrap();
         producer.set_volume(50);
         let installed = output();
@@ -1540,7 +1513,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_publishes_controls_across_driver_yields() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let permit = session.begin_output_install().unwrap();
         producer.set_volume(20);
         let installed = output();
@@ -1567,7 +1540,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.clear().unwrap();
         assert!(matches!(
             session.recv().await,
@@ -1585,7 +1558,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.clear_format_mismatch = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.clear().unwrap();
         assert!(matches!(
             session.recv().await,
@@ -1603,7 +1576,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut mismatch = output();
         mismatch.mismatch_commit = true;
-        let mut session = receiver.attach(mismatch, controls());
+        let mut session = receiver.attach(mismatch);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -1623,7 +1596,7 @@ mod tests {
     #[tokio::test]
     async fn public_lazy_format_mismatch_keeps_session_open_and_next_commit_succeeds() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let mut mismatch = output();
         mismatch.mismatch_commit = true;
         session.install(mismatch).unwrap();
@@ -1646,7 +1619,7 @@ mod tests {
     #[tokio::test]
     async fn predriver_combined_controls_apply_all_three_fields() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach(output(), controls());
+        let session = receiver.attach(output());
         let mut controls_rx = session.controls();
         producer.set_controls(AppliedControls {
             volume: 31,
@@ -1669,7 +1642,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_volume = true;
-        let session = receiver.attach(failing, controls());
+        let session = receiver.attach(failing);
         let controls_rx = session.controls();
         let mut status = session.status();
         producer.set_volume(12);
@@ -1682,17 +1655,14 @@ mod tests {
 
     #[tokio::test]
     async fn eager_attach_publishes_all_normalized_initial_controls() {
-        let (receiver, _) = PlayerReceiver::channel(controls());
+        let (receiver, _) = PlayerReceiver::channel(AppliedControls {
+            volume: 255,
+            muted: true,
+            static_delay_ms: 9_999,
+        });
         let output = output();
         let state = Arc::clone(&output.controls);
-        let session = receiver.attach(
-            output,
-            AppliedControls {
-                volume: 255,
-                muted: true,
-                static_delay_ms: 9_999,
-            },
-        );
+        let session = receiver.attach(output);
         assert_eq!(
             *session.controls().borrow(),
             AppliedControls {
@@ -1716,7 +1686,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.clear().unwrap();
         let output = output();
-        let mut session = receiver.attach(output.clone(), controls());
+        let mut session = receiver.attach(output.clone());
         producer.audio(chunk()).unwrap();
         assert!(matches!(session.recv().await, Some(PlayerEvent::Clear)));
         assert!(matches!(session.recv().await, Some(PlayerEvent::Audio(_))));
@@ -1727,7 +1697,7 @@ mod tests {
     async fn public_eager_clear_invalidates_issued_work_while_recv_is_idle() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
-        let mut session = receiver.attach(output.clone(), controls());
+        let mut session = receiver.attach(output.clone());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -1740,7 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn producer_command_applies_after_attach_without_recv() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach(output(), controls());
+        let session = receiver.attach(output());
         let mut controls_rx = session.controls();
         producer.set_volume(33);
         tokio::time::timeout(std::time::Duration::from_secs(1), controls_rx.changed())
@@ -1758,18 +1728,11 @@ mod tests {
             static_delay_ms: 222,
         });
         producer.set_volume(33);
-        let session = receiver.attach(
-            output(),
-            AppliedControls {
-                volume: 80,
-                muted: false,
-                static_delay_ms: 7,
-            },
-        );
+        let session = receiver.attach(output());
         let controls = session.controls();
         assert_eq!(controls.borrow().volume, 33);
-        assert!(!controls.borrow().muted);
-        assert_eq!(controls.borrow().static_delay_ms, 7);
+        assert!(controls.borrow().muted);
+        assert_eq!(controls.borrow().static_delay_ms, 222);
     }
 
     #[tokio::test]
@@ -1779,7 +1742,7 @@ mod tests {
             muted: false,
             static_delay_ms: 9999,
         });
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let mut controls_rx = session.controls();
         producer.set_controls(AppliedControls {
             volume: 33,
@@ -1808,7 +1771,7 @@ mod tests {
     #[tokio::test]
     async fn public_producer_close_rejects_held_work_without_recv_and_cancel_keeps_next_event() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach(output(), controls());
+        let mut session = receiver.attach(output());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -1818,7 +1781,7 @@ mod tests {
         assert!(session.recv().await.is_none());
 
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach(output(), controls());
+        let mut session = receiver.attach(output());
         producer.audio(chunk()).unwrap();
         let pending = session.recv();
         drop(pending);
@@ -1832,7 +1795,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing_clear = output();
         failing_clear.fail_clear = true;
-        let session = receiver.attach(failing_clear, controls());
+        let session = receiver.attach(failing_clear);
         let mut status = session.status();
         producer.clear().unwrap();
         while matches!(*status.borrow(), SessionStatus::Open) {
@@ -1843,7 +1806,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing_setter = output();
         failing_setter.fail_volume = true;
-        let session = receiver.attach(failing_setter, controls());
+        let session = receiver.attach(failing_setter);
         let mut status = session.status();
         producer.set_controls(AppliedControls {
             volume: 12,
@@ -1860,7 +1823,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_volume = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         assert!(matches!(
             session.recv().await,
@@ -1874,7 +1837,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_volume = true;
-        let mut session = receiver.attach(failing.clone(), controls());
+        let mut session = receiver.attach(failing.clone());
         assert!(matches!(
             session.recv().await,
             Some(PlayerEvent::OutputLost(_))
@@ -1887,7 +1850,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_work_keeps_generation_across_synchronous_clear() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(old_work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -1906,7 +1869,7 @@ mod tests {
     #[tokio::test]
     async fn reservation_identity_preserves_new_install_after_old_permit_drop_or_failure() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let old = session.begin_output_install().unwrap();
         session.release_output().unwrap();
         let new = session.begin_output_install().unwrap();
@@ -1914,7 +1877,7 @@ mod tests {
         new.install(output()).unwrap();
 
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let old = session.begin_output_install().unwrap();
         session.release_output().unwrap();
         let new = session.begin_output_install().unwrap();
@@ -1954,7 +1917,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn close_rejects_outstanding_install_before_driver_poll() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let permit = session.begin_output_install().unwrap();
         producer.close();
         assert_eq!(permit.install(output()), Err(InstallRejected::Closed));
@@ -1965,7 +1928,7 @@ mod tests {
     async fn producer_drop_fences_held_work_and_pending_recv_and_clears_once() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
-        let mut session = receiver.attach(output.clone(), controls());
+        let mut session = receiver.attach(output.clone());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -1991,7 +1954,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -2030,7 +1993,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
@@ -2074,7 +2037,7 @@ mod tests {
     #[tokio::test]
     async fn eager_shutdown_completes_with_live_producer() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach(output(), controls());
+        let session = receiver.attach(output());
         tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
             .await
             .expect("eager shutdown must not wait for producer drop");
@@ -2083,7 +2046,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_shutdown_completes_with_live_producer() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         tokio::time::timeout(std::time::Duration::from_secs(1), session.shutdown())
             .await
             .expect("lazy shutdown must not wait for producer drop");
@@ -2094,7 +2057,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let weak = Arc::downgrade(&output.clears);
-        let mut session = receiver.attach(output.clone(), controls());
+        let mut session = receiver.attach(output.clone());
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -2108,7 +2071,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_shutdown_awaits_driver_and_releases_shared_state() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let shared = session.coordinator.shared();
         let weak = Arc::downgrade(&shared);
         drop(producer);
@@ -2121,7 +2084,7 @@ mod tests {
     async fn controls_mirror_publishes_install_and_retains_close() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         producer.set_volume(37);
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let mut controls_watch = session.controls();
         while controls_watch.borrow().volume != 37 {
             controls_watch.changed().await.unwrap();
@@ -2145,7 +2108,7 @@ mod tests {
         gate.store(true, Ordering::Release);
         let driver_gate = Arc::new(Notify::new());
         let mut session =
-            receiver.attach_with_driver_gate(output.clone(), controls(), Arc::clone(&driver_gate));
+            receiver.attach_with_driver_gate(output.clone(), Arc::clone(&driver_gate));
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!("audio")
@@ -2168,7 +2131,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let clears = Arc::clone(&output.clears);
-        let session = receiver.attach(output, controls());
+        let session = receiver.attach(output);
         drop(producer);
         drop(session);
         assert_eq!(clears.load(Ordering::SeqCst), 1);
@@ -2177,12 +2140,12 @@ mod tests {
     #[tokio::test]
     async fn lazy_public_session_install_retry_and_closed_rejection() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         assert!(session.begin_output_install().is_ok());
         drop(session);
 
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         producer.close();
         assert!(session.recv().await.is_none());
         drop(session);
@@ -2193,7 +2156,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
         let weak = Arc::downgrade(&output.clears);
-        let session = receiver.attach(output.clone(), controls());
+        let session = receiver.attach(output.clone());
         let status = session.status();
         let clear_done = output.clear_notify.notified();
         producer.close();
@@ -2212,7 +2175,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         session.install(failing).unwrap();
         producer.clear().unwrap();
         assert!(matches!(
@@ -2229,7 +2192,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_install_setter_failure_publishes_output_loss() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let mut failing = output();
         failing.fail_volume = true;
         assert_eq!(session.install(failing), Err(InstallRejected::Failed));
@@ -2242,7 +2205,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_clears_queued_audio_after_end_before_permit() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let permit = session.begin_output_install().unwrap();
         producer.audio(chunk()).unwrap();
         producer.end().unwrap();
@@ -2257,7 +2220,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn lazy_install_reconciles_end_while_setter_is_blocked() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let permit = session.begin_output_install().unwrap();
         producer.audio(chunk()).unwrap();
         let installed = output();
@@ -2281,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn lazy_release_clear_failure_retains_output_loss() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let mut failing = output();
         failing.fail_clear = true;
         session.install(failing).unwrap();
@@ -2300,7 +2263,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(first) = session.recv().await.unwrap() else {
@@ -2327,7 +2290,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         producer.audio(chunk()).unwrap();
         let PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
             panic!()
@@ -2351,7 +2314,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn public_loss_shutdown_before_driver_poll_closes_and_joins() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let mut failing = output();
         failing.fail_volume = true;
         assert_eq!(session.install(failing), Err(InstallRejected::Failed));
@@ -2366,19 +2329,16 @@ mod tests {
 
     #[tokio::test]
     async fn public_failed_setter_replays_requested_controls_after_reinstall() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
+        let (receiver, producer) = PlayerReceiver::channel(AppliedControls {
+            volume: 50,
+            muted: false,
+            static_delay_ms: 0,
+        });
         let failing = output();
         failing
             .fail_volume_after_attach
             .store(true, Ordering::Release);
-        let mut session = receiver.attach(
-            failing,
-            AppliedControls {
-                volume: 50,
-                muted: false,
-                static_delay_ms: 0,
-            },
-        );
+        let mut session = receiver.attach(failing);
         let controls_watch = session.controls();
         producer.set_volume(70);
         timeout(Duration::from_secs(5), async {
@@ -2409,14 +2369,7 @@ mod tests {
         failing
             .fail_volume_after_attach
             .store(true, Ordering::Release);
-        let mut session = receiver.attach(
-            failing,
-            AppliedControls {
-                volume: 50,
-                muted: false,
-                static_delay_ms: 0,
-            },
-        );
+        let mut session = receiver.attach(failing);
         producer.set_volume(70);
         timeout(Duration::from_secs(5), async {
             while !matches!(*session.status().borrow(), SessionStatus::OutputLost(_)) {
@@ -2438,7 +2391,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_clear = true;
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         session.install(failing).unwrap();
         producer.clear().unwrap();
         let permit = session.begin_output_install().unwrap();
@@ -2453,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn core_install_and_close_publication_are_monotonic() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
+        let mut session = receiver.attach_empty::<FakeOutput>();
         let status = session.status();
         session.install(output()).unwrap();
         assert_eq!(*status.borrow(), SessionStatus::Open);
@@ -2492,7 +2445,7 @@ mod tests {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let mut failing = output();
         failing.fail_commit = true;
-        let mut session = receiver.attach(failing, controls());
+        let mut session = receiver.attach(failing);
         let mut pending = Box::pin(session.recv());
         assert!(matches!(
             futures_util::poll!(&mut pending),
@@ -2531,7 +2484,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn public_install_cannot_reopen_after_concurrent_close() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
-        let session = receiver.attach_empty::<FakeOutput>(controls());
+        let session = receiver.attach_empty::<FakeOutput>();
         let permit = session.begin_output_install().unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::channel();
