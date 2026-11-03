@@ -63,8 +63,8 @@ player-state object; otherwise state reporting is explicit. Fields set to `None`
 from serialized messages, and external-source exit uses the caller’s explicit patch before
 later control changes are reported.
 
-During output loss, applied controls are the baseline and desired controls are replayed when
-an output is installed.
+During output loss, control changes are still published and reported, and they are applied
+when an output is installed.
 
 ## Migration
 

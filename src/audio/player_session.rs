@@ -473,14 +473,10 @@ impl<O: OutputAdapter> Coordinator<O> {
         state.desired_controls = controls.clone();
         let Some(mut output) = state.output.take() else {
             state.control_version = version;
-            // Keep failed-output requests private until installation succeeds.
-            // An open session without output still exposes requested controls.
-            if matches!(state.status, SessionStatus::Open) {
-                let _ = self
-                    .shared
-                    .controls
-                    .send_replace(state.desired_controls.clone());
-            }
+            let _ = self
+                .shared
+                .controls
+                .send_replace(state.desired_controls.clone());
             return Ok(());
         };
         let result: Result<(), OutputError> = (|| {
@@ -1156,6 +1152,18 @@ mod tests {
             c.status(),
             SessionStatus::OutputLost(OutputError::Failed(_))
         ));
+    }
+    #[test]
+    fn controls_changed_during_output_loss_are_published() {
+        let c = coordinator(Arc::new(AtomicUsize::new(0)));
+        c.shared.session.lock().output.as_mut().unwrap().fail_commit =
+            Some(OutputError::Failed("callback".into()));
+        let _ = c.work(buffer(48_000, 2)).commit(buffer(48_000, 2));
+        c.apply_patch(ControlPatch {
+            volume: Some(33),
+            ..ControlPatch::default()
+        });
+        assert_eq!(c.shared.controls.borrow().volume, 33);
     }
     #[test]
     fn commit_failure_cleanup_race_reconciles_closed_lifecycle() {
