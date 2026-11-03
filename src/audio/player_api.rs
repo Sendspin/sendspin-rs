@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch, Notify};
 
 use super::player_session::{
-    Admission, AppliedControls, CommitRejected, ControlUpdate, Coordinator, InstallRejected,
-    Lifecycle, OutputAdapter, OutputError, SessionStatus,
+    AppliedControls, CommitRejected, ControlUpdate, Coordinator, InstallRejected, Lifecycle,
+    OutputAdapter, OutputError, SessionStatus,
 };
 use super::synced_player::PlaybackControl;
 use super::AudioBuffer;
@@ -84,7 +84,6 @@ enum RawEvent {
     Audio {
         generation: StreamGeneration,
         chunk: AudioChunk,
-        receipt: super::player_session::ReceiptStamp,
     },
     Clear(StreamGeneration),
     End(StreamGeneration),
@@ -263,17 +262,11 @@ impl PlayerProducer {
     }
     pub(crate) fn audio(&self, chunk: AudioChunk) -> Result<(), ProducerError> {
         let generation = *self.generation.lock();
-        let receipt = match self.fence.admission.admit() {
-            Admission::Open(receipt) => receipt,
-            Admission::Detached => return Ok(()),
-            Admission::Closed => return Err(ProducerError::ReceiverClosed),
-        };
+        if self.fence.admission.is_closed() {
+            return Err(ProducerError::ReceiverClosed);
+        }
         self.tx
-            .send(RawEvent::Audio {
-                generation,
-                chunk,
-                receipt,
-            })
+            .send(RawEvent::Audio { generation, chunk })
             .map_err(|_| ProducerError::ReceiverClosed)
     }
     pub(crate) fn set_volume(&self, value: u8) {
@@ -355,9 +348,7 @@ impl PlayerReceiver {
             commands: ControlUpdate::default(),
             closed: false,
         });
-        let admission = Arc::new(super::player_session::AdmissionGate::new(
-            crate::generation::OutputIncarnation::initial(),
-        ));
+        let admission = Arc::new(super::player_session::AdmissionGate::default());
         let fence = Arc::new(SessionFence {
             status,
             status_value,
@@ -705,9 +696,10 @@ impl<O: PlayerOutput> PlayerSession<O> {
     }
     /// Releases the installed output while keeping the session open for reinstall.
     ///
-    /// Receipt-time admission is detached first, so queued and outstanding old work is
-    /// rejected or skipped. The output is cleared before the result is returned; a clear
-    /// failure is retained as `OutputLost` and a fresh installation may recover the session.
+    /// Audio work already returned by [`recv`](Self::recv) becomes obsolete, while audio
+    /// still queued is kept for the next installation. The output is cleared before the
+    /// result is returned; a clear failure is retained as `OutputLost` and a fresh
+    /// installation may recover the session.
     ///
     /// The output-owning worker must acknowledge dropping its device before the application
     /// advertises an external source. The session remains open and retains controls and the
@@ -769,8 +761,10 @@ impl<O: PlayerOutput> PlayerSession<O> {
             Err(error) => Err(error),
         }
     }
-    /// Receives the next event, skipping audio from detached or superseded output
-    /// incarnations, including audio received before reinstallation.
+    /// Receives the next event, skipping audio superseded by a clear or end.
+    ///
+    /// Work returned while no output is installed can be committed after the next
+    /// installation, and committing it earlier returns `Obsolete`.
     ///
     /// Waiting is cancellation-safe and does not lose the next event. Terminal status
     /// returns `None` immediately without draining queued events; subsequent calls also
@@ -806,20 +800,14 @@ impl<O: PlayerOutput> PlayerSession<O> {
                 event = receiver.rx.recv() => event?,
             };
             match event {
-                RawEvent::Audio {
-                    generation,
-                    chunk,
-                    receipt,
-                } => {
+                RawEvent::Audio { generation, chunk } => {
                     let coordinator = &self.coordinator;
-                    let admitted = match coordinator.admission().admit() {
-                        Admission::Open(current) => current == receipt,
-                        Admission::Detached | Admission::Closed => false,
-                    };
-                    if !admitted || generation < coordinator.current_generation() {
+                    if coordinator.admission().is_closed()
+                        || generation < coordinator.current_generation()
+                    {
                         continue;
                     }
-                    let work = coordinator.receipt_stamped(receipt, generation);
+                    let work = coordinator.receipt_stamped(coordinator.stamp(), generation);
                     return Some(PlayerEvent::Audio(AudioWork::new(
                         work,
                         generation,
@@ -1412,25 +1400,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn lazy_audio_before_reinstall_does_not_hide_start() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
-        producer.audio(chunk()).unwrap();
-        session.release_output().unwrap();
-        producer
-            .start(crate::protocol::messages::StreamPlayerConfig {
-                codec: "pcm".into(),
-                sample_rate: 48_000,
-                channels: 2,
-                bit_depth: 16,
-                codec_header: None,
-            })
-            .unwrap();
-        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
-        assert!(session.recv().now_or_never().is_none());
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn command_between_attach_snapshot_and_driver_start_updates_output_and_controls() {
         let (receiver, producer) = PlayerReceiver::channel(controls());
         let output = output();
@@ -1543,25 +1512,6 @@ mod tests {
             *session.status().borrow(),
             SessionStatus::OutputLost(OutputError::Failed("clear".into()))
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn lazy_recv_skips_detached_audio_and_preserves_following_start() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
-        session.release_output().unwrap();
-        producer.audio(chunk()).unwrap();
-        producer
-            .start(crate::protocol::messages::StreamPlayerConfig {
-                codec: "pcm".into(),
-                sample_rate: 48_000,
-                channels: 2,
-                bit_depth: 16,
-                codec_header: None,
-            })
-            .unwrap();
-        assert!(matches!(session.recv().await, Some(PlayerEvent::Start(_))));
-        assert!(session.recv().now_or_never().is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1931,20 +1881,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_audio_is_skipped_but_fresh_audio_is_delivered() {
-        let (receiver, producer) = PlayerReceiver::channel(controls());
-        let mut session = receiver.attach_empty::<FakeOutput>(controls());
-        producer.audio(chunk()).unwrap();
-        session.release_output().unwrap();
-        assert_eq!(producer.audio(chunk()), Ok(()));
-        session.install(output()).unwrap();
-        producer.audio(chunk()).unwrap();
-        let event = session.recv().await;
-        assert!(matches!(event, Some(PlayerEvent::Audio(_))));
-        assert!(session.recv().now_or_never().is_none());
-    }
-
-    #[tokio::test]
     async fn reservation_identity_preserves_new_install_after_old_permit_drop_or_failure() {
         let (receiver, _producer) = PlayerReceiver::channel(controls());
         let mut session = receiver.attach_empty::<FakeOutput>(controls());
@@ -1959,10 +1895,7 @@ mod tests {
         let old = session.begin_output_install().unwrap();
         session.release_output().unwrap();
         let new = session.begin_output_install().unwrap();
-        assert_eq!(
-            old.install(output()),
-            Err(InstallRejected::Superseded)
-        );
+        assert_eq!(old.install(output()), Err(InstallRejected::Superseded));
         new.install(output()).unwrap();
     }
 
@@ -2001,10 +1934,7 @@ mod tests {
         let mut session = receiver.attach_empty::<FakeOutput>(controls());
         let permit = session.begin_output_install().unwrap();
         producer.close();
-        assert_eq!(
-            permit.install(output()),
-            Err(InstallRejected::Closed)
-        );
+        assert_eq!(permit.install(output()), Err(InstallRejected::Closed));
         assert!(session.recv().await.is_none());
     }
 
@@ -2267,10 +2197,7 @@ mod tests {
         let mut session = receiver.attach_empty::<FakeOutput>(controls());
         let mut failing = output();
         failing.fail_volume = true;
-        assert_eq!(
-            session.install(failing),
-            Err(InstallRejected::Failed)
-        );
+        assert_eq!(session.install(failing), Err(InstallRejected::Failed));
         assert!(matches!(
             *session.status().borrow(),
             SessionStatus::OutputLost(OutputError::Failed(ref error)) if error == "volume"
@@ -2397,10 +2324,7 @@ mod tests {
         let mut session = receiver.attach_empty::<FakeOutput>(controls());
         let mut failing = output();
         failing.fail_volume = true;
-        assert_eq!(
-            session.install(failing),
-            Err(InstallRejected::Failed)
-        );
+        assert_eq!(session.install(failing), Err(InstallRejected::Failed));
         assert!(matches!(
             *session.status().borrow(),
             SessionStatus::OutputLost(_)

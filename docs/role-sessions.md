@@ -26,7 +26,9 @@ Call `begin_output_install`, then install the output with the returned permit. T
 `attach_lazy(initial_controls)` convenience has the same behavior with the built-in
 `PlaybackControl`. `initial_controls` seeds the snapshot; commands received before attachment
 overlay it per field. Controls remain observable and updatable while detached; installation
-replays retained controls before admitting work.
+replays retained controls before admitting work. Audio work received while no output is
+installed can be committed after the next installation, and committing it earlier returns
+`Obsolete`. `release_output` only invalidates work already returned by `recv`.
 
 ## Decoding
 

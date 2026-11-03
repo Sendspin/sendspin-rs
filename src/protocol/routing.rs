@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receive_sinks_release_detached_dispatch_reinstall_accepts_fresh_audio() {
+    async fn receive_sinks_keep_stream_audio_across_release_and_reinstall() {
         let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
         let mut session = receiver.attach_lazy(controls());
         let format = crate::audio::AudioFormat {
@@ -440,72 +440,37 @@ mod tests {
             bit_depth: 16,
             codec_header: None,
         };
-        session
-            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
-                format.clone(),
-            ))
-            .unwrap();
-        session.release_output().unwrap();
-        sinks.dispatch_binary(BinaryFrame::Audio(audio(1, &[1])));
         sinks.dispatch_message(Message::StreamStart(StreamStart {
             player: Some(session_player_config("pcm")),
             artwork: None,
             visualizer: None,
         }));
-        session
-            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
-                format.clone(),
-            ))
-            .unwrap();
-        sinks.dispatch_binary(BinaryFrame::Audio(audio(2, &[2])));
+        sinks.dispatch_binary(BinaryFrame::Audio(audio(1, &[1])));
         assert!(matches!(
             session.recv().await,
             Some(crate::audio::PlayerEvent::Start(_))
         ));
-        let crate::audio::PlayerEvent::Audio(work) = session.recv().await.unwrap() else {
-            panic!()
-        };
-        assert_eq!(
-            work.commit(crate::audio::AudioBuffer {
-                timestamp: 2,
-                samples: std::sync::Arc::from(vec![0, 0]),
-                format
-            }),
-            Ok(())
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn receive_sinks_admission_snapshot_keeps_fresh_audio_after_reinstall() {
-        let (mut sinks, receiver, _, _, _) = ReceiveSinks::channel(controls());
-        let mut session = receiver.attach_lazy(controls());
-        let format = crate::audio::AudioFormat {
-            codec: crate::audio::Codec::Pcm,
-            sample_rate: 48_000,
-            channels: 2,
-            bit_depth: 16,
-            codec_header: None,
-        };
-        session
-            .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
-                format.clone(),
-            ))
-            .unwrap();
         session.release_output().unwrap();
-        sinks.dispatch_binary(BinaryFrame::Audio(audio(7, &[7])));
+        sinks.dispatch_binary(BinaryFrame::Audio(audio(2, &[2])));
         session
             .install(crate::audio::synced_player::SyncedPlayer::control_for_test(
                 format.clone(),
             ))
             .unwrap();
-        sinks.dispatch_binary(BinaryFrame::Audio(audio(8, &[8])));
-        let work = loop {
-            match session.recv().await {
-                Some(crate::audio::PlayerEvent::Audio(work)) => break work,
-                _ => continue,
-            }
-        };
-        assert_eq!(work.timestamp(), 8);
+        for timestamp in [1, 2] {
+            let Some(crate::audio::PlayerEvent::Audio(work)) = session.recv().await else {
+                panic!("expected audio {timestamp}")
+            };
+            assert_eq!(work.timestamp(), timestamp);
+            assert_eq!(
+                work.commit(crate::audio::AudioBuffer {
+                    timestamp,
+                    samples: std::sync::Arc::from(vec![0, 0]),
+                    format: format.clone(),
+                }),
+                Ok(())
+            );
+        }
     }
 
     #[tokio::test]

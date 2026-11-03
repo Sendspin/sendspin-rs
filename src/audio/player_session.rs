@@ -131,7 +131,7 @@ pub enum SessionStatus {
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 /// Why prepared output work was not admitted.
 pub enum CommitRejected {
-    /// A clear or end boundary, output release/reinstall, or newer receipt superseded the work.
+    /// A clear or end boundary or an output release superseded the work, or no output is installed.
     #[error("output work is obsolete")]
     Obsolete,
     /// The session is closed or failed and admits no further work; terminal receives return
@@ -171,51 +171,17 @@ pub(crate) struct ReceiptStamp {
     pub(crate) incarnation: OutputIncarnation,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdmissionState {
-    Open(OutputIncarnation),
-    Detached,
-    Closed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Admission {
-    Open(ReceiptStamp),
-    Detached,
-    Closed,
-}
-
+#[derive(Default)]
 pub(crate) struct AdmissionGate {
-    state: Mutex<AdmissionData>,
-}
-
-struct AdmissionData {
-    state: AdmissionState,
+    closed: Mutex<bool>,
 }
 
 impl AdmissionGate {
-    pub(crate) fn new(incarnation: OutputIncarnation) -> Self {
-        Self {
-            state: Mutex::new(AdmissionData {
-                state: AdmissionState::Open(incarnation),
-            }),
-        }
-    }
-    pub(crate) fn admit(&self) -> Admission {
-        match self.state.lock().state {
-            AdmissionState::Open(incarnation) => Admission::Open(ReceiptStamp { incarnation }),
-            AdmissionState::Detached => Admission::Detached,
-            AdmissionState::Closed => Admission::Closed,
-        }
-    }
-    pub(crate) fn detach(&self) {
-        let mut data = self.state.lock();
-        if !matches!(data.state, AdmissionState::Closed) {
-            data.state = AdmissionState::Detached;
-        }
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.closed.lock()
     }
     pub(crate) fn close(&self) {
-        self.state.lock().state = AdmissionState::Closed;
+        *self.closed.lock() = true;
     }
 }
 
@@ -281,8 +247,7 @@ impl<O: OutputAdapter> Coordinator<O> {
     }
     #[cfg(test)]
     pub(crate) fn new(controls: AppliedControls) -> Self {
-        let incarnation = OutputIncarnation::initial();
-        Self::with_admission(controls, Arc::new(AdmissionGate::new(incarnation)))
+        Self::with_admission(controls, Arc::new(AdmissionGate::default()))
     }
     #[cfg(test)]
     pub(crate) fn with_output(output: O, controls: AppliedControls) -> Self {
@@ -351,11 +316,16 @@ impl<O: OutputAdapter> Coordinator<O> {
     }
     #[cfg(test)]
     pub(crate) fn receipt(&self) -> Option<PreparedAudioWork<O>> {
-        let Admission::Open(stamp) = self.shared.admission.admit() else {
+        if self.shared.admission.is_closed() {
             return None;
-        };
+        }
         let generation = self.shared.session.lock().floor;
-        Some(self.receipt_stamped(stamp, generation))
+        Some(self.receipt_stamped(self.stamp(), generation))
+    }
+    pub(crate) fn stamp(&self) -> ReceiptStamp {
+        ReceiptStamp {
+            incarnation: self.shared.session.lock().incarnation,
+        }
     }
     pub(crate) fn receipt_stamped(
         &self,
@@ -411,9 +381,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         ) {
             return Err(OutputError::Failed("session is terminal".into()));
         }
-        let next = state.incarnation.advance();
-        self.shared.admission.detach();
-        state.incarnation = next;
+        state.incarnation = state.incarnation.advance();
         let mut output = state.output.take();
         *self.shared.install_state.lock() = InstallState::Detached;
         drop(state);
@@ -459,7 +427,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         ) {
             return;
         }
-        if matches!(self.shared.admission.admit(), Admission::Closed) {
+        if self.shared.admission.is_closed() {
             if let Some(mut output) = output {
                 let _ = output.clear();
             }
@@ -468,14 +436,10 @@ impl<O: OutputAdapter> Coordinator<O> {
             self.publish_status_locked(state);
             return;
         }
-        if already_advanced {
-            self.shared.admission.detach();
-            output_lost(state, output, error);
-        } else {
+        if !already_advanced {
             state.incarnation = state.incarnation.advance();
-            self.shared.admission.detach();
-            output_lost(state, output, error);
         }
+        output_lost(state, output, error);
         self.publish_status_locked(state);
     }
     pub(crate) fn current_generation(&self) -> StreamGeneration {
@@ -533,7 +497,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         })();
         match result {
             Ok(()) => {
-                if matches!(self.shared.admission.admit(), Admission::Closed) {
+                if self.shared.admission.is_closed() {
                     let _ = output.clear();
                     state.output = None;
                     state.status = SessionStatus::Closed;
@@ -676,9 +640,9 @@ impl<O: OutputAdapter> InstallPermit<O> {
                 return Err(InstallRejected::Failed);
             }
         }
-        let mut gate = self.shared.admission.state.lock();
-        if matches!(gate.state, AdmissionState::Closed) {
-            drop(gate);
+        let closed = self.shared.admission.closed.lock();
+        if *closed {
+            drop(closed);
             let _ = output.clear();
             state.status = SessionStatus::Closed;
             *install_state = InstallState::Detached;
@@ -690,9 +654,8 @@ impl<O: OutputAdapter> InstallPermit<O> {
         let _ = self.shared.controls.send_replace(state.controls.clone());
         state.output = Some(output);
         state.status = SessionStatus::Open;
-        gate.state = AdmissionState::Open(state.incarnation);
         Coordinator::from_shared(Arc::clone(&self.shared)).publish_status_locked(&mut state);
-        drop(gate);
+        drop(closed);
         *install_state = InstallState::Installed;
         self.consumed = true;
         Ok(())
@@ -706,7 +669,9 @@ impl<O> Drop for InstallPermit<O> {
         }
         let mut install_state = self.shared.install_state.lock();
         match *install_state {
-            InstallState::Reserved(id) if id == self.reservation => *install_state = InstallState::Initial,
+            InstallState::Reserved(id) if id == self.reservation => {
+                *install_state = InstallState::Initial
+            }
             InstallState::ReservedDetached(id) if id == self.reservation => {
                 *install_state = InstallState::Detached
             }
@@ -747,7 +712,7 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
         if self.stamp.incarnation != state.incarnation || self.generation != state.floor {
             return (Err(CommitRejected::Obsolete), state.status.clone());
         }
-        if matches!(self.shared.admission.admit(), Admission::Closed) {
+        if self.shared.admission.is_closed() {
             return (Err(CommitRejected::Closed), state.status.clone());
         }
         let Some(mut output) = state.output.take() else {
@@ -756,11 +721,7 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
         // Keep the session lock across the short, synchronous callback. This
         // serializes commit with boundary/clear and prevents stale reinsertion.
         let result = output.commit(buffer);
-        let closed = {
-            let gate = self.shared.admission.state.lock();
-            matches!(gate.state, AdmissionState::Closed)
-        };
-        if closed {
+        if self.shared.admission.is_closed() {
             let _ = output.clear();
             state.status = SessionStatus::Closed;
             return (Err(CommitRejected::Closed), state.status.clone());
@@ -1276,7 +1237,10 @@ mod tests {
         assert_eq!(state.status, SessionStatus::Open);
         assert_eq!(state.controls.volume, 77);
         assert_eq!(state.desired_controls.volume, 77);
-        assert!(matches!(*c.shared.install_state.lock(), InstallState::Installed));
+        assert!(matches!(
+            *c.shared.install_state.lock(),
+            InstallState::Installed
+        ));
         assert_eq!(state.output.as_ref().unwrap().controls.volume, 77);
         drop(state);
         assert_eq!(c.work(buffer(48_000, 2)).commit(buffer(48_000, 2)), Ok(()));
@@ -1393,7 +1357,7 @@ mod tests {
         assert_eq!(c.receipt().unwrap().commit(buffer(48_000, 2)), Ok(()));
     }
     #[test]
-    fn detached_receipt_is_dropped_and_old_permit_cannot_install() {
+    fn old_permit_cannot_install_after_release() {
         let c = lazy();
         let permit = c.begin_install().unwrap();
         c.release().unwrap();
@@ -1401,7 +1365,6 @@ mod tests {
             permit.install(installable()),
             Err(InstallRejected::Superseded)
         );
-        assert!(c.receipt().is_none());
     }
     #[test]
     fn clear_spans_install_and_terminal_rejects_install() {
