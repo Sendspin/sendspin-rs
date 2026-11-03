@@ -1436,6 +1436,10 @@ async fn test_public_websocket_clear_commands_and_fallback() {
             buffer_capacity: 1024,
             supported_commands: vec!["volume".to_string()],
         })
+        .initial_player_state(PlayerState {
+            volume: Some(100),
+            ..PlayerState::default()
+        })
         .build()
         .connect(&url)
         .await

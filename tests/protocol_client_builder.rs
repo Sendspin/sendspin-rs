@@ -1,8 +1,8 @@
 use sendspin::error::Error;
 use sendspin::protocol::client_builder::ProtocolClientBuilder;
 use sendspin::protocol::messages::{
-    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerV1Support,
-    VisualizerDataType, VisualizerV1Support,
+    ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerState,
+    PlayerV1Support, VisualizerDataType, VisualizerV1Support,
 };
 
 #[test]
@@ -127,6 +127,42 @@ fn test_supported_roles_with_multiple_supports() {
         builder.supported_roles(),
         &["player@v1", "artwork@v1", "visualizer@v1", "controller@v1"]
     );
+}
+
+#[tokio::test]
+async fn test_advertised_player_commands_require_initial_values() {
+    let builder = |state: PlayerState| {
+        ProtocolClientBuilder::builder()
+            .client_id("test".to_string())
+            .name("Test Client".to_string())
+            .player_v1_support(PlayerV1Support {
+                supported_formats: vec![],
+                buffer_capacity: 1024,
+                supported_commands: vec!["volume".to_string(), "mute".to_string()],
+            })
+            .initial_player_state(state)
+            .build()
+    };
+    let volume_only = PlayerState {
+        volume: Some(30),
+        ..PlayerState::default()
+    };
+    let muted_only = PlayerState {
+        muted: Some(false),
+        ..PlayerState::default()
+    };
+    for state in [volume_only, muted_only] {
+        assert!(matches!(
+            builder(state).listen("127.0.0.1:0").await,
+            Err(Error::Protocol(_))
+        ));
+    }
+    let both = PlayerState {
+        volume: Some(30),
+        muted: Some(false),
+        ..PlayerState::default()
+    };
+    assert!(builder(both).listen("127.0.0.1:0").await.is_ok());
 }
 
 #[tokio::test]

@@ -101,6 +101,7 @@ pub struct ProtocolClientBuilderFields {
     /// [`ClientSyncState::ExternalSource`] when another source owns playback.
     #[builder(default = ClientSyncState::Synchronized)]
     initial_sync_state: ClientSyncState,
+    /// Must set `volume` or `muted` when the player advertises the matching command.
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     /// Automatically report successful player control changes as client/state updates.
@@ -239,6 +240,22 @@ impl ProtocolClientBuilder {
             return Err(Error::Protocol(
                 "the client builder has no roles enabled".into(),
             ));
+        }
+        if let Some(support) = &self.player_v1_support {
+            let player = self.initial_player_state.as_ref();
+            let advertises = |command| support.supported_commands.iter().any(|c| c == command);
+            if advertises("volume") && player.and_then(|p| p.volume).is_none() {
+                return Err(Error::Protocol(
+                    "initial_player_state must set volume when the player supports the volume command"
+                        .into(),
+                ));
+            }
+            if advertises("mute") && player.and_then(|p| p.muted).is_none() {
+                return Err(Error::Protocol(
+                    "initial_player_state must set muted when the player supports the mute command"
+                        .into(),
+                ));
+            }
         }
         Ok(())
     }
