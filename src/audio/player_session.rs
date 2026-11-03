@@ -190,11 +190,9 @@ impl AdmissionGate {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallState {
-    Initial,
+    Empty,
     Reserved(u64),
     Installed,
-    Detached,
-    ReservedDetached(u64),
 }
 
 /// Explains why an output-install reservation or installation was rejected.
@@ -305,7 +303,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                 controls: control_tx,
                 lifecycle,
                 admission,
-                install_state: Mutex::new(InstallState::Initial),
+                install_state: Mutex::new(InstallState::Empty),
                 next_reservation: Mutex::new(0),
             }),
         }
@@ -361,11 +359,8 @@ impl<O: OutputAdapter> Coordinator<O> {
             *next
         };
         match *install_state {
-            InstallState::Initial => *install_state = InstallState::Reserved(reservation),
-            InstallState::Detached => *install_state = InstallState::ReservedDetached(reservation),
-            InstallState::Reserved(_) | InstallState::ReservedDetached(_) => {
-                return Err(InstallRejected::Reserved)
-            }
+            InstallState::Empty => *install_state = InstallState::Reserved(reservation),
+            InstallState::Reserved(_) => return Err(InstallRejected::Reserved),
             InstallState::Installed => return Err(InstallRejected::AlreadyInstalled),
         }
         Ok(InstallPermit {
@@ -386,7 +381,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         }
         state.incarnation = state.incarnation.advance();
         let mut output = state.output.take();
-        *self.shared.install_state.lock() = InstallState::Detached;
+        *self.shared.install_state.lock() = InstallState::Empty;
         drop(state);
         let result = output.as_mut().map_or(Ok(()), |output| output.clear());
         if let Err(error) = result {
@@ -501,7 +496,7 @@ impl<O: OutputAdapter> Coordinator<O> {
                     state.output = None;
                     state.status = SessionStatus::Closed;
                     self.publish_status_locked(&mut state);
-                    *self.shared.install_state.lock() = InstallState::Detached;
+                    *self.shared.install_state.lock() = InstallState::Empty;
                     return Err(OutputError::Closed);
                 }
                 state.controls = controls;
@@ -512,7 +507,7 @@ impl<O: OutputAdapter> Coordinator<O> {
             }
             Err(error) => {
                 self.lose_output_locked(&mut state, None, error.clone(), false);
-                *self.shared.install_state.lock() = InstallState::Detached;
+                *self.shared.install_state.lock() = InstallState::Empty;
                 self.publish_status_locked(&mut state);
                 drop(state);
                 let _ = output.clear();
@@ -550,7 +545,7 @@ impl<O: OutputAdapter> Coordinator<O> {
         if let Some(mut output) = state.output.take() {
             if let Err(error) = output.clear() {
                 self.lose_output_locked(&mut state, Some(output), error.clone(), false);
-                *self.shared.install_state.lock() = InstallState::Detached;
+                *self.shared.install_state.lock() = InstallState::Empty;
                 return Err(error);
             }
             state.output = Some(output);
@@ -592,7 +587,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
         let mut install_state = self.shared.install_state.lock();
         let reservation_matches = matches!(
             *install_state,
-            InstallState::Reserved(id) | InstallState::ReservedDetached(id) if id == self.reservation
+            InstallState::Reserved(id) if id == self.reservation
         );
         if !reservation_matches {
             return Err(InstallRejected::AlreadyInstalled);
@@ -620,7 +615,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
                 error,
                 false,
             );
-            *install_state = InstallState::Detached;
+            *install_state = InstallState::Empty;
             return Err(InstallRejected::Failed);
         }
         let retained_boundary = current_boundary();
@@ -635,7 +630,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
                     error,
                     false,
                 );
-                *install_state = InstallState::Detached;
+                *install_state = InstallState::Empty;
                 return Err(InstallRejected::Failed);
             }
         }
@@ -644,7 +639,7 @@ impl<O: OutputAdapter> InstallPermit<O> {
             drop(closed);
             let _ = output.clear();
             state.status = SessionStatus::Closed;
-            *install_state = InstallState::Detached;
+            *install_state = InstallState::Empty;
             return Err(InstallRejected::Closed);
         }
         state.controls = controls.clone();
@@ -669,10 +664,7 @@ impl<O> Drop for InstallPermit<O> {
         let mut install_state = self.shared.install_state.lock();
         match *install_state {
             InstallState::Reserved(id) if id == self.reservation => {
-                *install_state = InstallState::Initial
-            }
-            InstallState::ReservedDetached(id) if id == self.reservation => {
-                *install_state = InstallState::Detached
+                *install_state = InstallState::Empty
             }
             _ => {}
         }
@@ -744,7 +736,7 @@ impl<O: OutputAdapter> PreparedAudioWork<O> {
                     error,
                     false,
                 );
-                *self.shared.install_state.lock() = InstallState::Detached;
+                *self.shared.install_state.lock() = InstallState::Empty;
                 Err(rejection)
             }
         };
