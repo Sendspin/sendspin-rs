@@ -3,7 +3,6 @@ use crate::audio::AppliedControls;
 use crate::error::Error;
 use crate::protocol::messages::{ClientState, ClientSyncState, Message, PlayerState};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 pub(crate) enum Command {
     State {
@@ -73,13 +72,9 @@ fn synchronize_player(
 }
 
 async fn send(output: &mpsc::UnboundedSender<WriteCommand>, message: Message) -> Result<(), Error> {
-    let json = serde_json::to_string(&message).map_err(|e| Error::Protocol(e.to_string()))?;
     let (ack, result) = oneshot::channel();
     output
-        .send(WriteCommand::Send {
-            msg: WsMessage::Text(json.into()),
-            ack,
-        })
+        .send(WriteCommand::Send { msg: message, ack })
         .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
     result
         .await
@@ -268,14 +263,10 @@ mod tests {
     ) -> Vec<String> {
         let mut result = Vec::new();
         for _ in 0..count {
-            let Some(WriteCommand::Send {
-                msg: WsMessage::Text(text),
-                ack,
-            }) = rx.recv().await
-            else {
+            let Some(WriteCommand::Send { msg, ack }) = rx.recv().await else {
                 break;
             };
-            result.push(text.to_string());
+            result.push(serde_json::to_string(&msg).unwrap());
             let _ = ack.send(Ok(()));
         }
         result
@@ -340,7 +331,7 @@ mod tests {
             .unwrap();
         let mut output_rx = output_rx;
         let Some(WriteCommand::Send {
-            msg: WsMessage::Text(text),
+            msg: text,
             ack: writer_ack,
         }) = timeout(Duration::from_secs(1), output_rx.recv())
             .await
@@ -348,6 +339,7 @@ mod tests {
         else {
             panic!("missing external-source state")
         };
+        let text = serde_json::to_string(&text).unwrap();
         let message: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(message["payload"]["state"], "external_source");
         assert!(!text.contains("\"player\""));
@@ -364,7 +356,7 @@ mod tests {
             })
             .unwrap();
         let Some(WriteCommand::Send {
-            msg: WsMessage::Text(text),
+            msg: text,
             ack,
         }) = timeout(Duration::from_secs(1), output_rx.recv())
             .await
@@ -372,9 +364,10 @@ mod tests {
         else {
             panic!("missing synchronized exit state")
         };
+        let text = serde_json::to_string(&text).unwrap();
         let _ = ack.send(Ok(()));
         let Some(WriteCommand::Send {
-            msg: WsMessage::Text(followup),
+            msg: followup,
             ack,
         }) = timeout(Duration::from_secs(1), output_rx.recv())
             .await
@@ -382,6 +375,7 @@ mod tests {
         else {
             panic!("missing post-exit controls")
         };
+        let followup = serde_json::to_string(&followup).unwrap();
         let _ = ack.send(Ok(()));
         let _ = result.await;
         assert!(text.contains("synchronized"));
@@ -482,7 +476,7 @@ mod tests {
         tx.send(controls(80)).unwrap();
         let mut output_rx = output_rx;
         let Some(WriteCommand::Send {
-            msg: WsMessage::Text(automatic),
+            msg: automatic,
             ack: writer_ack,
         }) = timeout(Duration::from_secs(1), output_rx.recv())
             .await
@@ -490,6 +484,7 @@ mod tests {
         else {
             panic!("missing automatic state")
         };
+        let automatic = serde_json::to_string(&automatic).unwrap();
         assert!(automatic.contains("80"));
 
         let (ack_state, result) = oneshot::channel();

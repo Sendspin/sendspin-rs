@@ -4,11 +4,16 @@
 use crate::audio::PlayerReceiver;
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
+use crate::protocol::activation::admit;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
     ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
-    PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, ServerTime, StreamEnd,
-    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
+    PlayerFormatRequest, PlayerState, RepeatMode, ServerActivate, ServerHello, ServerTime,
+    StreamEnd, StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
+};
+use crate::protocol::noise::{
+    self, Decryptor, Encryptor, Identity, PskCategory, Session, HANDSHAKE_TIMEOUT,
+    MESSAGE_TYPE_JSON,
 };
 use crate::roles::{ArtworkReceiver, VisualizerReceiver};
 use crate::sync::clock::max_error;
@@ -24,6 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{oneshot, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
@@ -33,28 +39,34 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 /// *enqueued after it* reaches the wire.
 pub(crate) enum WriteCommand {
     Send {
-        msg: WsMessage,
-        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
+        msg: Message,
+        ack: oneshot::Sender<Result<(), Error>>,
     },
     Goodbye {
         reason: GoodbyeReason,
-        ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
+        ack: oneshot::Sender<Result<(), Error>>,
     },
+    /// Close the WebSocket without sending a Sendspin message.
+    Close,
 }
 
 async fn writer_task<S>(
     mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
     mut rx: UnboundedReceiver<WriteCommand>,
+    mut encryptor: Encryptor,
+    activation: watch::Receiver<ServerActivate>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::Send { msg, ack } => {
-                let result = sink
-                    .send(msg)
-                    .await
-                    .map_err(|e| Error::WebSocket(e.to_string()));
+                let gated = strip_inactive_roles(msg, &activation.borrow());
+                let Some(msg) = gated else {
+                    let _ = ack.send(Ok(()));
+                    continue;
+                };
+                let result = noise::send_encrypted(&mut sink, &mut encryptor, &msg).await;
                 let failed = result.is_err();
                 // Ignore SendError: the caller may have dropped its receiver.
                 let _ = ack.send(result);
@@ -63,7 +75,11 @@ async fn writer_task<S>(
                 }
             }
             WriteCommand::Goodbye { reason, ack } => {
-                let _ = ack.send(perform_goodbye(&mut sink, reason).await);
+                let _ = ack.send(perform_goodbye(&mut sink, &mut encryptor, reason).await);
+                break;
+            }
+            WriteCommand::Close => {
+                let _ = sink.close().await;
                 break;
             }
         }
@@ -74,18 +90,28 @@ async fn writer_task<S>(
     // connection (see `WsSender::send_message`).
 }
 
+/// Remove role objects for roles the server has not activated. Returns
+/// `None` when nothing is left to send.
+fn strip_inactive_roles(msg: Message, activation: &ServerActivate) -> Option<Message> {
+    match msg {
+        Message::ClientState(mut state) if !activation.is_active(PLAYER_V1) => {
+            state.player = None;
+            state.state.is_some().then_some(Message::ClientState(state))
+        }
+        other => Some(other),
+    }
+}
+
 async fn perform_goodbye<S>(
     sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
+    encryptor: &mut Encryptor,
     reason: GoodbyeReason,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
-    let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
-    sink.send(WsMessage::Text(json.into()))
-        .await
-        .map_err(|e| Error::WebSocket(e.to_string()))?;
+    noise::send_encrypted(sink, encryptor, &goodbye).await?;
     sink.close()
         .await
         .map_err(|e| Error::WebSocket(e.to_string()))
@@ -110,14 +136,14 @@ pub struct Connection {
     pub clock_sync: Arc<Mutex<ClockSync>>,
     /// Sender for writing messages to the server
     pub sender: WsSender,
-    /// Controller handle, if the server granted the `controller@v1` role
-    pub controller: Option<Controller>,
-    /// The `server/hello` received during handshake. Carries `server_id`,
-    /// `connection_reason`, and `active_roles` — required for the
-    /// multi-server arbitration policy described on [`ProtocolListener`].
-    ///
-    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    /// Controller handle. Its commands fail while `controller@v1` is not active.
+    pub controller: Controller,
+    /// The server's `server_id` from `server/init`, its static public key.
+    pub server_id: String,
+    /// The `server/hello` received during the handshake.
     pub server_hello: ServerHello,
+    /// The first `server/activate`. Later activations arrive on `messages`.
+    pub activation: ServerActivate,
     /// Must be held alive; dropping aborts background tasks
     pub guard: ConnectionGuard,
 }
@@ -127,6 +153,11 @@ pub struct Connection {
 const ROLE_PLAYER: &str = "player";
 const ROLE_ARTWORK: &str = "artwork";
 const ROLE_VISUALIZER: &str = "visualizer";
+
+const PLAYER_V1: &str = "player@v1";
+const ARTWORK_V1: &str = "artwork@v1";
+const VISUALIZER_V1: &str = "visualizer@v1";
+const CONTROLLER_V1: &str = "controller@v1";
 
 /// Which role streams are currently active, updated by the message router from
 /// `stream/start` and `stream/end`.
@@ -223,22 +254,11 @@ impl WsSender {
     }
 
     async fn send_raw(&self, msg: Message) -> Result<(), Error> {
-        let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
         // Time pings go out in bursts for as long as the connection lives; keep
         // that housekeeping at trace so debug shows only meaningful traffic.
-        let level = if matches!(msg, Message::ClientTime(_)) {
-            log::Level::Trace
-        } else {
-            log::Level::Debug
-        };
-        log::log!(level, "Sending message: {}", json);
-
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
-            .send(WriteCommand::Send {
-                msg: WsMessage::Text(json.into()),
-                ack: ack_tx,
-            })
+            .send(WriteCommand::Send { msg, ack: ack_tx })
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
 
         // A cancelled ack means the writer dropped the command unsent — the
@@ -358,11 +378,6 @@ impl WsSender {
     /// response to changing network, CPU, or display conditions. Fields left
     /// as `None` are unconstrained by the client.
     ///
-    /// This low-level sender does not enforce negotiated roles; callers should
-    /// only use it for connections where the server granted the requested role.
-    /// Use [`Connection::server_hello`] when you need to inspect the negotiated
-    /// roles before sending.
-    ///
     /// A requested component is rejected unless that role's stream is currently
     /// active (between its `stream/start` and `stream/end`): there is nothing to
     /// renegotiate for a role the server is not streaming.
@@ -446,8 +461,8 @@ impl WsSender {
     fn send_goodbye(
         &self,
         reason: GoodbyeReason,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), Error>>, Error> {
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    ) -> Result<oneshot::Receiver<Result<(), Error>>, Error> {
+        let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send(WriteCommand::Goodbye {
                 reason,
@@ -456,19 +471,46 @@ impl WsSender {
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
         Ok(ack_rx)
     }
+
+    fn close(&self) {
+        // A failed send means the writer is already gone.
+        let _ = self.tx.send(WriteCommand::Close);
+    }
+
+    /// Queue a report of the retained player object without waiting for it.
+    fn queue_player_report(&self) {
+        let Some(reporter) = &self.reporter else {
+            return;
+        };
+        let (ack, _) = oneshot::channel();
+        let _ = reporter.send(crate::protocol::state_reporter::Command::State {
+            state: ClientState {
+                state: None,
+                player: Some(PlayerState::default()),
+            },
+            boundary_applied_controls: self.controls.borrow().clone(),
+            ack,
+        });
+    }
 }
 
 /// Controller handle for sending playback commands to the server.
 ///
-/// Only available when the server grants the `controller@v1` role.
+/// Commands fail while the server has not activated `controller@v1`.
 /// Obtained via [`ProtocolClient::split()`].
 #[derive(Debug, Clone)]
 pub struct Controller {
     sender: WsSender,
+    activation: watch::Receiver<ServerActivate>,
 }
 
 impl Controller {
     async fn send_controller_command(&self, cmd: ControllerCommand) -> Result<(), Error> {
+        if !self.activation.borrow().is_active(CONTROLLER_V1) {
+            return Err(Error::Protocol(
+                "the controller@v1 role is not active".to_string(),
+            ));
+        }
         let msg = Message::ClientCommand(ClientCommand {
             controller: Some(cmd),
         });
@@ -846,6 +888,7 @@ async fn time_sync(
     clock: Arc<dyn Clock>,
     clock_sync: Arc<Mutex<ClockSync>>,
     mut replies: UnboundedReceiver<(ServerTime, i64)>,
+    mut synced: Option<oneshot::Sender<()>>,
 ) {
     let reply_max_error = |(st, t4): &(ServerTime, i64)| {
         max_error(
@@ -901,6 +944,11 @@ async fn time_sync(
                     t4,
                 )
             });
+            if sync.is_synchronized() {
+                if let Some(synced) = synced.take() {
+                    let _ = synced.send(());
+                }
+            }
             if accepted && !sync.is_synchronized() {
                 Duration::ZERO
             } else if !sync.is_settled() {
@@ -921,10 +969,22 @@ pub struct ProtocolClient {
     visualizer: VisualizerReceiver,
     message_rx: UnboundedReceiver<Message>,
     clock_sync: Arc<Mutex<ClockSync>>,
+    server_id: String,
     server_hello: ServerHello,
+    first_activation: ServerActivate,
+    activation: watch::Receiver<ServerActivate>,
     stream_state: Arc<StreamState>,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
+}
+
+/// What a connection needs from the builder.
+pub(crate) struct ConnectParams {
+    pub(crate) identity: Identity,
+    pub(crate) hello: ClientHello,
+    pub(crate) initial_state: ClientState,
+    pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) automatic_player_state: bool,
 }
 
 /// Aborts background tasks on drop. Hold this alive for the lifetime of the
@@ -1025,13 +1085,7 @@ impl Connection {
 
 impl ProtocolClient {
     /// Connect to Sendspin server
-    pub(crate) async fn connect<R>(
-        request: R,
-        hello: ClientHello,
-        initial_state: ClientState,
-        clock: Arc<dyn Clock>,
-        automatic_player_state: bool,
-    ) -> Result<Self, Error>
+    pub(crate) async fn connect<R>(request: R, params: ConnectParams) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
     {
@@ -1039,103 +1093,67 @@ impl ProtocolClient {
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        Self::drive(
-            ws_stream,
-            hello,
-            initial_state,
-            clock,
-            automatic_player_state,
-        )
-        .await
+        Self::drive(ws_stream, params).await
     }
 
-    /// Drive the protocol-client state machine over an already-handshaked
-    /// WebSocket stream. Shared between outbound `connect()` and inbound
+    /// Drive the protocol-client state machine over an already-upgraded
+    /// WebSocket stream, through the first `server/activate` and the initial
+    /// `client/state`. Shared between outbound `connect()` and inbound
     /// acceptor paths.
     pub(crate) async fn drive<S>(
         ws_stream: WebSocketStream<S>,
-        hello: ClientHello,
-        initial_state: ClientState,
-        clock: Arc<dyn Clock>,
-        automatic_player_state: bool,
+        params: ConnectParams,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let ConnectParams {
+            identity,
+            hello,
+            initial_state,
+            clock,
+            automatic_player_state,
+        } = params;
+        let unpaired_access = hello.unpaired_access.enabled;
         let (mut write, mut read) = ws_stream.split();
 
-        // The handshake exchange (hello + state) sends directly on the sink
-        // rather than through the writer task, so handshake failures are
-        // returned synchronously instead of through an ack channel.
-        let hello_msg = Message::ClientHello(hello);
-        let hello_json =
-            serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        log::debug!("Sending client/hello: {}", hello_json);
-        write
-            .send(WsMessage::Text(hello_json.into()))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
-
-        log::debug!("Waiting for server/hello...");
-        let server_hello = loop {
-            let Some(result) = read.next().await else {
-                log::error!("Connection closed before receiving server/hello");
-                return Err(Error::Connection("No server hello received".to_string()));
-            };
-            match result {
-                Ok(WsMessage::Text(text)) => {
-                    log::trace!("Received text frame: {}", text);
-                    let msg: Message = serde_json::from_str(&text).map_err(|e| {
-                        log::error!("Failed to parse server message: {} (payload: {})", e, text);
-                        Error::Protocol(e.to_string())
-                    })?;
-
-                    match msg {
-                        Message::ServerHello(server_hello) => {
-                            log::debug!("Received server/hello: {:?}", server_hello);
-                            log::info!(
-                                "Connected to server: {} ({})",
-                                server_hello.name,
-                                server_hello.server_id
-                            );
-                            break server_hello;
-                        }
-                        _ => {
-                            log::error!("Expected server/hello, got: {:?}", msg);
-                            return Err(Error::Protocol("Expected server/hello".to_string()));
-                        }
-                    }
-                }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                    log::debug!("Received Ping/Pong, continuing to wait for server/hello");
-                    continue;
-                }
-                Ok(WsMessage::Close(_)) => {
-                    log::error!("Server closed connection");
-                    return Err(Error::Connection("Server closed connection".to_string()));
-                }
-                Ok(other) => {
-                    log::warn!(
-                        "Unexpected message type while waiting for hello: {:?}",
-                        other
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    log::error!("WebSocket error: {}", e);
-                    return Err(Error::WebSocket(e.to_string()));
-                }
+        // Setup messages go directly on the sink rather than through the
+        // writer task, so failures are returned synchronously.
+        let Session {
+            server_id,
+            psk_category,
+            mut encryptor,
+            mut decryptor,
+        } = noise::handshake(&mut write, &mut read, &identity).await?;
+        let server_hello = match noise::recv_encrypted(&mut read, &mut decryptor).await? {
+            Message::ServerHello(server_hello) => server_hello,
+            other => {
+                return Err(Error::Protocol(format!(
+                    "expected server/hello, got {other:?}"
+                )))
             }
         };
-
-        let state_msg = Message::ClientState(initial_state.clone());
-        let state_json =
-            serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        log::debug!("Sending initial client/state: {}", state_json);
-        write
-            .send(WsMessage::Text(state_json.into()))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
+        log::info!("Connected to server: {} ({})", server_hello.name, server_id);
+        noise::send_encrypted(&mut write, &mut encryptor, &Message::ClientHello(hello)).await?;
+        let activation = match noise::recv_encrypted(&mut read, &mut decryptor).await? {
+            Message::ServerActivate(activation) => activation,
+            other => {
+                return Err(Error::Protocol(format!(
+                    "expected server/activate, got {other:?}"
+                )))
+            }
+        };
+        let activation = match admit(None, activation, psk_category, unpaired_access) {
+            Ok(activation) => activation,
+            Err(reason) => {
+                log::warn!("Rejecting the server's activation: {reason:?}");
+                perform_goodbye(&mut write, &mut encryptor, reason.clone()).await?;
+                return Err(Error::Connection(format!(
+                    "rejected server/activate ({reason:?})"
+                )));
+            }
+        };
+        let (activation_tx, activation_rx) = watch::channel(activation.clone());
 
         let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
         let initial_controls = crate::audio::AppliedControls {
@@ -1155,207 +1173,98 @@ impl ProtocolClient {
                 .and_then(|p| p.static_delay_ms)
                 .unwrap_or(0),
         };
-        let (mut sinks, player, artwork, visualizer, message_rx) =
+        let (sinks, player, artwork, visualizer, message_rx) =
             crate::protocol::routing::ReceiveSinks::channel(initial_controls);
         let controls = player.controls();
-        let (report_tx, report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (report_tx, report_rx) = unbounded_channel();
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let stream_state = Arc::new(StreamState::default());
-
-        let writer_handle = tokio::spawn(writer_task(write, out_rx));
-        let reporter_handle = if automatic_player_state
-            && initial_state.player.is_some()
-            && server_hello
-                .active_roles
-                .iter()
-                .any(|role| role == "player@v1")
-        {
-            Some(tokio::spawn(crate::protocol::state_reporter::run(
-                crate::protocol::state_reporter::Config {
-                    commands: report_rx,
-                    controls: controls.clone(),
-                    initial: initial_state.clone(),
-                    output: out_tx.clone(),
-                },
-            )))
-        } else {
-            None
+        let sender = WsSender {
+            tx: out_tx.clone(),
+            reporter: (automatic_player_state && initial_state.player.is_some())
+                .then_some(report_tx),
+            controls: controls.clone(),
+            stream_state: Arc::clone(&stream_state),
         };
 
+        let writer_handle =
+            tokio::spawn(writer_task(write, out_rx, encryptor, activation_rx.clone()));
+        let (synced_tx, synced_rx) = oneshot::channel();
         let (time_reply_tx, time_reply_rx) = unbounded_channel();
-        let clock_router = Arc::clone(&clock);
-        let stream_state_router = Arc::clone(&stream_state);
+        let router = Router {
+            decryptor,
+            sinks,
+            time_replies: time_reply_tx,
+            clock: Arc::clone(&clock),
+            stream_state: Arc::clone(&stream_state),
+            activation: activation_tx,
+            psk_category,
+            unpaired_access,
+            sender: sender.clone(),
+        };
         // The router task handle is used by ConnectionGuard::closed() observers.
-        let router_handle = tokio::spawn(async move {
-            Self::message_router(
-                read,
-                &mut sinks,
-                time_reply_tx,
-                clock_router,
-                stream_state_router,
-            )
-            .await;
-        });
+        let router_handle = tokio::spawn(router.run(read));
 
         let sync_handle = tokio::spawn(time_sync(
-            WsSender {
-                tx: out_tx.clone(),
-                reporter: reporter_handle.as_ref().map(|_| report_tx.clone()),
-                controls: controls.clone(),
-                stream_state: Arc::clone(&stream_state),
-            },
+            sender.clone(),
             clock,
             Arc::clone(&clock_sync),
             time_reply_rx,
+            Some(synced_tx),
         ));
 
+        // Dropped on an early return, which aborts the tasks spawned above.
+        let mut guard = ConnectionGuard {
+            sender: sender.clone(),
+            router_handle: Some(router_handle),
+            sync_handle: Some(sync_handle),
+            writer_handle: Some(writer_handle),
+            reporter_handle: None,
+        };
+
+        if activation.is_active(PLAYER_V1) {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, synced_rx).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    return Err(Error::Connection(
+                        "connection closed before the clock synchronized".to_string(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(Error::Connection(
+                        "the clock did not synchronize in time".to_string(),
+                    ))
+                }
+            }
+        }
+        sender
+            .send_raw(Message::ClientState(initial_state.clone()))
+            .await?;
+        if sender.reporter.is_some() {
+            guard.reporter_handle = Some(tokio::spawn(crate::protocol::state_reporter::run(
+                crate::protocol::state_reporter::Config {
+                    commands: report_rx,
+                    controls,
+                    initial: initial_state,
+                    output: out_tx.clone(),
+                },
+            )));
+        }
+
         Ok(Self {
-            out_tx: out_tx.clone(),
+            out_tx,
             player,
             artwork,
             visualizer,
             message_rx,
             clock_sync,
+            server_id,
             server_hello,
-            stream_state: Arc::clone(&stream_state),
-            guard: ConnectionGuard {
-                sender: WsSender {
-                    tx: out_tx,
-                    reporter: reporter_handle.as_ref().map(|_| report_tx),
-                    controls,
-                    stream_state,
-                },
-                router_handle: Some(router_handle),
-                sync_handle: Some(sync_handle),
-                writer_handle: Some(writer_handle),
-                reporter_handle,
-            },
+            first_activation: activation,
+            activation: activation_rx,
+            stream_state,
+            guard,
         })
-    }
-
-    async fn message_router<S>(
-        mut read: SplitStream<WebSocketStream<S>>,
-        sinks: &mut crate::protocol::routing::ReceiveSinks,
-        time_replies: UnboundedSender<(ServerTime, i64)>,
-        clock: Arc<dyn Clock>,
-        stream_state: Arc<StreamState>,
-    ) where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut audio_chunk_count = 0u64;
-        let mut visualizer_chunk_count = 0u64;
-
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(WsMessage::Binary(data)) => match BinaryFrame::from_bytes(&data) {
-                    Ok(BinaryFrame::Audio(chunk)) => {
-                        audio_chunk_count = match audio_chunk_count.checked_add(1) {
-                            Some(count) => count,
-                            None => {
-                                log::error!("Audio chunk counter exhausted; closing router");
-                                sinks.close();
-                                break;
-                            }
-                        };
-                        if should_log_sample(audio_chunk_count) {
-                            log::trace!(
-                                "Received audio chunk: chunk={}, timestamp={}µs, payload_bytes={}, wire_bytes={}",
-                                audio_chunk_count,
-                                chunk.timestamp,
-                                chunk.data.len(),
-                                data.len()
-                            );
-                        }
-                        sinks.dispatch_binary(BinaryFrame::Audio(chunk));
-                    }
-                    Ok(BinaryFrame::Artwork(chunk)) => {
-                        // Artwork arrives in short bursts on track changes, so
-                        // every chunk is worth a line; audio and visualizer
-                        // chunks stream continuously and are sampled instead.
-                        log::trace!(
-                            "Received artwork chunk: channel={}, timestamp={}µs, payload_bytes={}",
-                            chunk.channel,
-                            chunk.timestamp,
-                            chunk.data.len()
-                        );
-                        sinks.dispatch_binary(BinaryFrame::Artwork(chunk));
-                    }
-                    Ok(BinaryFrame::Visualizer(chunk)) => {
-                        visualizer_chunk_count = match visualizer_chunk_count.checked_add(1) {
-                            Some(count) => count,
-                            None => {
-                                log::error!("Visualizer chunk counter exhausted; closing router");
-                                sinks.close();
-                                break;
-                            }
-                        };
-                        if should_log_sample(visualizer_chunk_count) {
-                            log::trace!(
-                                "Received visualizer chunk: chunk={}, timestamp={}µs, payload_bytes={}",
-                                visualizer_chunk_count,
-                                chunk.timestamp,
-                                chunk.data.len()
-                            );
-                        }
-                        sinks.dispatch_binary(BinaryFrame::Visualizer(chunk));
-                    }
-                    Ok(BinaryFrame::Unknown { type_id, .. }) => {
-                        log::warn!("Received unknown binary type: {}", type_id);
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to parse binary frame: {}", e);
-                    }
-                },
-                Ok(WsMessage::Text(text)) => {
-                    // Capture receive time before deserialization so
-                    // t4 is as close to the true arrival time as possible.
-                    let t4 = clock.now_micros();
-                    log::trace!("Received text frame: {}", text);
-                    match serde_json::from_str::<Message>(&text) {
-                        Ok(msg) => {
-                            // ServerTime is consumed here for clock sync
-                            // and intentionally NOT forwarded to message_rx
-                            // consumers — it's an internal protocol detail.
-                            // It also arrives in bursts for as long as the
-                            // connection lives, so it stays out of the debug
-                            // view; ClockSync::update logs the computed sync
-                            // state instead.
-                            if let Message::ServerTime(st) = msg {
-                                let _ = time_replies.send((st, t4));
-                            } else {
-                                log::debug!("Received message: {:?}", msg);
-                                // Settle the request-format gate before
-                                // forwarding, so a consumer reacting to this
-                                // stream/start or stream/end sees current state.
-                                match &msg {
-                                    Message::StreamStart(start) => {
-                                        stream_state.note_stream_start(start)
-                                    }
-                                    Message::StreamEnd(end) => stream_state.note_stream_end(end),
-                                    _ => {}
-                                }
-                                sinks.dispatch_message(msg);
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to parse message: {} (payload: {})", e, text);
-                        }
-                    }
-                }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
-                Ok(WsMessage::Close(_)) => {
-                    log::info!("Server closed connection");
-                    break;
-                }
-                Err(e) => {
-                    log::error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        sinks.close();
-        log::debug!("Message router: WebSocket stream ended");
     }
 
     /// Gracefully disconnect: sends `client/goodbye`, closes the WebSocket,
@@ -1393,13 +1302,19 @@ impl ProtocolClient {
         Arc::clone(&self.clock_sync)
     }
 
-    /// The `server/hello` received during handshake. Carries `server_id`,
-    /// `connection_reason`, and `active_roles` — required for the
-    /// multi-server arbitration policy described on [`ProtocolListener`].
-    ///
-    /// [`ProtocolListener`]: crate::protocol::listener::ProtocolListener
+    /// The server's `server_id` from `server/init`, its static public key.
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    /// The `server/hello` received during the handshake.
     pub fn server_hello(&self) -> &ServerHello {
         &self.server_hello
+    }
+
+    /// The first `server/activate`, with `active_roles` filled in.
+    pub fn activation(&self) -> &ServerActivate {
+        &self.first_activation
     }
 
     /// Split into separate receivers for concurrent processing.
@@ -1414,14 +1329,10 @@ impl ProtocolClient {
             controls: self.guard.sender.controls.clone(),
             stream_state: self.stream_state,
         };
-        let controller = self
-            .server_hello
-            .active_roles
-            .iter()
-            .any(|r| r == "controller@v1")
-            .then(|| Controller {
-                sender: sender.clone(),
-            });
+        let controller = Controller {
+            sender: sender.clone(),
+            activation: self.activation,
+        };
         Connection {
             messages: self.message_rx,
             player: self.player,
@@ -1430,9 +1341,220 @@ impl ProtocolClient {
             clock_sync: self.clock_sync,
             sender,
             controller,
+            server_id: self.server_id,
             server_hello: self.server_hello,
+            activation: self.first_activation,
             guard: self.guard,
         }
+    }
+}
+
+/// Reads the server's messages, decrypting them and applying protocol state
+/// before handing them to the role sinks.
+struct Router {
+    decryptor: Decryptor,
+    sinks: crate::protocol::routing::ReceiveSinks,
+    time_replies: UnboundedSender<(ServerTime, i64)>,
+    clock: Arc<dyn Clock>,
+    stream_state: Arc<StreamState>,
+    activation: watch::Sender<ServerActivate>,
+    psk_category: PskCategory,
+    unpaired_access: bool,
+    sender: WsSender,
+}
+
+impl Router {
+    async fn run<S>(mut self, mut read: SplitStream<WebSocketStream<S>>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut audio_chunk_count = 0u64;
+        let mut visualizer_chunk_count = 0u64;
+
+        while let Some(msg) = read.next().await {
+            let data = match msg {
+                Ok(WsMessage::Binary(data)) => data,
+                Ok(WsMessage::Text(_)) => {
+                    log::warn!("Closing the connection: cleartext message after the handshake");
+                    self.sender.close();
+                    break;
+                }
+                Ok(WsMessage::Close(_)) => {
+                    log::info!("Server closed connection");
+                    break;
+                }
+                Err(e) => {
+                    log::error!("WebSocket error: {}", e);
+                    break;
+                }
+                Ok(_) => continue,
+            };
+            let plaintext = match self.decryptor.open(&data) {
+                Ok(Some(plaintext)) => plaintext,
+                Ok(None) => continue,
+                Err(e) => {
+                    log::warn!("Closing the connection: {e}");
+                    self.sender.close();
+                    break;
+                }
+            };
+            // Arrival time is taken once the message is decrypted and reassembled.
+            let arrival = self.clock.now_micros();
+            if plaintext[0] == MESSAGE_TYPE_JSON {
+                if !self.handle_json(&plaintext[1..], arrival) {
+                    break;
+                }
+                continue;
+            }
+            match BinaryFrame::from_bytes(&plaintext) {
+                Ok(BinaryFrame::Audio(chunk)) => {
+                    audio_chunk_count = match audio_chunk_count.checked_add(1) {
+                        Some(count) => count,
+                        None => {
+                            log::error!("Audio chunk counter exhausted; closing router");
+                            break;
+                        }
+                    };
+                    if should_log_sample(audio_chunk_count) {
+                        log::trace!(
+                            "Received audio chunk: chunk={}, timestamp={}µs, payload_bytes={}, wire_bytes={}",
+                            audio_chunk_count,
+                            chunk.timestamp,
+                            chunk.data.len(),
+                            data.len()
+                        );
+                    }
+                    self.sinks.dispatch_binary(BinaryFrame::Audio(chunk));
+                }
+                Ok(BinaryFrame::Artwork(chunk)) => {
+                    // Artwork arrives in short bursts on track changes, so
+                    // every chunk is worth a line; audio and visualizer
+                    // chunks stream continuously and are sampled instead.
+                    log::trace!(
+                        "Received artwork chunk: channel={}, timestamp={}µs, payload_bytes={}",
+                        chunk.channel,
+                        chunk.timestamp,
+                        chunk.data.len()
+                    );
+                    self.sinks.dispatch_binary(BinaryFrame::Artwork(chunk));
+                }
+                Ok(BinaryFrame::Visualizer(chunk)) => {
+                    visualizer_chunk_count = match visualizer_chunk_count.checked_add(1) {
+                        Some(count) => count,
+                        None => {
+                            log::error!("Visualizer chunk counter exhausted; closing router");
+                            break;
+                        }
+                    };
+                    if should_log_sample(visualizer_chunk_count) {
+                        log::trace!(
+                            "Received visualizer chunk: chunk={}, timestamp={}µs, payload_bytes={}",
+                            visualizer_chunk_count,
+                            chunk.timestamp,
+                            chunk.data.len()
+                        );
+                    }
+                    self.sinks.dispatch_binary(BinaryFrame::Visualizer(chunk));
+                }
+                Ok(BinaryFrame::Unknown { type_id, .. }) => {
+                    log::warn!("Received unknown binary type: {}", type_id);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse binary frame: {}", e);
+                }
+            }
+        }
+        self.sinks.close();
+        log::debug!("Message router: WebSocket stream ended");
+    }
+
+    /// Handle one JSON message. Returns `false` when the connection is closing.
+    fn handle_json(&mut self, json: &[u8], arrival: i64) -> bool {
+        let msg = match serde_json::from_slice::<Message>(json) {
+            Ok(msg) => msg,
+            Err(e) => {
+                log::warn!(
+                    "Failed to parse message: {} (payload: {})",
+                    e,
+                    String::from_utf8_lossy(json)
+                );
+                return true;
+            }
+        };
+        match msg {
+            // ServerTime is consumed here for clock sync and intentionally
+            // NOT forwarded to message_rx consumers — it's an internal
+            // protocol detail. It also arrives at 1Hz for as long as the
+            // connection lives, so it stays out of the debug view;
+            // ClockSync::update logs the computed sync state instead.
+            Message::ServerTime(st) => {
+                let _ = self.time_replies.send((st, arrival));
+            }
+            Message::ServerActivate(activation) => return self.apply_activation(activation),
+            msg => {
+                log::debug!("Received message: {:?}", msg);
+                // Settle the request-format gate before forwarding, so a
+                // consumer reacting to this stream/start or stream/end sees
+                // current state.
+                match &msg {
+                    Message::StreamStart(start) => self.stream_state.note_stream_start(start),
+                    Message::StreamEnd(end) => self.stream_state.note_stream_end(end),
+                    _ => {}
+                }
+                self.sinks.dispatch_message(msg);
+            }
+        }
+        true
+    }
+
+    /// Apply a later `server/activate`. Returns `false` when it was rejected
+    /// and the connection is closing.
+    fn apply_activation(&mut self, activation: ServerActivate) -> bool {
+        log::debug!("Received server/activate: {:?}", activation);
+        let current = self.activation.borrow().clone();
+        let next = match admit(
+            current.active_roles.as_deref(),
+            activation,
+            self.psk_category,
+            self.unpaired_access,
+        ) {
+            Ok(next) => next,
+            Err(reason) => {
+                log::warn!("Rejecting the server's activation: {reason:?}");
+                let _ = self.sender.send_goodbye(reason);
+                return false;
+            }
+        };
+        // Removing a role stops its stream even if no stream/end preceded it.
+        let ended: Vec<String> = [
+            (PLAYER_V1, ROLE_PLAYER, self.stream_state.is_player_active()),
+            (
+                ARTWORK_V1,
+                ROLE_ARTWORK,
+                self.stream_state.is_artwork_active(),
+            ),
+            (
+                VISUALIZER_V1,
+                ROLE_VISUALIZER,
+                self.stream_state.is_visualizer_active(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(role, _, streaming)| *streaming && !next.is_active(role))
+        .map(|(_, stream, _)| stream.to_string())
+        .collect();
+        if !ended.is_empty() {
+            let end = StreamEnd { roles: Some(ended) };
+            self.stream_state.note_stream_end(&end);
+            self.sinks.dispatch_message(Message::StreamEnd(end));
+        }
+        let player_added = next.is_active(PLAYER_V1) && !current.is_active(PLAYER_V1);
+        self.activation.send_replace(next.clone());
+        if player_added {
+            self.sender.queue_player_report();
+        }
+        self.sinks.dispatch_message(Message::ServerActivate(next));
+        true
     }
 }
 
@@ -1461,13 +1583,48 @@ mod tests {
         }
     }
 
+    fn test_router(
+        decryptor: Decryptor,
+        sinks: crate::protocol::routing::ReceiveSinks,
+        clock: Arc<dyn Clock>,
+        time_replies: UnboundedSender<(ServerTime, i64)>,
+    ) -> Router {
+        let stream_state = Arc::new(StreamState::default());
+        let (tx, _) = unbounded_channel();
+        Router {
+            decryptor,
+            sinks,
+            time_replies,
+            clock,
+            stream_state: Arc::clone(&stream_state),
+            activation: watch::channel(ServerActivate {
+                activities: vec![],
+                active_roles: Some(vec![PLAYER_V1.to_string()]),
+            })
+            .0,
+            psk_category: PskCategory::Sentinel,
+            unpaired_access: true,
+            sender: WsSender {
+                tx,
+                reporter: None,
+                controls: watch::channel(AppliedControls {
+                    volume: 100,
+                    muted: false,
+                    static_delay_ms: 0,
+                })
+                .1,
+                stream_state,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn router_consumes_server_time_after_all_endpoints_are_dropped() {
         let (left, right) = duplex(4096);
         let mut server = WebSocketStream::from_raw_socket(left, Role::Server, None).await;
         let client = WebSocketStream::from_raw_socket(right, Role::Client, None).await;
         let (_, read) = client.split();
-        let (mut sinks, player, artwork, visualizer, messages) =
+        let (sinks, player, artwork, visualizer, messages) =
             crate::protocol::routing::ReceiveSinks::channel(AppliedControls {
                 volume: 100,
                 muted: false,
@@ -1478,57 +1635,49 @@ mod tests {
         drop(visualizer);
         drop(messages);
 
+        let (mut encryptor, decryptor) = noise::test_session_pair();
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
         let (time_reply_tx, mut time_reply_rx) = unbounded_channel();
-        let stream_state = Arc::new(StreamState::default());
-        let mut router = tokio::spawn(async move {
-            ProtocolClient::message_router(read, &mut sinks, time_reply_tx, clock, stream_state)
-                .await;
-        });
+        let router = test_router(decryptor, sinks, clock, time_reply_tx);
+        let mut router = tokio::spawn(router.run(read));
 
-        server
-            .send(WsMessage::Text(
-                serde_json::to_string(&Message::StreamStart(StreamStart {
-                    player: Some(crate::protocol::messages::StreamPlayerConfig {
-                        codec: "pcm".into(),
-                        sample_rate: 48_000,
-                        channels: 2,
-                        bit_depth: 16,
-                        codec_header: None,
-                    }),
-                    artwork: None,
-                    visualizer: None,
-                }))
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let mut audio = vec![binary_types::PLAYER_AUDIO];
-        audio.extend_from_slice(&42_i64.to_be_bytes());
+        let mut audio = 42_i64.to_be_bytes().to_vec();
         audio.extend_from_slice(&[0, 0x10, 0, 0xf0]);
-        server.send(WsMessage::Binary(audio.into())).await.unwrap();
-        server
-            .send(WsMessage::Text(
-                serde_json::to_string(&Message::ServerCommand(
+        let mut frames = encryptor
+            .seal_json(&Message::StreamStart(StreamStart {
+                player: Some(crate::protocol::messages::StreamPlayerConfig {
+                    codec: "pcm".into(),
+                    sample_rate: 48_000,
+                    channels: 2,
+                    bit_depth: 16,
+                    codec_header: None,
+                }),
+                artwork: None,
+                visualizer: None,
+            }))
+            .unwrap();
+        frames.extend(encryptor.seal(binary_types::PLAYER_AUDIO, &audio).unwrap());
+        frames.extend(
+            encryptor
+                .seal_json(&Message::ServerCommand(
                     crate::protocol::messages::ServerCommand { player: None },
                 ))
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
-        let server_time = Message::ServerTime(crate::protocol::messages::ServerTime {
-            client_transmitted: 1_000,
-            server_received: 2_000,
-            server_transmitted: 3_000,
-        });
-        server
-            .send(WsMessage::Text(
-                serde_json::to_string(&server_time).unwrap().into(),
-            ))
-            .await
-            .unwrap();
+                .unwrap(),
+        );
+        frames.extend(
+            encryptor
+                .seal_json(&Message::ServerTime(
+                    crate::protocol::messages::ServerTime {
+                        client_transmitted: 1_000,
+                        server_received: 2_000,
+                        server_transmitted: 3_000,
+                    },
+                ))
+                .unwrap(),
+        );
+        for frame in frames {
+            server.send(frame).await.unwrap();
+        }
         server.send(WsMessage::Close(None)).await.unwrap();
         match tokio::time::timeout(Duration::from_secs(5), &mut router).await {
             Ok(result) => {

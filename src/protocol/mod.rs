@@ -11,6 +11,10 @@ pub mod listener;
 pub mod manager;
 /// Protocol message type definitions and serialization
 pub mod messages;
+pub(crate) mod activation;
+pub(crate) mod noise;
+/// Byte storage for long-lived client state
+pub mod persistence;
 pub(crate) mod routing;
 mod state_reporter;
 

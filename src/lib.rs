@@ -29,6 +29,7 @@ pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;
 pub use protocol::manager::{ConnectionManager, ManagedConnection, ManagerConfig};
 pub use protocol::messages::ServerHello;
+pub use protocol::persistence::{FileStore, MemoryStore, PersistenceProvider};
 pub use sync::raw_clock::{Clock, DefaultClock};
 
 /// Result type for sendspin operations
@@ -60,5 +61,9 @@ pub mod error {
         /// Audio output error
         #[error("Audio output error: {0}")]
         Output(String),
+
+        /// Loading or saving persisted client state failed
+        #[error("Persistence error: {0}")]
+        Persistence(String),
     }
 }
