@@ -37,7 +37,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 /// *enqueued after it* reaches the wire.
 pub(crate) enum WriteCommand {
     Send {
-        msg: Message,
+        msg: Box<Message>,
         ack: oneshot::Sender<Result<(), Error>>,
     },
     Goodbye {
@@ -59,7 +59,7 @@ async fn writer_task<S>(
     while let Some(cmd) = rx.recv().await {
         match cmd {
             WriteCommand::Send { msg, ack } => {
-                let gated = strip_inactive_roles(msg, &activation.borrow());
+                let gated = strip_inactive_roles(*msg, &activation.borrow());
                 let Some(msg) = gated else {
                     let _ = ack.send(Ok(()));
                     continue;
@@ -254,7 +254,10 @@ impl WsSender {
     async fn send_raw(&self, msg: Message) -> Result<(), Error> {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
-            .send(WriteCommand::Send { msg, ack: ack_tx })
+            .send(WriteCommand::Send {
+                msg: Box::new(msg),
+                ack: ack_tx,
+            })
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
 
         // A cancelled ack means the writer dropped the command unsent — the
