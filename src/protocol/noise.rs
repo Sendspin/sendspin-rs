@@ -140,7 +140,9 @@ where
         match frame {
             Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
             Some(Ok(WsMessage::Close(_))) | None => {
-                return Err(Error::Connection("server closed the connection".to_string()))
+                return Err(Error::Connection(
+                    "server closed the connection".to_string(),
+                ))
             }
             Some(Ok(message)) => return Ok(message),
             Some(Err(e)) => return Err(Error::WebSocket(e.to_string())),
@@ -193,13 +195,19 @@ where
                 error.reason
             )))
         }
-        _ => return Err(Error::Protocol(format!("unusable server/init: {server_init}"))),
+        _ => {
+            return Err(Error::Protocol(format!(
+                "unusable server/init: {server_init}"
+            )))
+        }
     };
     let server_key: [u8; 32] = URL_SAFE_NO_PAD
         .decode(&server_id)
         .ok()
         .and_then(|key| key.try_into().ok())
-        .ok_or_else(|| Error::Protocol(format!("server_id is not a Curve25519 key: {server_id}")))?;
+        .ok_or_else(|| {
+            Error::Protocol(format!("server_id is not a Curve25519 key: {server_id}"))
+        })?;
 
     let prologue = [client_init.as_bytes(), server_init.as_bytes()].concat();
     let mut noise = noise_builder()
@@ -231,7 +239,9 @@ where
     let psk_category = PskCategory::Sentinel;
     noise.set_psk(2, &SENTINEL_PSK).map_err(noise_error)?;
 
-    let len = noise.write_message(b"{}", &mut buffer).map_err(noise_error)?;
+    let len = noise
+        .write_message(b"{}", &mut buffer)
+        .map_err(noise_error)?;
     let message2 = serde_json::to_string(&Message::NoiseHandshake(NoiseHandshake {
         data: URL_SAFE_NO_PAD.encode(&buffer[..len]),
     }))
@@ -240,11 +250,7 @@ where
         .await
         .map_err(|e| Error::WebSocket(e.to_string()))?;
 
-    let transport = Arc::new(
-        noise
-            .into_stateless_transport_mode()
-            .map_err(noise_error)?,
-    );
+    let transport = Arc::new(noise.into_stateless_transport_mode().map_err(noise_error)?);
     Ok(Session {
         server_id,
         psk_category,

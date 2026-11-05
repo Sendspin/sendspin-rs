@@ -9,7 +9,7 @@ use sendspin::protocol::messages::{
     AudioFormatSpec, PlayerState, PlayerStateCommand, PlayerV1Support,
 };
 use sendspin::sync::ClockSync;
-use sendspin::ProtocolClientBuilder;
+use sendspin::{FileStore, ProtocolClientBuilder};
 use std::error::Error;
 
 type SharedClock = std::sync::Arc<parking_lot::Mutex<ClockSync>>;
@@ -108,11 +108,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let name = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "Sendspin-RS Player".into());
-    let id = std::env::args()
+    let data_dir = std::env::args()
         .nth(3)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(|| "sendspin-player-data".into());
     let client = ProtocolClientBuilder::builder()
-        .client_id(id)
+        .persistence(std::sync::Arc::new(FileStore::new(data_dir)))
+        .unpaired_access(true)
         .name(name)
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![

@@ -1,6 +1,7 @@
 // ABOUTME: Protocol implementation for Sendspin WebSocket protocol
 // ABOUTME: Message types, serialization, and WebSocket client
 
+pub(crate) mod activation;
 /// WebSocket client implementation
 pub mod client;
 /// Builder for easy construction of the client
@@ -11,7 +12,6 @@ pub mod listener;
 pub mod manager;
 /// Protocol message type definitions and serialization
 pub mod messages;
-pub(crate) mod activation;
 pub(crate) mod noise;
 /// Byte storage for long-lived client state
 pub mod persistence;

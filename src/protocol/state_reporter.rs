@@ -355,23 +355,19 @@ mod tests {
                 ack,
             })
             .unwrap();
-        let Some(WriteCommand::Send {
-            msg: text,
-            ack,
-        }) = timeout(Duration::from_secs(1), output_rx.recv())
-            .await
-            .unwrap()
+        let Some(WriteCommand::Send { msg: text, ack }) =
+            timeout(Duration::from_secs(1), output_rx.recv())
+                .await
+                .unwrap()
         else {
             panic!("missing synchronized exit state")
         };
         let text = serde_json::to_string(&text).unwrap();
         let _ = ack.send(Ok(()));
-        let Some(WriteCommand::Send {
-            msg: followup,
-            ack,
-        }) = timeout(Duration::from_secs(1), output_rx.recv())
-            .await
-            .unwrap()
+        let Some(WriteCommand::Send { msg: followup, ack }) =
+            timeout(Duration::from_secs(1), output_rx.recv())
+                .await
+                .unwrap()
         else {
             panic!("missing post-exit controls")
         };
