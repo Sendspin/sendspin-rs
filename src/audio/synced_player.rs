@@ -1930,9 +1930,8 @@ impl SyncedPlayer {
                                 correction.reset_measurements();
                             }
                         } else if schedule.is_correcting() {
-                            // Conversions went dark (the implausible-drift
-                            // safety net): stop correcting rather than
-                            // resample blind on the stale cadence.
+                            // Conversions went dark: stop correcting rather
+                            // than resample blind on the stale cadence.
                             log::debug!(
                                 "Sync conversions unavailable; clearing correction schedule: callback={}, playback_reset_generation={:?}",
                                 stats.callbacks,
