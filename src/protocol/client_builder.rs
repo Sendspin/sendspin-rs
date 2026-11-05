@@ -113,10 +113,11 @@ pub struct ProtocolClientBuilderFields {
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     /// Automatically report successful player control changes as client/state updates.
+    /// Without it, the app sends the player state when `player@v1` becomes active.
     #[builder(default = true)]
     automatic_player_state: bool,
     /// Admit servers without a pairing record to activate roles and play.
-    /// Without pairing these connections are open to man-in-the-middle attacks.
+    /// Any device on the network can then act as a server for this client.
     #[builder(default = false)]
     unpaired_access: bool,
     #[builder(default = false, setter(transform = || true))]
@@ -220,7 +221,8 @@ impl ProtocolClientBuilder {
     /// Use this when you're terminating TLS, routing by HTTP path, or
     /// otherwise need to own the WebSocket layer yourself. For the common
     /// "bind a TCP socket and accept inbound peers" case, use
-    /// [`Self::listen`].
+    /// [`Self::listen`]. The caller must reject upgrades carrying an
+    /// `Origin` header, as [`ProtocolListener`] does.
     pub async fn accept<S>(self, ws_stream: WebSocketStream<S>) -> Result<ProtocolClient, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
