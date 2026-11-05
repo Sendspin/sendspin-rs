@@ -203,7 +203,9 @@ impl ClockSync {
     /// - `t2` = server_received (server loop µs)
     /// - `t3` = server_transmitted (server loop µs)
     /// - `t4` = client_received (raw monotonic µs from [`Clock::now_micros`])
-    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
+    ///
+    /// Returns false when the filter discards the measurement.
+    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) -> bool {
         let rtt = (t4 - t1) - (t3 - t2);
         let measurement = ((t2 - t1) + (t3 - t4)) / 2;
         let was_synced = self.filter.is_synchronized();
@@ -214,7 +216,7 @@ impl ClockSync {
             log::debug!(
                 "Clock sync sample discarded: rtt={rtt}µs (t1={t1}, t2={t2}, t3={t3}, t4={t4})"
             );
-            return;
+            return false;
         }
         self.rtt_micros = Some(rtt);
         self.last_update = Some(Instant::now());
@@ -232,6 +234,7 @@ impl ClockSync {
                 rtt
             );
         }
+        true
     }
 
     /// Get current RTT in microseconds
