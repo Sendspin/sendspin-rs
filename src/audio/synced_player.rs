@@ -2114,7 +2114,7 @@ impl SyncedPlayer {
                             }
                             cpal::ErrorKind::Xrun => {
                                 static XRUNS: AtomicU64 = AtomicU64::new(0);
-                                let count = XRUNS.fetch_add(1, Ordering::Relaxed);
+                                let count = XRUNS.fetch_add(1, Ordering::Relaxed) + 1;
                                 if should_log_sample(count) {
                                     log::debug!("Audio callback underrun (xrun): {err}");
                                 }
