@@ -37,7 +37,6 @@ thiserror = "2.0"
 
 # Utilities
 log = "0.4"
-uuid = { version = "1.23", features = ["v4", "serde"] }
 
 # Audio output
 cpal = "0.18"
