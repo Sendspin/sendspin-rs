@@ -74,7 +74,10 @@ fn synchronize_player(
 async fn send(output: &mpsc::UnboundedSender<WriteCommand>, message: Message) -> Result<(), Error> {
     let (ack, result) = oneshot::channel();
     output
-        .send(WriteCommand::Send { msg: message, ack })
+        .send(WriteCommand::Send {
+            msg: Box::new(message),
+            ack,
+        })
         .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
     result
         .await
