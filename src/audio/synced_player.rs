@@ -408,6 +408,17 @@ const STARTUP_GENTLE_WINDOW: Duration = Duration::from_secs(20);
 /// Speed-correction cap during [`STARTUP_GENTLE_WINDOW`]: 0.5%, under 9 cents.
 const STARTUP_MAX_SPEED_CORRECTION: f64 = 0.005;
 
+/// Frames until the next drop or insert after a re-plan. Progress made under
+/// the previous cadence carries over, so re-planning on every callback cannot
+/// postpone a correction indefinitely.
+fn replanned_countdown(countdown: u32, previous_every: u32, every: u32) -> u32 {
+    if previous_every == 0 {
+        every
+    } else {
+        countdown.min(every)
+    }
+}
+
 /// Observe delay before planning each callback; call `start` when audio begins.
 /// Observations may precede playback, but startup deadlines begin at `start`.
 struct StartupCorrectionState {
@@ -1896,9 +1907,17 @@ impl SyncedPlayer {
                                 } else {
                                     stats.correction_updates = 0;
                                 }
+                                insert_counter = replanned_countdown(
+                                    insert_counter,
+                                    schedule.insert_every_n_frames,
+                                    new_schedule.insert_every_n_frames,
+                                );
+                                drop_counter = replanned_countdown(
+                                    drop_counter,
+                                    schedule.drop_every_n_frames,
+                                    new_schedule.drop_every_n_frames,
+                                );
                                 schedule = new_schedule;
-                                insert_counter = schedule.insert_every_n_frames;
-                                drop_counter = schedule.drop_every_n_frames;
                             }
 
                             if schedule.reanchor {
