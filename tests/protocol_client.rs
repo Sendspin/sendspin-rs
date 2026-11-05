@@ -1744,3 +1744,43 @@ async fn test_cleartext_after_handshake_closes_without_goodbye() {
         .expect("client did not close the connection")
         .unwrap();
 }
+
+#[tokio::test]
+async fn test_player_state_follows_player_activation() {
+    let (url, mut rx, server_tx, _handle) = start_server(Some(vec![])).await;
+    let _client = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
+        .name("Test".to_string())
+        .player_v1_support(player_support())
+        .initial_player_state(PlayerState {
+            volume: Some(40),
+            muted: Some(false),
+            static_delay_ms: Some(0),
+            required_lead_time_ms: Some(500),
+            min_buffer_ms: Some(500),
+            supported_commands: None,
+        })
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut next_state = async || loop {
+        let text = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for client/state")
+            .expect("server channel closed");
+        if let Message::ClientState(state) = serde_json::from_str(&text).unwrap() {
+            break state;
+        }
+    };
+    assert!(next_state().await.player.is_none());
+
+    server_tx
+        .send(text_message(&Message::ServerActivate(ServerActivate {
+            activities: vec![],
+            active_roles: Some(vec!["player@v1".to_string()]),
+        })))
+        .unwrap();
+    assert_eq!(next_state().await.player.and_then(|p| p.volume), Some(40));
+}

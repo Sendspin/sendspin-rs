@@ -3,11 +3,7 @@
 use crate::protocol::messages::{Activity, GoodbyeReason, ServerActivate};
 use crate::protocol::noise::PskCategory;
 
-/// Apply `activation` on top of the roles persisted by earlier activations
-/// (`None` before the first one).
-///
-/// Returns the activation with `active_roles` filled in, or the goodbye
-/// reason the client closes the connection with.
+/// Apply `activation` over the roles persisted by earlier activations, or return the goodbye reason.
 pub(crate) fn admit(
     persisted_roles: Option<&[String]>,
     activation: ServerActivate,

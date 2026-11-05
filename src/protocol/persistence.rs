@@ -1,6 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 /// Stores opaque byte blobs under fixed keys chosen by the library.
@@ -43,7 +43,13 @@ impl PersistenceProvider for FileStore {
         std::fs::create_dir_all(&self.dir)?;
         // Write a sibling file first so a crash never leaves a truncated blob.
         let staged = self.dir.join(format!("{key}.tmp"));
-        std::fs::write(&staged, value)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&staged)?;
+        file.write_all(value)?;
+        file.sync_all()?;
         std::fs::rename(staged, self.dir.join(key))
     }
 }
@@ -69,5 +75,24 @@ impl PersistenceProvider for MemoryStore {
     fn save(&self, key: &str, value: &[u8]) -> io::Result<()> {
         self.blobs.lock().insert(key.to_string(), value.to_vec());
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn file_store_keeps_blobs_private_to_the_owner() {
+        let dir = std::env::temp_dir().join(format!("sendspin-store-{}", std::process::id()));
+        let store = FileStore::new(&dir);
+        store.save("identity", b"secret").unwrap();
+        let mode = std::fs::metadata(dir.join("identity"))
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }
