@@ -71,6 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Split into conn channels for concurrent use
     let conn = client.split();
+    // This example demonstrates setup/controller data only; drop role streams to avoid unread buffers.
+    drop(conn.player);
+    drop(conn.artwork);
+    drop(conn.visualizer);
 
     if let Some(controller) = conn.controller {
         println!("Controller role granted — can send playback commands");

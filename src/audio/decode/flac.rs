@@ -2,6 +2,7 @@
 // ABOUTME: Frame-at-a-time streaming FLAC decoding via the pure-Rust flac-codec crate
 
 use crate::audio::decode::Decoder;
+use crate::audio::types::AudioFormat;
 use crate::error::Error;
 use flac_codec::decode::FlacStreamReader;
 use std::sync::Arc;
@@ -36,12 +37,23 @@ struct StreamParams {
 /// from the headerless stream reader used underneath.
 #[derive(Clone)]
 pub struct FlacDecoder {
-    /// Expected stream parameters from the codec header, if provided.
-    /// When present, every decoded frame is validated against them.
+    /// Expected stream parameters from the advertised stream format.
+    /// Every decoded frame is validated against them.
     expected: Option<StreamParams>,
 }
 
 impl FlacDecoder {
+    pub(crate) fn from_format(format: &AudioFormat) -> Self {
+        let expected = StreamParams {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            bits_per_sample: u32::from(format.bit_depth),
+        };
+        Self {
+            expected: Some(expected),
+        }
+    }
+
     /// Create a FLAC decoder without a codec header.
     ///
     /// Frames are decoded using only their own (self-describing) frame
@@ -119,7 +131,7 @@ impl Decoder for FlacDecoder {
                 };
                 if actual != expected {
                     return Err(Error::Protocol(format!(
-                        "FLAC frame format {actual:?} does not match stream header {expected:?}"
+                        "FLAC frame format {actual:?} does not match expected stream format {expected:?}"
                     )));
                 }
             }

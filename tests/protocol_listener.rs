@@ -2,20 +2,62 @@
 // ABOUTME: WebSocket acceptor that drives the protocol-client state machine.
 
 use futures_util::{SinkExt, StreamExt};
+use sendspin::audio::decode::{Decoder, PcmDecoder};
+use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
+use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message, PlayerState,
-    ServerHello,
+    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message,
+    PlayerState, PlayerV1Support, ServerHello, StreamPlayerConfig, StreamStart,
 };
 use sendspin::ProtocolClientBuilder;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+#[derive(Clone, Default)]
+struct ListenerOutput {
+    commits: Arc<Mutex<Vec<AudioBuffer>>>,
+}
+impl PlayerOutput for ListenerOutput {
+    fn commit(&self, buffer: AudioBuffer) -> Result<(), OutputError> {
+        self.commits.lock().unwrap().push(buffer);
+        Ok(())
+    }
+    fn clear(&self) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_volume(&self, _: u8) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_mute(&self, _: bool) -> Result<(), OutputError> {
+        Ok(())
+    }
+    fn set_static_delay(&self, _: u16) -> Result<(), OutputError> {
+        Ok(())
+    }
+}
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, WebSocketStream};
 
+fn player_support() -> PlayerV1Support {
+    let format = |codec: &str, bit_depth| AudioFormatSpec {
+        codec: codec.into(),
+        channels: 2,
+        sample_rate: 48_000,
+        bit_depth,
+    };
+    PlayerV1Support {
+        supported_formats: vec![format("opus", 16), format("pcm", 24), format("pcm", 16)],
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec![],
+    }
+}
+
 /// Test peer that plays the protocol-server role over an already-connected
 /// WebSocket stream: replies to `client/hello` with `server/hello`, then
-/// forwards every subsequent text frame to the returned channel. Generic over
-/// the transport so it serves both the plaintext and TLS connect paths.
+/// forwards every subsequent text frame to the returned channel, and returns a
+/// writer for server-initiated frames. Generic over the transport so it serves
+/// both the plaintext and TLS connect paths.
 async fn run_peer<S>(
     ws: WebSocketStream<S>,
     active_roles: Vec<String>,
@@ -23,6 +65,7 @@ async fn run_peer<S>(
     Vec<String>,
     tokio::sync::mpsc::UnboundedReceiver<String>,
     tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedSender<WsMessage>,
 )
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -66,7 +109,15 @@ where
         }
     });
 
-    (supported_roles, rx, handle)
+    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _writer_task = tokio::spawn(async move {
+        while let Some(frame) = writer_rx.recv().await {
+            if write.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    (supported_roles, rx, handle, writer_tx)
 }
 
 async fn drive_peer_until_state(
@@ -76,6 +127,7 @@ async fn drive_peer_until_state(
     Vec<String>,
     tokio::sync::mpsc::UnboundedReceiver<String>,
     tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedSender<WsMessage>,
 ) {
     let (ws, _) = connect_async(url).await.expect("WS connect failed");
     run_peer(ws, active_roles).await
@@ -101,11 +153,100 @@ async fn wait_for_goodbye(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>)
     false
 }
 
+async fn wait_for_peer_close(reader: tokio::task::JoinHandle<()>) {
+    timeout(Duration::from_secs(2), reader)
+        .await
+        .expect("peer did not observe WebSocket close")
+        .expect("peer reader task failed");
+}
+
+#[tokio::test]
+async fn test_listen_role_session_delivers_player_events() {
+    let builder = ProtocolClientBuilder::builder()
+        .client_id("listener-role".to_string())
+        .name("Listener Role".to_string())
+        .player_v1_support(player_support())
+        .build();
+    let (url, listener) = bind_listener(builder).await;
+    let peer = tokio::spawn(async move {
+        let (ws, _) = connect_async(&url).await.expect("connect");
+        run_peer(ws, vec!["player@v1".to_string()]).await
+    });
+    let (client, _) = timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("accept timeout")
+        .expect("accept");
+    let (_roles, _rx, _reader, writer) = peer.await.expect("peer task");
+    let split = client.split();
+    let output = ListenerOutput::default();
+    let mut session = split.player.attach(output.clone());
+    let start = Message::StreamStart(StreamStart {
+        player: Some(StreamPlayerConfig {
+            codec: "pcm".into(),
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        }),
+        artwork: None,
+        visualizer: None,
+    });
+    writer
+        .send(WsMessage::Text(
+            serde_json::to_string(&start).unwrap().into(),
+        ))
+        .unwrap();
+    let mut frame = vec![binary_types::PLAYER_AUDIO];
+    frame.extend_from_slice(&77i64.to_be_bytes());
+    frame.extend_from_slice(&[0, 0x10, 0, 0xf0]);
+    writer.send(WsMessage::Binary(frame.into())).unwrap();
+    match timeout(Duration::from_secs(5), session.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        PlayerEvent::Start(config) => assert_eq!(config.codec, "pcm"),
+        other => panic!("expected start, got {other:?}"),
+    }
+    match timeout(Duration::from_secs(5), session.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        PlayerEvent::Audio(work) => {
+            assert_eq!(work.timestamp(), 77);
+            assert_eq!(work.data(), &[0, 0x10, 0, 0xf0]);
+            let samples = PcmDecoder::new(16).decode(work.data()).unwrap();
+            assert_eq!(
+                work.commit(AudioBuffer {
+                    timestamp: 77,
+                    samples,
+                    format: AudioFormat {
+                        codec: Codec::Pcm,
+                        sample_rate: 48_000,
+                        channels: 2,
+                        bit_depth: 16,
+                        codec_header: None,
+                    },
+                }),
+                Ok(())
+            );
+            let records = output.commits.lock().unwrap();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].timestamp, 77);
+            assert_eq!(records[0].samples.as_ref(), &[268_435_456, -268_435_456]);
+            assert_eq!(records[0].format.codec, Codec::Pcm);
+        }
+        other => panic!("expected audio, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_listen_accepts_and_drives_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-inbound".to_string())
         .name("Test Inbound".to_string())
+        .player_v1_support(player_support())
         .initial_player_state(PlayerState {
             volume: Some(60),
             muted: Some(false),
@@ -137,7 +278,7 @@ async fn test_listen_accepts_and_drives_handshake() {
     assert_eq!(hello.connection_reason, ConnectionReason::Playback);
     assert_eq!(hello.active_roles, vec!["player@v1".to_string()]);
 
-    let (supported_roles, mut rx, _peer_handle) = peer.await.expect("peer task panicked");
+    let (supported_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task panicked");
     assert_eq!(supported_roles, vec!["player@v1".to_string()]);
 
     let first_after_hello = timeout(Duration::from_secs(2), rx.recv())
@@ -172,6 +313,7 @@ async fn test_listen_path_match_accepts() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path".to_string())
         .name("Test Path".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -191,7 +333,7 @@ async fn test_listen_path_match_accepts() {
         .expect("accept timed out")
         .expect("accept");
 
-    let (_roles, mut rx, _peer_handle) = peer.await.expect("peer task");
+    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
@@ -212,6 +354,7 @@ async fn test_listen_path_normalizes_missing_leading_slash() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path-norm".to_string())
         .name("Test Path Norm".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -230,7 +373,7 @@ async fn test_listen_path_normalizes_missing_leading_slash() {
         .await
         .expect("accept timed out")
         .expect("accept");
-    let (_roles, mut rx, _peer_handle) = peer.await.expect("peer task");
+    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
@@ -247,6 +390,7 @@ async fn test_listen_path_mismatch_rejects_but_listener_survives() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-path-reject".to_string())
         .name("Test Path Reject".to_string())
+        .player_v1_support(player_support())
         .build();
 
     let listener = builder
@@ -277,12 +421,18 @@ async fn test_listen_path_mismatch_rejects_but_listener_survives() {
         .await
         .expect("second accept timed out")
         .expect("second accept");
-    let _ = good_peer.await.expect("good peer task");
+    let (_roles, mut rx, reader, writer) = good_peer.await.expect("good peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
         .await
         .expect("disconnect");
+    assert!(
+        wait_for_goodbye(&mut rx).await,
+        "matched-path connection never delivered client/goodbye"
+    );
+    drop(writer);
+    wait_for_peer_close(reader).await;
 }
 
 #[tokio::test]
@@ -290,6 +440,7 @@ async fn test_listen_local_addr_resolves_ephemeral_port() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-local-addr".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let listener = builder.listen("127.0.0.1:0").await.expect("listen");
     let addr = listener.local_addr().expect("local_addr");
@@ -307,6 +458,7 @@ async fn test_listen_send_message_fails_after_disconnect() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-listen-disc".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let (url, listener) = bind_listener(builder).await;
 
@@ -318,7 +470,7 @@ async fn test_listen_send_message_fails_after_disconnect() {
         .await
         .expect("accept timed out")
         .expect("accept");
-    let (_roles, _rx, _peer_handle) = peer.await.expect("peer task");
+    let (_roles, _rx, _peer_handle, _writer) = peer.await.expect("peer task");
 
     let conn = client.split();
     // `split()` must carry `server_hello` through to `Connection` — the
@@ -358,6 +510,7 @@ async fn test_listen_accept_pending_when_peer_stalls_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-stall".to_string())
         .name("Test".to_string())
+        .player_v1_support(player_support())
         .build();
     let (url, listener) = bind_listener(builder).await;
 
@@ -397,6 +550,7 @@ async fn test_listen_tls_terminates_and_drives_handshake() {
     let builder = ProtocolClientBuilder::builder()
         .client_id("test-tls".to_string())
         .name("Test TLS".to_string())
+        .player_v1_support(player_support())
         .build();
     let listener = builder
         .listen("127.0.0.1:0")
@@ -434,7 +588,7 @@ async fn test_listen_tls_terminates_and_drives_handshake() {
         .expect("accept over TLS");
     assert!(peer_addr.ip().is_loopback(), "peer addr should be loopback");
 
-    let (_roles, mut rx, _peer_handle) = peer.await.expect("peer task panicked");
+    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task panicked");
 
     client
         .disconnect(GoodbyeReason::Shutdown)

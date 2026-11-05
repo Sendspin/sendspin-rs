@@ -7,6 +7,7 @@ use crate::audio::sync_correction::{
 };
 use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
+use crate::generation::PlaybackResetGeneration;
 use crate::log_sampling::should_log_sample;
 use crate::sync::ClockSync;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,6 +18,12 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use super::diagnostics::{clear_diagnostic_observer, install_diagnostic_observer};
+use super::diagnostics::{
+    logs_clear, logs_enqueue, record_playback_diagnostic, PlaybackDiagnostic,
+};
 
 /// Callback for post-processing audio samples before output.
 ///
@@ -135,10 +142,10 @@ struct PlaybackQueue {
     cursor_us: i64,
     cursor_remainder: i64,
     initialized: bool,
-    generation: u64,
+    playback_reset_generation: PlaybackResetGeneration,
     force_reanchor: bool,
-    /// Buffers enqueued in this generation; the sampling key for the enqueue
-    /// trace line. Reset by `clear()`.
+    /// Buffers enqueued since the last playback reset; the sampling key for
+    /// the enqueue trace line. Reset by `clear()`.
     enqueue_count: u64,
 }
 
@@ -151,7 +158,7 @@ impl PlaybackQueue {
             cursor_us: 0,
             cursor_remainder: 0,
             initialized: false,
-            generation: 0,
+            playback_reset_generation: PlaybackResetGeneration::initial(),
             force_reanchor: true,
             enqueue_count: 0,
         }
@@ -164,7 +171,7 @@ impl PlaybackQueue {
         self.cursor_us = 0;
         self.cursor_remainder = 0;
         self.initialized = false;
-        self.generation = self.generation.wrapping_add(1);
+        self.playback_reset_generation = self.playback_reset_generation.advance();
         self.force_reanchor = true;
         self.enqueue_count = 0;
     }
@@ -338,6 +345,11 @@ impl PlaybackQueue {
         self.queued_frames(channels) as u64 * 1_000_000 / sample_rate.max(1) as u64
     }
 
+    fn enqueue(&mut self, buffer: AudioBuffer) {
+        self.push(buffer);
+        self.enqueue_count += 1;
+    }
+
     fn buffer_count(&self) -> usize {
         self.queue.len() + usize::from(self.current.is_some())
     }
@@ -376,7 +388,7 @@ struct StartupCorrectionState {
     delay_settle: OutputDelaySettle,
     started_at: Option<Instant>,
     /// Padding noise is one-sided: anchoring to a high sample bakes that error
-    /// into the timeline. Use the generation's floor, replaced on settling.
+    /// into the timeline. Use the playback-reset floor, replaced on settling.
     min_playback_delta_us: u64,
 }
 
@@ -655,7 +667,7 @@ mod startup_correction_tests {
     }
 
     #[test]
-    fn generation_reset_restarts_floor_filter_gate_and_deadlines() {
+    fn playback_reset_restarts_floor_filter_gate_and_deadlines() {
         let start = Instant::now();
         let mut state = StartupCorrectionState::new();
         state.start(start);
@@ -914,13 +926,9 @@ mod startup_correction_tests {
 /// log with low/recovered pairs.
 const QUEUE_RECOVERED_WATER_US: u64 = 200_000;
 
-/// Diagnostic counters for the audio callback. Logging-only: playback
-/// decisions never read these.
-///
-/// `callbacks` counts for the lifetime of the stream and anchors every log
-/// line to one timeline. The rest are per-generation — reset whenever the
-/// playback queue generation changes — so each stream start reports its own
-/// startup behavior.
+/// Logging-only callback diagnostics; playback decisions never read them.
+/// `callbacks` spans the stream lifetime; the other counters reset when the
+/// playback queue clears.
 #[derive(Default)]
 struct CallbackStats {
     /// Data callbacks since the stream was built. Never reset.
@@ -948,10 +956,8 @@ struct CallbackStats {
     /// settling after stream start, which were suppressed; the sampling key
     /// for its trace line.
     delay_transient_suppressed_corrections: u64,
-    /// Correction episodes started (idle -> correcting transitions, including
-    /// reanchor engagements). Mirrors the "Sync correction engaged" debug
-    /// line 1:1 so the generation summary can answer whether the corrector
-    /// ever fired, even when debug logging was off during playback.
+    /// Correction episodes started, including reanchors. Mirrors the
+    /// engagement log so summaries retain this fact when debug logging is off.
     correction_engagements: u64,
     /// Whether the queue was below [`QUEUE_LOW_WATER_US`] at the last render.
     /// Drives the edge-triggered low/recovered debug lines.
@@ -959,8 +965,8 @@ struct CallbackStats {
 }
 
 impl CallbackStats {
-    /// Reset per-generation counters, keeping the lifetime callback count.
-    fn reset_for_generation(&mut self) {
+    /// Reset per-playback-reset counters, keeping the lifetime callback count.
+    fn reset_for_playback_reset(&mut self) {
         *self = Self {
             callbacks: self.callbacks,
             ..Self::default()
@@ -989,6 +995,182 @@ pub struct SyncedPlayer {
     gain: GainControl,
     /// Shared with the audio callback. See [`SyncedPlayer::set_static_delay`].
     static_delay_us: Arc<AtomicU64>,
+}
+
+/// Device-independent control handle for session-owned playback.
+#[derive(Clone)]
+pub struct PlaybackControl {
+    format: AudioFormat,
+    queue: Arc<Mutex<PlaybackQueue>>,
+    last_error: Arc<Mutex<Option<String>>>,
+    gain: GainControl,
+    static_delay_us: Arc<AtomicU64>,
+}
+
+impl SyncedPlayer {
+    /// Creates a cloneable, device-independent control handle for this player.
+    ///
+    /// Calls through the returned handle are synchronous, short, and safe to use from
+    /// a session control driver. Cloning the handle is cheap; it does not create or
+    /// move the audio stream.
+    pub fn control(&self) -> PlaybackControl {
+        PlaybackControl {
+            format: self.format.clone(),
+            queue: Arc::clone(&self.queue),
+            last_error: Arc::clone(&self.last_error),
+            gain: self.gain.clone(),
+            static_delay_us: Arc::clone(&self.static_delay_us),
+        }
+    }
+
+    /// Create a control handle without requiring an output device.
+    #[cfg(test)]
+    pub(crate) fn control_for_test(format: AudioFormat) -> PlaybackControl {
+        PlaybackControl {
+            format,
+            queue: Arc::new(Mutex::new(PlaybackQueue::new())),
+            last_error: Arc::new(Mutex::new(None)),
+            gain: GainControl::new(0, false),
+            static_delay_us: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl PlaybackControl {
+    #[cfg(test)]
+    pub(crate) fn set_error_for_test(&self, error: impl Into<String>) {
+        *self.last_error.lock() = Some(error.into());
+    }
+
+    /// Returns the format accepted by this control handle.
+    pub fn format(&self) -> &AudioFormat {
+        &self.format
+    }
+
+    /// Commits whole frames matching this control's sample rate and channel count.
+    /// Format and frame rejections leave the session usable; callback failures are retained.
+    /// `clear` and all setters report retained callback failures.
+    pub fn commit(&self, buffer: AudioBuffer) -> Result<(), crate::audio::OutputError> {
+        if self.format.sample_rate != buffer.format.sample_rate
+            || self.format.channels != buffer.format.channels
+        {
+            return Err(crate::audio::OutputError::FormatMismatch {
+                expected: self.format.clone(),
+                actual: buffer.format.clone(),
+            });
+        }
+        if self.format.channels == 0
+            || !buffer
+                .samples
+                .len()
+                .is_multiple_of(self.format.channels as usize)
+        {
+            return Err(crate::audio::OutputError::InvalidBuffer {
+                samples: buffer.samples.len(),
+                channels: self.format.channels,
+            });
+        }
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        let timestamp = buffer.timestamp;
+        let duration_us = buffer.duration_us();
+        let diagnostic = {
+            let mut queue = self.queue.lock();
+            queue.enqueue(buffer);
+            // The audio callback contends on this lock, so walk the queue only for logged samples.
+            let queued_us = if logs_enqueue(queue.enqueue_count) {
+                queue.queued_duration_us(self.format.channels as usize, self.format.sample_rate)
+            } else {
+                0
+            };
+            PlaybackDiagnostic::Enqueued {
+                timestamp,
+                duration_us,
+                enqueue_count: queue.enqueue_count,
+                queued_us,
+                buffers: queue.buffer_count(),
+                cursor_us: queue.cursor_us,
+                reset: queue.playback_reset_generation,
+            }
+        };
+        record_playback_diagnostic(diagnostic);
+        Ok(())
+    }
+
+    /// Clears queued audio before reporting any retained callback failure.
+    pub fn clear(&self) -> Result<(), crate::audio::OutputError> {
+        let diagnostic = {
+            let mut queue = self.queue.lock();
+            let queued_us = if logs_clear() {
+                queue.queued_duration_us(self.format.channels as usize, self.format.sample_rate)
+            } else {
+                0
+            };
+            let diagnostic = PlaybackDiagnostic::Cleared {
+                queued_us,
+                buffers: queue.buffer_count(),
+                cursor_us: queue.cursor_us,
+                reset: queue.playback_reset_generation,
+            };
+            queue.clear();
+            diagnostic
+        };
+        record_playback_diagnostic(diagnostic);
+        self.last_error.lock().as_ref().map_or(Ok(()), |error| {
+            Err(crate::audio::OutputError::Failed(error.clone()))
+        })
+    }
+
+    /// Sets the software output volume.
+    pub fn set_volume(&self, volume: u8) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.gain.set_volume(volume);
+        Ok(())
+    }
+
+    /// Sets whether the software output is muted.
+    pub fn set_mute(&self, muted: bool) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.gain.set_mute(muted);
+        Ok(())
+    }
+
+    /// Sets the static playback delay in milliseconds.
+    pub fn set_static_delay(&self, delay_ms: u16) -> Result<(), crate::audio::OutputError> {
+        if let Some(error) = self.last_error.lock().as_ref() {
+            return Err(crate::audio::OutputError::Failed(error.clone()));
+        }
+        self.static_delay_us
+            .store(static_delay_ms_to_us(delay_ms), Ordering::Relaxed);
+        let mut queue = self.queue.lock();
+        if queue.initialized {
+            queue.force_reanchor = true;
+        }
+        Ok(())
+    }
+}
+
+impl crate::audio::PlayerOutput for PlaybackControl {
+    fn commit(&self, buffer: AudioBuffer) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::commit(self, buffer)
+    }
+    fn clear(&self) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::clear(self)
+    }
+    fn set_volume(&self, volume: u8) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_volume(self, volume)
+    }
+    fn set_mute(&self, muted: bool) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_mute(self, muted)
+    }
+    fn set_static_delay(&self, delay_ms: u16) -> Result<(), crate::audio::OutputError> {
+        PlaybackControl::set_static_delay(self, delay_ms)
+    }
 }
 
 impl SyncedPlayer {
@@ -1121,76 +1303,14 @@ impl SyncedPlayer {
     /// Scheduling uses `buffer.timestamp` (server time in microseconds) for
     /// drift-corrected playback.
     pub fn enqueue(&self, buffer: AudioBuffer) {
-        let buffer_timestamp = buffer.timestamp;
-        let buffer_duration_us = buffer.duration_us();
-        let channels = self.format.channels as usize;
-        let sample_rate = self.format.sample_rate;
-
-        // Snapshot log fields under the lock but log after dropping it: the
-        // audio callback contends on this lock, and logging can block on I/O.
-        // The O(buffers) depth walk runs only for sampled, trace-enabled
-        // enqueues.
-        let trace_fields = {
-            let mut queue = self.queue.lock();
-            queue.push(buffer);
-            queue.enqueue_count += 1;
-            if log::log_enabled!(log::Level::Trace) && should_log_sample(queue.enqueue_count) {
-                Some((
-                    queue.enqueue_count,
-                    queue.queued_duration_us(channels, sample_rate),
-                    queue.buffer_count(),
-                    queue.cursor_us,
-                    queue.generation,
-                ))
-            } else {
-                None
-            }
-        };
-
-        if let Some((enqueue_count, queued_us, buffers, cursor_us, generation)) = trace_fields {
-            log::trace!(
-                "Audio buffer enqueued: enqueue={}, ts={}µs, duration={:.1}ms, queued={:.1}ms, buffers={}, cursor={}µs, generation={}",
-                enqueue_count,
-                buffer_timestamp,
-                buffer_duration_us as f64 / 1000.0,
-                us_to_ms(queued_us),
-                buffers,
-                cursor_us,
-                generation,
-            );
+        if let Err(error) = self.control().commit(buffer) {
+            log::warn!("Audio buffer rejected: {error}");
         }
     }
 
     /// Clear queued audio and reset playback state.
     pub fn clear(&self) {
-        let channels = self.format.channels as usize;
-        let sample_rate = self.format.sample_rate;
-
-        // Snapshot log fields under the lock but log after dropping it: the
-        // audio callback contends on this lock, and logging can block on I/O.
-        let debug_fields = {
-            let mut queue = self.queue.lock();
-            let fields = log::log_enabled!(log::Level::Debug).then(|| {
-                (
-                    queue.queued_duration_us(channels, sample_rate),
-                    queue.buffer_count(),
-                    queue.cursor_us,
-                    queue.generation,
-                )
-            });
-            queue.clear();
-            fields
-        };
-
-        if let Some((queued_us, buffers, cursor_us, generation)) = debug_fields {
-            log::debug!(
-                "Cleared playback queue: queued={:.1}ms, buffers={}, cursor={}µs, generation={}",
-                us_to_ms(queued_us),
-                buffers,
-                cursor_us,
-                generation,
-            );
-        }
+        let _ = self.control().clear();
     }
 
     /// Release the underlying audio output device.
@@ -1306,7 +1426,7 @@ impl SyncedPlayer {
         let mut last_callback_instant: Option<Instant> = None;
         let mut last_playback_delta_us: Option<u64> = None;
 
-        let mut last_generation = 0u64;
+        let mut last_playback_reset_generation = PlaybackResetGeneration::initial();
         let mut stats = CallbackStats::default();
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
@@ -1352,11 +1472,9 @@ impl SyncedPlayer {
                     stats.callbacks += 1;
                     let frames = data.len() / channels;
 
-                    // Read queue timing state together. The generation is
-                    // rechecked before consuming force_reanchor so a clear()
-                    // racing with this callback cannot clear the next startup's
-                    // one-shot handoff.
-                    let (generation, cursor_us, force_reanchor, queued_us, queued_buffers) = {
+                    // Recheck the reset generation before consuming force_reanchor;
+                    // a racing clear must not consume the next startup's handoff.
+                    let (playback_reset_generation, cursor_us, force_reanchor, queued_us, queued_buffers) = {
                         let queue = queue.lock();
                         let cursor = if queue.initialized {
                             Some(queue.cursor_us)
@@ -1375,18 +1493,18 @@ impl SyncedPlayer {
                             (0, 0)
                         };
                         (
-                            queue.generation,
+                            queue.playback_reset_generation,
                             cursor,
                             queue.force_reanchor,
                             queued_us,
                             queued_buffers,
                         )
                     };
-                    if generation != last_generation {
+                    if playback_reset_generation != last_playback_reset_generation {
                         log::debug!(
-                            "Playback queue generation changed: {} -> {}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
-                            last_generation,
-                            generation,
+                            "Playback-reset generation changed: {:?} -> {:?}, queued={:.1}ms, buffers={}, callbacks={}, silent_callbacks={}, underrun_callbacks={}, underrun_frames={}, sync_lock_misses={}, correction_engagements={}",
+                            last_playback_reset_generation,
+                            playback_reset_generation,
                             us_to_ms(queued_us),
                             queued_buffers,
                             stats.callbacks,
@@ -1396,13 +1514,13 @@ impl SyncedPlayer {
                             stats.sync_lock_misses,
                             stats.correction_engagements,
                         );
-                        last_generation = generation;
+                        last_playback_reset_generation = playback_reset_generation;
                         started = false;
                         schedule = CorrectionSchedule::default();
                         insert_counter = 0;
                         drop_counter = 0;
                         correction.reset();
-                        stats.reset_for_generation();
+                        stats.reset_for_playback_reset();
                         for sample in last_frame.iter_mut() {
                             *sample = i32::EQUILIBRIUM;
                         }
@@ -1424,11 +1542,11 @@ impl SyncedPlayer {
                         let period_us = frames as u64 * 1_000_000 / u64::from(sample_rate.max(1));
                         if gap_us >= 2 * period_us {
                             log::debug!(
-                                "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, generation={}",
+                                "Audio callback gap: {:.1}ms since previous (period ~{:.1}ms), callback={}, playback_reset_generation={:?}",
                                 us_to_ms(gap_us),
                                 us_to_ms(period_us),
                                 stats.callbacks,
-                                generation,
+                                playback_reset_generation,
                             );
                         }
                     }
@@ -1436,11 +1554,11 @@ impl SyncedPlayer {
                     if let Some(last) = last_playback_delta_us {
                         if playback_delta_us.abs_diff(last) > 1_000 {
                             log::debug!(
-                                "Output timeline shifted: playback_delta {:.1}ms -> {:.1}ms, callback={}, generation={}",
+                                "Output timeline shifted: playback_delta {:.1}ms -> {:.1}ms, callback={}, playback_reset_generation={:?}",
                                 us_to_ms(last),
                                 us_to_ms(playback_delta_us),
                                 stats.callbacks,
-                                generation,
+                                playback_reset_generation,
                             );
                         }
                     }
@@ -1451,11 +1569,11 @@ impl SyncedPlayer {
                         correction.observe_output_delay(callback_instant, playback_delta_us)
                     {
                         log::debug!(
-                            "Output delay settled at {:.1}ms; corrections enabled: callback={}, suppressed_during_transient={}, generation={}",
+                            "Output delay settled at {:.1}ms; corrections enabled: callback={}, suppressed_during_transient={}, playback_reset_generation={:?}",
                             us_to_ms(floor_us),
                             stats.callbacks,
                             stats.delay_transient_suppressed_corrections,
-                            generation,
+                            playback_reset_generation,
                         );
                     }
 
@@ -1494,10 +1612,10 @@ impl SyncedPlayer {
                             // estimate, not playback; start the filter fresh.
                             correction.reset_measurements();
                             log::debug!(
-                                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, generation={}",
+                                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, playback_reset_generation={:?}",
                                 stats.callbacks,
                                 stats.warmup_suppressed_corrections,
-                                generation,
+                                playback_reset_generation,
                             );
                         }
 
@@ -1524,7 +1642,7 @@ impl SyncedPlayer {
                                 sync.instant_to_client_micros(handoff_instant) + delay_us as i64;
                             if let Some(server_time) = sync.client_to_server_micros(client_micros) {
                                 let mut queue = queue.lock();
-                                if queue.generation == generation && queue.initialized {
+                                if queue.playback_reset_generation == playback_reset_generation && queue.initialized {
                                     if let Some(cursor_us) =
                                         queue.first_playable_cursor_at_or_after(server_time)
                                     {
@@ -1536,11 +1654,9 @@ impl SyncedPlayer {
                                         schedule = CorrectionSchedule::default();
                                         insert_counter = 0;
                                         drop_counter = 0;
-                                        // The cursor just jumped (e.g. a
-                                        // static-delay change, which does not
-                                        // bump the generation); prior
-                                        // measurements describe the old
-                                        // timeline.
+                                        // The cursor jump changes the timeline; a
+                                        // static-delay change does not advance the reset,
+                                        // so prior measurements are stale.
                                         correction.reset_measurements();
                                         log::debug!(
                                             "Sync reanchor applied: cursor reset to server_time={cursor_us}µs"
@@ -1559,14 +1675,14 @@ impl SyncedPlayer {
                                 stats.silent_callbacks += 1;
                                 if trace_logging && should_log_sample(stats.silent_callbacks) {
                                     log::trace!(
-                                        "Audio callback silent during reanchor: callback={}, silent_callback={}, reanchor_applied={}, started={}, queued={:.1}ms, buffers={}, generation={}",
+                                        "Audio callback silent during reanchor: callback={}, silent_callback={}, reanchor_applied={}, started={}, queued={:.1}ms, buffers={}, playback_reset_generation={:?}",
                                         stats.callbacks,
                                         stats.silent_callbacks,
                                         reanchor_applied,
                                         started,
                                         us_to_ms(queued_us),
                                         queued_buffers,
-                                        generation,
+                                        playback_reset_generation,
                                     );
                                 }
                                 emit_silence(data);
@@ -1590,14 +1706,14 @@ impl SyncedPlayer {
                                         .duration_since(playback_instant)
                                         .as_micros() as u64;
                                     log::trace!(
-                                        "Audio callback early; emitting silence: callback={}, silent_callback={}, early={:.1}ms, cursor={}µs, queued={:.1}ms, buffers={}, generation={}",
+                                        "Audio callback early; emitting silence: callback={}, silent_callback={}, early={:.1}ms, cursor={}µs, queued={:.1}ms, buffers={}, playback_reset_generation={:?}",
                                         stats.callbacks,
                                         stats.silent_callbacks,
                                         us_to_ms(early_us),
                                         effective_cursor_us,
                                         us_to_ms(queued_us),
                                         queued_buffers,
-                                        generation,
+                                        playback_reset_generation,
                                     );
                                 }
                                 emit_silence(data);
@@ -1644,12 +1760,12 @@ impl SyncedPlayer {
                                     && should_log_sample(stats.gate_suppressed_corrections)
                                 {
                                     log::trace!(
-                                        "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                                        "Sync correction awaiting sustained error: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, playback_reset_generation={:?}",
                                         stats.callbacks,
                                         stats.gate_suppressed_corrections,
                                         error_us as f64 / 1000.0,
                                         raw_error_us as f64 / 1000.0,
-                                        generation,
+                                        playback_reset_generation,
                                     );
                                 }
                             }
@@ -1664,13 +1780,13 @@ impl SyncedPlayer {
                                         )
                                     {
                                         log::trace!(
-                                            "Sync correction suppressed while output delay settles: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, playback_delta={:.1}ms, generation={}",
+                                            "Sync correction suppressed while output delay settles: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, playback_delta={:.1}ms, playback_reset_generation={:?}",
                                             stats.callbacks,
                                             stats.delay_transient_suppressed_corrections,
                                             error_us as f64 / 1000.0,
                                             raw_error_us as f64 / 1000.0,
                                             us_to_ms(playback_delta_us),
-                                            generation,
+                                            playback_reset_generation,
                                         );
                                     }
                                 }
@@ -1683,12 +1799,12 @@ impl SyncedPlayer {
                                         )
                                     {
                                         log::trace!(
-                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, generation={}",
+                                            "Sync correction suppressed during clock warm-up: callback={}, suppressed={}, error={:.3}ms, raw_error={:.3}ms, playback_reset_generation={:?}",
                                             stats.callbacks,
                                             stats.warmup_suppressed_corrections,
                                             error_us as f64 / 1000.0,
                                             raw_error_us as f64 / 1000.0,
-                                            generation,
+                                            playback_reset_generation,
                                         );
                                     }
                                 }
@@ -1699,25 +1815,25 @@ impl SyncedPlayer {
                                     if new_schedule.is_correcting() {
                                         stats.correction_engagements += 1;
                                         log::debug!(
-                                            "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, generation={}",
+                                            "Sync correction engaged: error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, callback={}, playback_reset_generation={:?}",
                                             error_us as f64 / 1000.0,
                                             raw_error_us as f64 / 1000.0,
                                             new_schedule.insert_every_n_frames,
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
                                             stats.callbacks,
-                                            generation,
+                                            playback_reset_generation,
                                         );
                                     } else {
                                         // The floor lags rises, so error= may
                                         // read worse than raw_error= here;
                                         // expected, not a bug.
                                         log::debug!(
-                                            "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, generation={}",
+                                            "Sync correction disengaged: error={:.3}ms, raw_error={:.3}ms, callback={}, playback_reset_generation={:?}",
                                             error_us as f64 / 1000.0,
                                             raw_error_us as f64 / 1000.0,
                                             stats.callbacks,
-                                            generation,
+                                            playback_reset_generation,
                                         );
                                     }
                                 }
@@ -1735,7 +1851,7 @@ impl SyncedPlayer {
                                         && should_log_sample(stats.correction_updates)
                                     {
                                         log::trace!(
-                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, generation={}",
+                                            "Sync correction updated: callback={}, correction_update={}, error={:.3}ms, raw_error={:.3}ms, insert_every={}, drop_every={}, reanchor={}, queued={:.1}ms, playback_reset_generation={:?}",
                                             stats.callbacks,
                                             stats.correction_updates,
                                             error_us as f64 / 1000.0,
@@ -1744,7 +1860,7 @@ impl SyncedPlayer {
                                             new_schedule.drop_every_n_frames,
                                             new_schedule.reanchor,
                                             us_to_ms(queued_us),
-                                            generation,
+                                            playback_reset_generation,
                                         );
                                     }
                                 } else {
@@ -1788,9 +1904,9 @@ impl SyncedPlayer {
                             // safety net): stop correcting rather than
                             // resample blind on the stale cadence.
                             log::debug!(
-                                "Sync conversions unavailable; clearing correction schedule: callback={}, generation={}",
+                                "Sync conversions unavailable; clearing correction schedule: callback={}, playback_reset_generation={:?}",
                                 stats.callbacks,
-                                generation,
+                                playback_reset_generation,
                             );
                             schedule = CorrectionSchedule::default();
                             insert_counter = 0;
@@ -1808,13 +1924,13 @@ impl SyncedPlayer {
                         stats.silent_callbacks += 1;
                         if trace_logging && should_log_sample(stats.silent_callbacks) {
                             log::trace!(
-                                "Audio callback silent before start: callback={}, silent_callback={}, cursor_present={}, queued={:.1}ms, buffers={}, generation={}",
+                                "Audio callback silent before start: callback={}, silent_callback={}, cursor_present={}, queued={:.1}ms, buffers={}, playback_reset_generation={:?}",
                                 stats.callbacks,
                                 stats.silent_callbacks,
                                 cursor_us.is_some(),
                                 us_to_ms(queued_us),
                                 queued_buffers,
-                                generation,
+                                playback_reset_generation,
                             );
                         }
                         emit_silence(data);
@@ -1897,16 +2013,14 @@ impl SyncedPlayer {
                         stats.underrun_callbacks += 1;
                         stats.consecutive_underrun_callbacks += 1;
 
-                        // Per-generation totals reset on stream changes, so
-                        // every stream logs its first few underruns at debug.
-                        // That is intentional: startup underruns after a
-                        // clear/track change are the main diagnostic.
+                        // Reset totals on queue clears so startup underruns remain
+                        // visible in diagnostics after a clear or track change.
                         if debug_logging
                             && (should_log_sample(stats.underrun_callbacks)
                                 || should_log_sample(stats.consecutive_underrun_callbacks))
                         {
                             log::debug!(
-                                "Audio underrun: callback={}, missing_frames={} ({:.1}ms), queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, cursor={:?}µs, generation={}, underrun_frames={}, underrun_callbacks={}, consecutive_underrun_callbacks={}",
+                                "Audio underrun: callback={}, missing_frames={} ({:.1}ms), queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, cursor={:?}µs, playback_reset_generation={:?}, underrun_frames={}, underrun_callbacks={}, consecutive_underrun_callbacks={}",
                                 stats.callbacks,
                                 callback_underrun_frames,
                                 callback_underrun_frames as f64 * 1000.0 / sample_rate as f64,
@@ -1914,7 +2028,7 @@ impl SyncedPlayer {
                                 us_to_ms(queued_after_us),
                                 buffers_after,
                                 cursor_us,
-                                generation,
+                                playback_reset_generation,
                                 stats.underrun_frames,
                                 stats.underrun_callbacks,
                                 stats.consecutive_underrun_callbacks,
@@ -1924,13 +2038,13 @@ impl SyncedPlayer {
                         let underrun_run = stats.consecutive_underrun_callbacks;
                         stats.consecutive_underrun_callbacks = 0;
                         log::debug!(
-                            "Audio underrun recovered: callback={}, consecutive_underrun_callbacks={}, underrun_frames={}, queued_after={:.1}ms, buffers_after={}, generation={}",
+                            "Audio underrun recovered: callback={}, consecutive_underrun_callbacks={}, underrun_frames={}, queued_after={:.1}ms, buffers_after={}, playback_reset_generation={:?}",
                             stats.callbacks,
                             underrun_run,
                             stats.underrun_frames,
                             us_to_ms(queued_after_us),
                             buffers_after,
-                            generation,
+                            playback_reset_generation,
                         );
                     }
 
@@ -1940,21 +2054,21 @@ impl SyncedPlayer {
                         if !stats.queue_low && queued_after_us < QUEUE_LOW_WATER_US {
                             stats.queue_low = true;
                             log::debug!(
-                                "Playback queue low: queued={:.1}ms, buffers={}, callback={}, underrun_frames={}, generation={}",
+                                "Playback queue low: queued={:.1}ms, buffers={}, callback={}, underrun_frames={}, playback_reset_generation={:?}",
                                 us_to_ms(queued_after_us),
                                 buffers_after,
                                 stats.callbacks,
                                 stats.underrun_frames,
-                                generation,
+                                playback_reset_generation,
                             );
                         } else if stats.queue_low && queued_after_us >= QUEUE_RECOVERED_WATER_US {
                             stats.queue_low = false;
                             log::debug!(
-                                "Playback queue recovered: queued={:.1}ms, buffers={}, callback={}, generation={}",
+                                "Playback queue recovered: queued={:.1}ms, buffers={}, callback={}, playback_reset_generation={:?}",
                                 us_to_ms(queued_after_us),
                                 buffers_after,
                                 stats.callbacks,
-                                generation,
+                                playback_reset_generation,
                             );
                         }
                     }
@@ -1978,32 +2092,41 @@ impl SyncedPlayer {
                             .map(|sample| sample.abs())
                             .fold(0.0, f32::max);
                         log::trace!(
-                            "Audio callback rendered: callback={}, frames={}, queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, peak_abs={:.6}, generation={}",
+                            "Audio callback rendered: callback={}, frames={}, queued_before={:.1}ms, queued_after={:.1}ms, buffers_after={}, peak_abs={:.6}, playback_reset_generation={:?}",
                             stats.callbacks,
                             frames,
                             us_to_ms(queued_us),
                             us_to_ms(queued_after_us),
                             buffers_after,
                             peak_abs,
-                            generation,
+                            playback_reset_generation,
                         );
                     }
                     },
                     move |err| {
-                        // cpal reports a refused real-time promotion as
-                        // RealtimeDenied ("Audio will still play"); playback
-                        // continues at normal priority. Warn without storing:
-                        // take_error()/has_error() signal fatal stream
-                        // failures, and a consumer must not tear down a
-                        // working stream over a scheduling downgrade.
-                        if err.kind() == cpal::ErrorKind::RealtimeDenied {
-                            log::warn!(
-                                "Audio thread priority promotion failed (non-fatal): {err}"
-                            );
-                            return;
+                        // These recoverable notifications do not invalidate a working stream;
+                        // only other callback errors are retained for take_error()/has_error().
+                        match err.kind() {
+                            cpal::ErrorKind::RealtimeDenied => {
+                                log::warn!(
+                                    "Audio thread priority promotion failed (non-fatal): {err}"
+                                );
+                            }
+                            cpal::ErrorKind::Xrun => {
+                                static XRUNS: AtomicU64 = AtomicU64::new(0);
+                                let count = XRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                                if should_log_sample(count) {
+                                    log::debug!("Audio callback underrun (xrun): {err}");
+                                }
+                            }
+                            cpal::ErrorKind::DeviceChanged => {
+                                log::warn!("Audio device changed; playback stream continues: {err}");
+                            }
+                            _ => {
+                                log::error!("Audio stream error: {err}");
+                                *error.lock() = Some(err.to_string());
+                            }
                         }
-                        log::error!("Audio stream error: {err}");
-                        *error.lock() = Some(err.to_string());
                     },
                     None,
                 )
@@ -2048,15 +2171,28 @@ mod tests {
     // cannot run in CI.
 
     use super::{
-        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackQueue, SyncedPlayer,
-        SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
+        clear_diagnostic_observer, install_diagnostic_observer, record_playback_diagnostic,
+        static_delay_ms_to_us, windows_default_buffer_frames, PlaybackDiagnostic, PlaybackQueue,
+        SyncedPlayer, SyncedPlayerConfig, MAX_STATIC_DELAY_MS,
     };
-    use crate::audio::{AudioBuffer, AudioFormat, Codec};
+    use crate::audio::decode::{Decoder, PcmDecoder};
+    use crate::audio::diagnostics::DiagnosticScope;
+    use crate::audio::{AudioBuffer, AudioFormat, Codec, OutputError};
     use crate::error::Error;
     use crate::sync::{ClockSync, DefaultClock};
     use cpal::Sample;
     use parking_lot::Mutex;
+    use std::cell::Cell;
     use std::sync::Arc;
+
+    fn diagnostic() -> PlaybackDiagnostic {
+        PlaybackDiagnostic::Cleared {
+            queued_us: 0,
+            buffers: 0,
+            cursor_us: 0,
+            reset: crate::generation::PlaybackResetGeneration::initial(),
+        }
+    }
 
     /// Standard test format: 48kHz stereo 24-bit PCM.
     fn test_format() -> AudioFormat {
@@ -2075,6 +2211,190 @@ mod tests {
             channels: 1,
             ..test_format()
         }
+    }
+
+    fn control_buffer(format: AudioFormat, timestamp: i64) -> AudioBuffer {
+        AudioBuffer {
+            timestamp,
+            samples: Arc::from(vec![0_i32; format.channels as usize * 48].into_boxed_slice()),
+            format,
+        }
+    }
+
+    #[test]
+    fn playback_control_commit_and_clear_reset_queue_state() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        control
+            .commit(control_buffer(test_format(), 1_000))
+            .unwrap();
+        {
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 1);
+            let generation = queue.playback_reset_generation;
+            drop(queue);
+            control.clear().unwrap();
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 0);
+            assert_ne!(queue.playback_reset_generation, generation);
+            assert!(queue.queue.is_empty());
+            assert!(!queue.initialized);
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_sample_rate_and_channel_mismatches_but_ignores_codec() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        let mut wrong_rate = test_format();
+        wrong_rate.sample_rate = 44_100;
+        assert!(matches!(
+            control.commit(control_buffer(wrong_rate, 0)),
+            Err(OutputError::FormatMismatch { .. })
+        ));
+        let mut wrong_channels = test_format();
+        wrong_channels.channels = 1;
+        assert!(matches!(
+            control.commit(control_buffer(wrong_channels, 0)),
+            Err(OutputError::FormatMismatch { .. })
+        ));
+        let mut different_codec = test_format();
+        different_codec.codec = Codec::Opus;
+        control.commit(control_buffer(different_codec, 0)).unwrap();
+    }
+
+    fn decoded_buffer(bit_depth: u8, data: &[u8], timestamp: i64) -> AudioBuffer {
+        let samples = PcmDecoder::new(bit_depth).decode(data).unwrap();
+        AudioBuffer {
+            timestamp,
+            samples,
+            format: AudioFormat {
+                bit_depth,
+                ..test_format()
+            },
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_decoder_partial_frames_without_changing_queue() {
+        for (bit_depth, valid_data, invalid_data) in [
+            (16, [0_u8; 8].as_slice(), [0_u8; 6].as_slice()),
+            (24, [0_u8; 12].as_slice(), [0_u8; 9].as_slice()),
+        ] {
+            let control = SyncedPlayer::control_for_test(test_format());
+            control
+                .commit(decoded_buffer(bit_depth, valid_data, 0))
+                .unwrap();
+            let before = {
+                let queue = control.queue.lock();
+                (
+                    queue.enqueue_count,
+                    queue.initialized,
+                    queue.cursor_us,
+                    queue.current.as_ref().map(|buffer| buffer.samples.to_vec()),
+                    queue
+                        .queue
+                        .iter()
+                        .map(|buffer| (buffer.timestamp, buffer.samples.to_vec()))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let invalid = decoded_buffer(bit_depth, invalid_data, 1);
+            assert_eq!(invalid.samples.len(), 3);
+            assert_eq!(
+                control.commit(invalid),
+                Err(OutputError::InvalidBuffer {
+                    samples: 3,
+                    channels: 2,
+                })
+            );
+            let queue = control.queue.lock();
+            assert_eq!(
+                (
+                    queue.enqueue_count,
+                    queue.initialized,
+                    queue.cursor_us,
+                    queue.current.as_ref().map(|buffer| buffer.samples.to_vec()),
+                    queue
+                        .queue
+                        .iter()
+                        .map(|buffer| (buffer.timestamp, buffer.samples.to_vec()))
+                        .collect::<Vec<_>>(),
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn playback_control_rejects_partial_frames_on_empty_queue_then_accepts_valid() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        let invalid = decoded_buffer(16, &[0; 6], 0);
+        assert_eq!(
+            control.commit(invalid),
+            Err(OutputError::InvalidBuffer {
+                samples: 3,
+                channels: 2,
+            })
+        );
+        {
+            let queue = control.queue.lock();
+            assert_eq!(queue.enqueue_count, 0);
+            assert!(!queue.initialized);
+            assert!(queue.current.is_none());
+            assert!(queue.queue.is_empty());
+        }
+        let valid = AudioBuffer {
+            timestamp: 1,
+            samples: PcmDecoder::new(16).decode(&[0; 8]).unwrap(),
+            format: test_format(),
+        };
+        control.commit(valid).unwrap();
+        assert_eq!(control.queue.lock().enqueue_count, 1);
+    }
+
+    #[test]
+    fn playback_control_accepts_three_mono_samples() {
+        let control = SyncedPlayer::control_for_test(test_format_mono());
+        let buffer = AudioBuffer {
+            timestamp: 0,
+            samples: PcmDecoder::new(16).decode(&[0; 6]).unwrap(),
+            format: test_format_mono(),
+        };
+        control.commit(buffer).unwrap();
+        assert_eq!(control.queue.lock().enqueue_count, 1);
+    }
+
+    #[test]
+    fn playback_control_clear_drains_queue_before_returning_callback_error() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        control
+            .commit(control_buffer(test_format(), 0))
+            .expect("queue starts healthy");
+        *control.last_error.lock() = Some("callback failed".into());
+        assert_eq!(
+            control.clear(),
+            Err(OutputError::Failed("callback failed".into()))
+        );
+        let queue = control.queue.lock();
+        assert!(queue.queue.is_empty());
+        assert!(queue.current.is_none());
+    }
+
+    #[test]
+    fn playback_control_retains_callback_error_across_operations() {
+        let control = SyncedPlayer::control_for_test(test_format());
+        *control.last_error.lock() = Some("callback failed".into());
+        let expected = |result: Result<(), OutputError>| {
+            assert_eq!(result, Err(OutputError::Failed("callback failed".into())));
+        };
+        expected(control.commit(control_buffer(test_format(), 0)));
+        expected(control.clear());
+        expected(control.set_volume(50));
+        expected(control.set_mute(true));
+        expected(control.set_static_delay(10));
+        assert_eq!(
+            control.last_error.lock().as_deref(),
+            Some("callback failed")
+        );
     }
 
     #[test]
@@ -2136,7 +2456,7 @@ mod tests {
     }
 
     #[test]
-    fn test_queue_clear_bumps_generation() {
+    fn test_queue_clear_advances_playback_reset_generation() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
         let samples = vec![i32::EQUILIBRIUM; 96];
@@ -2146,9 +2466,9 @@ mod tests {
             format,
         });
 
-        let before = queue.generation;
+        let before = queue.playback_reset_generation;
         queue.clear();
-        assert_ne!(queue.generation, before);
+        assert_ne!(queue.playback_reset_generation, before);
         assert!(queue.queue.is_empty());
         assert!(!queue.initialized);
     }
@@ -2848,5 +3168,63 @@ mod tests {
             .next_frame(2, 48_000)
             .expect("should return a frame from the next buffer, not panic");
         assert_eq!(frame[0], 222, "expected frame from the ahead buffer");
+    }
+
+    #[test]
+    fn nested_diagnostic_scopes_flush_only_at_outer_drop() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        {
+            let _outer = DiagnosticScope::new();
+            record_playback_diagnostic(diagnostic());
+            {
+                let _inner = DiagnosticScope::new();
+                record_playback_diagnostic(diagnostic());
+                assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+            }
+            assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        clear_diagnostic_observer();
+    }
+
+    #[test]
+    fn diagnostic_emission_drops_reentrant_records() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            record_playback_diagnostic(diagnostic());
+        });
+        record_playback_diagnostic(diagnostic());
+        clear_diagnostic_observer();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn diagnostic_emission_guard_resets_after_panic() {
+        let panicking = Cell::new(true);
+        install_diagnostic_observer(move |_| {
+            if panicking.replace(false) {
+                panic!("diagnostic callback panic");
+            }
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            record_playback_diagnostic(diagnostic());
+        }));
+        assert!(result.is_err());
+        clear_diagnostic_observer();
+
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&count);
+        install_diagnostic_observer(move |_| {
+            callback_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        record_playback_diagnostic(diagnostic());
+        clear_diagnostic_observer();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

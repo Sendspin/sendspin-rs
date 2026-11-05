@@ -11,6 +11,8 @@ pub mod listener;
 pub mod manager;
 /// Protocol message type definitions and serialization
 pub mod messages;
+pub(crate) mod routing;
+mod state_reporter;
 
 pub use client::{Connection, ConnectionGuard, Controller, WsSender};
 pub use listener::ProtocolListener;

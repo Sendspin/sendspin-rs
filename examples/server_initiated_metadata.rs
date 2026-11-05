@@ -75,9 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             conn.server_hello.connection_reason
         );
 
-        // Only `messages` is consumed: this client negotiates just the
-        // metadata role, so the audio/artwork/visualizer receivers stay
-        // silent and can be ignored. A player would drain those too.
+        // This client negotiates metadata only, so role stream receivers are not consumed.
+        drop(conn.player);
+        drop(conn.artwork);
+        drop(conn.visualizer);
         while let Some(msg) = conn.messages.recv().await {
             match msg {
                 Message::GroupUpdate(g) if g.playback_state == Some(PlaybackState::Playing) => {

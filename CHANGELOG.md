@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking receiving API:** released audio now arrives through the typed `player`, `artwork`, and `visualizer` role sessions rather than the old `connection.audio` receiver and unbounded role chunks. Role configuration and controls are handled through each session’s typed events and controls.
+- Player preparation can run on an application-owned worker without blocking urgent controls or ordered boundaries. `AudioWork::commit` reports `FormatMismatch` only for the mismatched item; transient player output loss is recoverable through fresh installation, while terminal failures remain terminal for custom roles.
+- **Breaking builder:** the player role is no longer enabled by default. Call `player_v1_support` to enable it. A builder with no roles fails to connect, accept, or listen.
+- **Breaking builder:** a player that advertises the `volume` or `mute` command must set the matching `volume` or `muted` field in its initial player state, otherwise it fails to connect, accept, or listen.
+- Automatic player-state reporting is enabled only with the player role and an initial player-state object; applications can disable it and use explicit partial updates or raw client-state transitions.
+
+### Added
+
+- Added `StreamDecoder` for selecting and validating PCM, Opus, and FLAC decoders from each stream configuration.
+- Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
+- Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
+
 ## [0.3.8](https://github.com/Sendspin/sendspin-rs/compare/v0.3.7...v0.3.8) - 2026-10-15
 
 ### Fixed

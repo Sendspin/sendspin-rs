@@ -9,16 +9,9 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 ## Features
 
 - **Zero-copy audio pipeline** - Minimal allocations, maximum performance
-- **Lock-free concurrency** - No contention on audio thread
+- **Responsive concurrency** - Urgent controls are handled independently of audio preparation
 - **Async I/O** - Efficient WebSocket handling with Tokio
 - **Type-safe protocol** - Leverage Rust's type system for correctness
-
-## Performance Targets
-
-- Audio latency: <10ms end-to-end jitter
-- CPU usage: <2% on modern hardware (4-core)
-- Memory: <20MB stable
-- Thread synchronization: Lock-free audio pipeline
 
 ## Current Status
 
@@ -29,10 +22,11 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 - PCM decoder (16-bit and 24-bit)
 - Clock synchronization (NTP-style)
 
-**Phase 2: Audio Pipeline** 🚧 (Next)
-- Audio output (cpal integration)
-- Lock-free scheduler
-- End-to-end player
+**Current capabilities**
+- Ordered role streams with responsive playback controls
+- Minimal player example with cpal output
+- Async protocol I/O
+- Typed player, artwork, and visualizer sessions
 
 
 ## Installing build dependencies
@@ -51,34 +45,20 @@ dnf install alsa-lib-devel
 
 ## Quick Start
 
-Add to your `Cargo.toml`:
+See the [role-session guide](docs/role-sessions.md) for the current receiving API and the
+`examples/` directory for complete clients. A minimal player session starts by attaching an
+output and returns a `PlayerSession`:
 
-```toml
-[dependencies]
-sendspin = "0.1"
-```
-
-### Basic Client Example
-
-```rust
-use sendspin::ProtocolClientBuilder;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
-        .name("My Player".to_string())
-        .build()
-        .connect("ws://localhost:8080/sendspin")
-        .await?;
-
-    // Client is now connected and ready to receive audio
-
-    Ok(())
+```rust,no_run
+fn attach<O: sendspin::audio::PlayerOutput>(
+    receiver: sendspin::audio::PlayerReceiver,
+    output: O,
+) -> sendspin::audio::PlayerSession<O> {
+    receiver.attach(output)
 }
 ```
 
-See `examples/` directory for more examples.
+The guide covers output recovery, controls, and prepared audio work.
 
 ## Architecture
 
