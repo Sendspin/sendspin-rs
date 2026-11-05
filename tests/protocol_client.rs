@@ -7,13 +7,15 @@ use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
     ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
     ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand, PlayerCommandType,
-    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, ServerCommand,
-    StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
-    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
+    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, ServerActivate, ServerCommand,
+    ServerTime, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd,
+    StreamPlayerConfig, StreamRequestFormat, StreamStart, VisualizerDataType,
+    VisualizerFormatRequest,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
 use sendspin::{MemoryStore, ProtocolClientBuilder};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -1565,4 +1567,180 @@ async fn test_concurrent_send_during_disconnect_is_clean() {
     // Err (writer already exited) are both correct. The contract under test is
     // that join! returned at all — neither future deadlocked.
     let _ = send_res;
+}
+
+/// Accept one client on a fresh port and run the server/init, Noise and
+/// hello exchange with it.
+async fn accept_one() -> (
+    String,
+    tokio::task::JoinHandle<TestServer<tokio::net::TcpStream>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        TestServer::handshake(accept_async(stream).await.unwrap())
+            .await
+            .0
+    });
+    (url, server)
+}
+
+#[tokio::test]
+async fn test_client_waits_for_activation_and_clock_sync() {
+    let (url, server) = accept_one().await;
+    let server = tokio::spawn(async move {
+        let mut server = server.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), server.recv())
+                .await
+                .is_err(),
+            "client sent a message before server/activate"
+        );
+        server.activate(vec!["player@v1".to_string()]).await;
+        let mut samples = Vec::new();
+        for _ in 0..2 {
+            match server.recv().await {
+                Some(Message::ClientTime(time)) => samples.push((time, Instant::now())),
+                other => panic!("expected client/time, got {other:?}"),
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), server.recv())
+                .await
+                .is_err(),
+            "client sent client/state before its clock synchronized"
+        );
+        // Report the time each request was held so the round trip stays short.
+        for (time, received) in samples {
+            let t = time.client_transmitted;
+            server
+                .send(&Message::ServerTime(ServerTime {
+                    client_transmitted: t,
+                    server_received: t,
+                    server_transmitted: t + received.elapsed().as_micros() as i64,
+                }))
+                .await;
+        }
+        match server.recv().await {
+            Some(Message::ClientState(_)) => {}
+            other => panic!("expected client/state, got {other:?}"),
+        }
+    });
+    let _client = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
+        .name("Test".to_string())
+        .player_v1_support(player_support())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_unpaired_playback_without_unpaired_access_is_refused() {
+    let (url, server) = accept_one().await;
+    let server = tokio::spawn(async move {
+        let mut server = server.await.unwrap();
+        server.activate(vec!["player@v1".to_string()]).await;
+        match server.recv().await {
+            Some(Message::ClientGoodbye(goodbye)) => {
+                assert_eq!(goodbye.reason, GoodbyeReason::PairingRequired)
+            }
+            other => panic!("expected client/goodbye, got {other:?}"),
+        }
+        assert!(server.recv().await.is_none(), "client kept the connection");
+    });
+    let result = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::new()))
+        .name("Test".to_string())
+        .player_v1_support(player_support())
+        .build()
+        .connect(&url)
+        .await;
+    assert!(matches!(result, Err(Error::Connection(_))));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_role_removal_ends_stream_and_forwards_activation() {
+    let (url, _rx, server_tx, _handle) = start_server(None).await;
+    let client = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
+        .name("Test".to_string())
+        .player_v1_support(player_support())
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+    let mut session = conn.player.attach(TestOutput);
+    server_tx.send(player_stream_start()).unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), session.recv()).await,
+        Ok(Some(PlayerEvent::Start(_)))
+    ));
+
+    server_tx
+        .send(text_message(&Message::ServerActivate(ServerActivate {
+            activities: vec![],
+            active_roles: Some(vec![]),
+        })))
+        .unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(2), session.recv()).await,
+        Ok(Some(PlayerEvent::End))
+    ));
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(2), conn.messages.recv())
+            .await
+            .expect("timed out waiting for server/activate")
+            .expect("message channel closed");
+        if let Message::ServerActivate(activation) = message {
+            assert_eq!(activation.active_roles, Some(vec![]));
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_cleartext_after_handshake_closes_without_goodbye() {
+    let (url, server) = accept_one().await;
+    let server = tokio::spawn(async move {
+        let mut server = server.await.unwrap();
+        server.activate_with(vec![], vec![]).await;
+        server
+            .send_raw(text_message(&Message::ServerCommand(ServerCommand {
+                player: None,
+            })))
+            .await;
+        while let Some(message) = server.recv().await {
+            assert!(
+                !matches!(message, Message::ClientGoodbye(_)),
+                "client said goodbye after cleartext"
+            );
+        }
+    });
+    let client = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::new()))
+        .name("Test".to_string())
+        .metadata()
+        .build()
+        .connect(&url)
+        .await
+        .unwrap();
+    let mut conn = client.split();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), conn.messages.recv())
+            .await
+            .expect("connection stayed open after cleartext")
+            .is_none()
+    );
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("client did not close the connection")
+        .unwrap();
 }
