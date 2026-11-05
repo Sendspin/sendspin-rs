@@ -76,23 +76,12 @@ struct Peer {
     writer: tokio::sync::mpsc::UnboundedSender<WsMessage>,
 }
 
-/// Whether a server activates the client to play or only keeps it idle.
-#[derive(Clone, Copy)]
-enum Intent {
-    Playback,
-    Idle,
-}
-
-async fn connect_peer(url: &str, name: &str, intent: Intent) -> Peer {
+async fn connect_peer(url: &str, name: &str, activities: Vec<Activity>) -> Peer {
     let (ws, _) = timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("peer establishment timed out")
         .expect("WS connect failed");
     let (mut server, _) = TestServer::handshake_as(ws, name).await;
-    let activities = match intent {
-        Intent::Playback => vec![Activity::Playback],
-        Intent::Idle => vec![],
-    };
     server
         .activate_with(activities, vec!["player@v1".to_string()])
         .await;
@@ -170,7 +159,7 @@ async fn expect_channels_close(conn: &mut sendspin::ManagedConnection) {
 #[tokio::test]
 async fn manager_role_session_handoff_and_displacement_fences_audio() {
     let (url, mut mgr) = manager(None).await;
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Idle).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .unwrap()
@@ -229,7 +218,7 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
         }
         other => panic!("expected audio event, got {other:?}"),
     };
-    let peer_b = connect_peer(&url, "server-b", Intent::Playback).await;
+    let peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -341,7 +330,7 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
 async fn test_first_server_is_promoted() {
     let (url, mut mgr) = manager(None).await;
 
-    let _peer = connect_peer(&url, "server-a", Intent::Idle).await;
+    let _peer = connect_peer(&url, "server-a", vec![]).await;
 
     let conn = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
@@ -356,11 +345,11 @@ async fn test_first_server_is_promoted() {
 async fn test_playback_displaces_idle_incumbent() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Idle).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let _peer_b = connect_peer(&url, "server-b", Intent::Playback).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
 
     // The displaced incumbent gets an automatic goodbye(another_server)...
     assert_eq!(
@@ -381,13 +370,13 @@ async fn test_playback_displaces_idle_incumbent() {
 async fn test_idle_never_displaces_playback() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
     // Even the last-played server cannot displace active playback.
     mgr.set_last_played(Some(server_id("server-b")));
-    let mut peer_b = connect_peer(&url, "server-b", Intent::Idle).await;
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
 
     // The rejected newcomer gets the goodbye; the incumbent stays quiet.
     assert_eq!(
@@ -402,11 +391,11 @@ async fn test_last_played_breaks_idle_tie() {
     let (url, mut mgr) = manager(None).await;
     mgr.set_last_played(Some(server_id("server-b")));
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Idle).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let _peer_b = connect_peer(&url, "server-b", Intent::Idle).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -422,11 +411,11 @@ async fn test_last_played_breaks_idle_tie() {
 async fn test_idle_tie_defaults_to_keep() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Idle).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let mut peer_b = connect_peer(&url, "server-b", Intent::Idle).await;
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
     assert_eq!(
         expect_goodbye(&mut peer_b).await,
         GoodbyeReason::AnotherServer
@@ -438,7 +427,7 @@ async fn test_idle_tie_defaults_to_keep() {
 async fn test_incumbent_death_frees_slot() {
     let (url, mut mgr) = manager(None).await;
 
-    let peer_a = connect_peer(&url, "server-a", Intent::Idle).await;
+    let peer_a = connect_peer(&url, "server-a", vec![]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
@@ -448,7 +437,7 @@ async fn test_incumbent_death_frees_slot() {
 
     // A plain idle connection (not last-played) must now be promoted:
     // the dead incumbent may no longer win arbitration.
-    let mut peer_b = connect_peer(&url, "server-b", Intent::Idle).await;
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
     let conn_b = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out")
@@ -466,7 +455,7 @@ async fn test_disconnect_sends_goodbye_and_keeps_listening() {
         .await
         .expect("no-op disconnect");
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
 
     mgr.disconnect(GoodbyeReason::UserRequest)
@@ -479,7 +468,7 @@ async fn test_disconnect_sends_goodbye_and_keeps_listening() {
     expect_channels_close(&mut conn_a).await;
 
     // The manager keeps listening: a new server can still connect.
-    let _peer_b = connect_peer(&url, "server-b", Intent::Idle).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![]).await;
     let conn_b = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out")
@@ -491,12 +480,12 @@ async fn test_disconnect_sends_goodbye_and_keeps_listening() {
 async fn test_playback_displaces_playback() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", Intent::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
     assert_eq!(conn_a.server_id, server_id("server-a"));
 
     // Newest playback intent wins even against a playback incumbent.
-    let _peer_b = connect_peer(&url, "server-b", Intent::Playback).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -568,7 +557,7 @@ async fn test_stalled_handshake_is_reaped_and_frees_slot() {
 
     // A real server connecting behind it must still establish once the
     // stalled peer is reaped at the deadline.
-    let _peer = connect_peer(&url, "server-a", Intent::Playback).await;
+    let _peer = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out — stalled peer was never reaped")

@@ -88,8 +88,7 @@ async fn writer_task<S>(
     // connection (see `WsSender::send_message`).
 }
 
-/// Remove role objects for roles the server has not activated. Returns
-/// `None` when nothing is left to send.
+/// Remove role objects for inactive roles, returning `None` when nothing is left to send.
 fn strip_inactive_roles(msg: Message, activation: &ServerActivate) -> Option<Message> {
     match msg {
         Message::ClientState(mut state) if !activation.is_active(PLAYER_V1) => {
@@ -1051,7 +1050,7 @@ impl ProtocolClient {
             Ok(activation) => activation,
             Err(reason) => {
                 log::warn!("Rejecting the server's activation: {reason:?}");
-                perform_goodbye(&mut write, &mut encryptor, reason.clone()).await?;
+                let _ = perform_goodbye(&mut write, &mut encryptor, reason.clone()).await;
                 return Err(Error::Connection(format!(
                     "rejected server/activate ({reason:?})"
                 )));
@@ -1325,10 +1324,8 @@ impl Router {
                     break;
                 }
             };
-            // Arrival time is taken once the message is decrypted and reassembled.
-            let arrival = self.clock.now_micros();
             if plaintext[0] == MESSAGE_TYPE_JSON {
-                if !self.handle_json(&plaintext[1..], arrival) {
+                if !self.handle_json(&plaintext[1..], self.clock.now_micros()) {
                     break;
                 }
                 continue;
@@ -1410,9 +1407,9 @@ impl Router {
         };
         match msg {
             // ServerTime is consumed here for clock sync and intentionally
-            // NOT forwarded to message_rx consumers — it's an internal
+            // NOT forwarded to message_rx consumers, since it's an internal
             // protocol detail. It also arrives at 1Hz for as long as the
-            // connection lives, so it stays out of the debug view;
+            // connection lives, so it stays out of the debug view.
             // ClockSync::update logs the computed sync state instead.
             Message::ServerTime(st) => {
                 let mut clock_sync = self.clock_sync.lock();
@@ -1521,18 +1518,32 @@ mod tests {
         }
     }
 
-    fn test_router(
-        decryptor: Decryptor,
-        sinks: crate::protocol::routing::ReceiveSinks,
-        clock: Arc<dyn Clock>,
-        clock_sync: Arc<Mutex<ClockSync>>,
-    ) -> Router {
+    #[tokio::test]
+    async fn router_consumes_server_time_after_all_endpoints_are_dropped() {
+        let (left, right) = duplex(4096);
+        let mut server = WebSocketStream::from_raw_socket(left, Role::Server, None).await;
+        let client = WebSocketStream::from_raw_socket(right, Role::Client, None).await;
+        let (_, read) = client.split();
+        let (sinks, player, artwork, visualizer, messages) =
+            crate::protocol::routing::ReceiveSinks::channel(AppliedControls {
+                volume: 100,
+                muted: false,
+                static_delay_ms: 0,
+            });
+        drop(player);
+        drop(artwork);
+        drop(visualizer);
+        drop(messages);
+
+        let (mut encryptor, decryptor) = noise::test_session_pair();
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let stream_state = Arc::new(StreamState::default());
         let (tx, _) = unbounded_channel();
-        Router {
+        let router = Router {
             decryptor,
             sinks,
-            clock_sync,
+            clock_sync: Arc::clone(&clock_sync),
             clock,
             stream_state: Arc::clone(&stream_state),
             activation: watch::channel(ServerActivate {
@@ -1554,30 +1565,7 @@ mod tests {
                 stream_state,
             },
             synced: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn router_consumes_server_time_after_all_endpoints_are_dropped() {
-        let (left, right) = duplex(4096);
-        let mut server = WebSocketStream::from_raw_socket(left, Role::Server, None).await;
-        let client = WebSocketStream::from_raw_socket(right, Role::Client, None).await;
-        let (_, read) = client.split();
-        let (sinks, player, artwork, visualizer, messages) =
-            crate::protocol::routing::ReceiveSinks::channel(AppliedControls {
-                volume: 100,
-                muted: false,
-                static_delay_ms: 0,
-            });
-        drop(player);
-        drop(artwork);
-        drop(visualizer);
-        drop(messages);
-
-        let (mut encryptor, decryptor) = noise::test_session_pair();
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
-        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
-        let router = test_router(decryptor, sinks, clock, Arc::clone(&clock_sync));
+        };
         let mut router = tokio::spawn(router.run(read));
 
         let mut audio = 42_i64.to_be_bytes().to_vec();

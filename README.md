@@ -76,7 +76,7 @@ let builder = ProtocolClientBuilder::builder()
     .build();
 ```
 
-With unpaired access on, anyone who can intercept the connection can pose as the server, so only turn it on in a network you trust. The examples turn it on.
+With unpaired access on, any device on your network can act as a server for this client, so only turn it on in a network you trust. The examples turn it on.
 
 The persistence store keeps the client's identity key. Keep it across restarts, since the client gets a new `client_id` whenever the key is lost.
 

@@ -108,6 +108,7 @@ pub struct ClientInit {
 
 /// Noise cipher suite
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CipherSuite {
     /// `25519_ChaChaPoly_SHA256`
     #[serde(rename = "25519_ChaChaPoly_SHA256")]
@@ -365,7 +366,7 @@ pub struct ServerActivate {
 }
 
 impl ServerActivate {
-    /// Whether `role` (a versioned name such as `controller@v1`) is active.
+    /// Whether the versioned `role` is active.
     pub fn is_active(&self, role: &str) -> bool {
         self.active_roles
             .as_ref()
@@ -374,8 +375,9 @@ impl ServerActivate {
 }
 
 /// Purpose a server declares for a connection
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Activity {
     /// Normal playback and control
     Playback,

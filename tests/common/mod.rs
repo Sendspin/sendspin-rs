@@ -142,7 +142,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TestServer<S> {
         }
     }
 
-    /// Send a decrypted binary message (message type in byte 0) encrypted.
+    /// Encrypt and send a binary message whose first byte is its type.
     pub async fn send_plaintext(&mut self, plaintext: &[u8]) {
         let mut ciphertext = vec![0_u8; plaintext.len() + 16];
         let len = self

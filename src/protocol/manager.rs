@@ -18,8 +18,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
-/// The multi-server arbitration rule: should the newly activated
-/// `candidate` (with `candidate_server_id`) displace the `current` server?
+/// The multi-server arbitration rule: should the newly activated server
+/// `candidate_server_id` displace the `current` server?
 /// Each side is judged by the activities of its first `server/activate`.
 ///
 /// [`ConnectionManager`] applies this automatically; it is public so
@@ -53,8 +53,8 @@ pub const DEFAULT_GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tuning for [`ConnectionManager`].
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
-    /// Deadline for an inbound connection to complete TLS + WebSocket +
-    /// protocol handshake, measured from TCP accept. Peers that stall are
+    /// Deadline for an inbound connection to complete the WebSocket and
+    /// protocol handshakes, measured from TCP accept. Peers that stall are
     /// dropped. Default: [`DEFAULT_ESTABLISH_TIMEOUT`].
     pub establish_timeout: Duration,
     /// Maximum number of inbound connections concurrently working through
@@ -244,7 +244,7 @@ impl ConnectionManager {
     }
 
     /// Set (or clear, with `None`) the last-played server ID used to break
-    /// ties between two `discovery` connections. Persisting this across runs
+    /// ties between two idle connections. Persisting this across runs
     /// is the application's responsibility.
     pub fn set_last_played(&self, server_id: Option<String>) {
         // Send failure means the driver is gone; arbitration is moot then.

@@ -40,6 +40,8 @@ const MESSAGE_TYPE_FRAGMENT: u8 = 1;
 const FRAGMENT_LAST: u8 = 0x01;
 const FRAGMENT_FIRST: u8 = 0x02;
 const FRAGMENT_RESERVED: u8 = 0xFC;
+/// Largest reassembled message accepted, above any artwork a client asks for.
+const MAX_REASSEMBLED: usize = 16 * 1024 * 1024;
 
 fn noise_error(error: snow::Error) -> Error {
     Error::Protocol(format!("Noise: {error}"))
@@ -127,7 +129,7 @@ pub(crate) struct Session {
 }
 
 /// Next complete WebSocket message within [`HANDSHAKE_TIMEOUT`], skipping control frames.
-pub(crate) async fn next_handshake_frame<S>(
+async fn next_handshake_frame<S>(
     stream: &mut SplitStream<WebSocketStream<S>>,
 ) -> Result<WsMessage, Error>
 where
@@ -275,8 +277,8 @@ pub(crate) async fn send_encrypted<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Time pings go out at 1Hz for as long as the connection lives; keep
-    // that housekeeping at trace so debug shows only meaningful traffic.
+    // Time pings go out at 1Hz for as long as the connection lives, so they
+    // log at trace to keep debug for meaningful traffic.
     let level = if matches!(message, Message::ClientTime(_)) {
         log::Level::Trace
     } else {
@@ -386,11 +388,7 @@ pub(crate) struct Decryptor {
 }
 
 impl Decryptor {
-    /// Decrypt one binary message. Returns the complete plaintext (message
-    /// type in byte 0), or `None` while a fragmented message is in flight.
-    ///
-    /// An error means the connection must close: the message failed
-    /// authentication or broke the fragmentation rules.
+    /// Decrypt one binary message, returning `None` while a fragmented message is in flight.
     pub(crate) fn open(&mut self, ciphertext: &[u8]) -> Result<Option<Vec<u8>>, Error> {
         let mut plaintext = vec![0_u8; ciphertext.len()];
         let len = self
@@ -425,10 +423,14 @@ impl Decryptor {
             }
             self.reassembly = Some([&[orig_type], &fragment[3..]].concat());
         } else {
-            self.reassembly
+            let buffer = self
+                .reassembly
                 .as_mut()
-                .ok_or_else(|| Error::Protocol("fragment without a first fragment".to_string()))?
-                .extend_from_slice(&fragment[2..]);
+                .ok_or_else(|| Error::Protocol("fragment without a first fragment".to_string()))?;
+            if buffer.len() + fragment.len() - 2 > MAX_REASSEMBLED {
+                return Err(Error::Protocol("fragmented message too large".to_string()));
+            }
+            buffer.extend_from_slice(&fragment[2..]);
         }
         Ok(if flags & FRAGMENT_LAST != 0 {
             self.reassembly.take()
@@ -562,6 +564,17 @@ mod tests {
         let sealed = encryptor.seal(MESSAGE_TYPE_JSON, b"{}").unwrap();
         decryptor.open(binary(&sealed[0])).unwrap();
         assert!(decryptor.open(binary(&sealed[0])).is_err());
+    }
+
+    #[test]
+    fn an_oversized_fragmented_message_is_rejected() {
+        let (mut encryptor, mut decryptor) = test_session_pair();
+        let fragments = encryptor.seal(4, &vec![0_u8; MAX_REASSEMBLED + 1]).unwrap();
+        let (last, rest) = fragments.split_last().unwrap();
+        for fragment in rest {
+            assert!(decryptor.open(binary(fragment)).unwrap().is_none());
+        }
+        assert!(decryptor.open(binary(last)).is_err());
     }
 
     #[test]
