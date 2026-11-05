@@ -1,17 +1,19 @@
-use futures_util::{SinkExt, StreamExt};
+mod common;
+
+use common::TestServer;
 use sendspin::audio::decode::{Decoder, OpusDecoder, PcmDecoder};
 use sendspin::audio::{
     AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput, PlayerStatus,
 };
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ArtworkSource, AudioFormatSpec, ClientSyncState, ConnectionReason, ImageFormat, Message,
-    PlayerCommand, PlayerCommandType, PlayerState, PlayerStateCommand, PlayerV1Support,
-    ServerCommand, ServerHello, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear,
-    StreamEnd, StreamPlayerConfig, StreamStart, StreamVisualizerConfig, VisualizerDataType,
+    ArtworkSource, AudioFormatSpec, ClientSyncState, ImageFormat, Message, PlayerCommand,
+    PlayerCommandType, PlayerState, PlayerStateCommand, PlayerV1Support, ServerCommand,
+    StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
+    StreamStart, StreamVisualizerConfig, VisualizerDataType,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
-use sendspin::{Clock, ProtocolClientBuilder};
+use sendspin::{Clock, MemoryStore, ProtocolClientBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -232,51 +234,51 @@ async fn fixture_with(
 ) -> Fixture {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let client_ws = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
-    let mut server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+    let server_ws = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
     let (server_tx, mut commands) = mpsc::unbounded_channel();
     let (observed_tx, mut observed) = mpsc::unbounded_channel();
+    let clock = Arc::new(FakeClock::new());
+    let server_clock = clock.clone();
     tokio::spawn(async move {
-        let hello = server_ws
-            .next()
-            .await
-            .expect("client hello")
-            .expect("hello frame");
-        let hello_text = match hello {
-            WsMessage::Text(text) => text,
-            other => panic!("expected client/hello, got {other:?}"),
-        };
-        assert!(matches!(
-            serde_json::from_str::<Message>(&hello_text).unwrap(),
-            Message::ClientHello(_)
-        ));
-        let hello = Message::ServerHello(ServerHello {
-            server_id: "role-events".into(),
-            name: "Role events".into(),
-            version: 1,
-            active_roles: vec![
+        let (mut server, _) = TestServer::handshake(server_ws).await;
+        server
+            .activate(vec![
                 "player@v1".into(),
                 "artwork@v1".into(),
                 "visualizer@v1".into(),
-            ],
-            connection_reason: ConnectionReason::Playback,
-        });
-        server_ws
-            .send(WsMessage::Text(
-                serde_json::to_string(&hello).unwrap().into(),
-            ))
-            .await
-            .unwrap();
+            ])
+            .await;
+        // Answer the two fast-start samples the client waits on before its
+        // initial client/state, and let tests observe and answer later ones.
+        // The clock advances so the filter accepts both samples.
+        let mut fast_start_samples = 2;
         loop {
             tokio::select! {
-                command = commands.recv() => match command { Some(frame) => { if server_ws.send(frame).await.is_err() { break; } }, None => break },
-                frame = server_ws.next() => match frame { Some(Ok(WsMessage::Text(text))) => { if let Ok(message) = serde_json::from_str::<Message>(&text) { let _ = observed_tx.send(message); } }, Some(Ok(WsMessage::Close(_))) | None => break, Some(Ok(_)) => {}, Some(Err(_)) => break }
+                command = commands.recv() => match command {
+                    Some(frame) => server.send_frame(frame).await,
+                    None => break,
+                },
+                json = server.recv_json() => {
+                    let Some(json) = json else { break };
+                    let message = serde_json::from_str::<Message>(&json).unwrap();
+                    match message {
+                        Message::ClientTime(time) if fast_start_samples > 0 => {
+                            fast_start_samples -= 1;
+                            server_clock.set(server_clock.now_micros() + 1);
+                            server.answer_time(&time).await;
+                        }
+                        message => {
+                            let _ = observed_tx.send(message);
+                        }
+                    }
+                }
             }
         }
     });
-    let clock = Arc::new(FakeClock::new());
     let clock_trait: Arc<dyn Clock> = clock.clone();
     let builder = ProtocolClientBuilder::builder()
-        .client_id("role-events".into())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Role events".into())
         .player_v1_support(player_support())
         .automatic_player_state(automatic_player_state);
@@ -827,10 +829,10 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
         .unwrap()
     {
         Some(Message::ClientTime(time)) => time.client_transmitted,
-        other => panic!("expected first observed ClientTime before reply, got {other:?}"),
+        other => panic!("expected an observed ClientTime before reply, got {other:?}"),
     };
     let mut split = f.client.split();
-    assert_eq!(split.clock_sync.lock().rtt_micros(), None);
+    f.clock.set(t1 + 1_000);
     let mut session = split.player.attach(Events::default());
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())

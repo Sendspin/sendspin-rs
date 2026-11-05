@@ -1,15 +1,18 @@
 // ABOUTME: Integration tests for ProtocolListener — inbound (server-initiated)
 // ABOUTME: WebSocket acceptor that drives the protocol-client state machine.
 
-use futures_util::{SinkExt, StreamExt};
+mod common;
+
+use common::TestServer;
+use futures_util::StreamExt;
 use sendspin::audio::decode::{Decoder, PcmDecoder};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientCommand, ClientSyncState, ConnectionReason, GoodbyeReason, Message,
-    PlayerState, PlayerV1Support, ServerHello, StreamPlayerConfig, StreamStart,
+    AudioFormatSpec, ClientCommand, ClientSyncState, GoodbyeReason, Message, PlayerState,
+    PlayerV1Support, StreamPlayerConfig, StreamStart,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{MemoryStore, ProtocolClientBuilder};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,9 +38,15 @@ impl PlayerOutput for ListenerOutput {
         Ok(())
     }
 }
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage, WebSocketStream};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::{
+    connect_async, tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream,
+};
 
 fn player_support() -> PlayerV1Support {
     let format = |codec: &str, bit_depth| AudioFormatSpec {
@@ -53,82 +62,37 @@ fn player_support() -> PlayerV1Support {
     }
 }
 
-/// Test peer that plays the protocol-server role over an already-connected
-/// WebSocket stream: replies to `client/hello` with `server/hello`, then
-/// forwards every subsequent text frame to the returned channel, and returns a
-/// writer for server-initiated frames. Generic over the transport so it serves
-/// both the plaintext and TLS connect paths.
-async fn run_peer<S>(
-    ws: WebSocketStream<S>,
-    active_roles: Vec<String>,
-) -> (
-    Vec<String>,
-    tokio::sync::mpsc::UnboundedReceiver<String>,
-    tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::UnboundedSender<WsMessage>,
-)
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut write, mut read) = ws.split();
-
-    let hello_text = match read.next().await.expect("no hello").expect("ws error") {
-        WsMessage::Text(t) => t,
-        other => panic!("expected text client/hello, got {:?}", other),
-    };
-    let parsed: Message = serde_json::from_str(&hello_text).expect("client/hello must deserialize");
-    let supported_roles = match parsed {
-        Message::ClientHello(h) => h.supported_roles,
-        other => panic!("first message should be client/hello, got {:?}", other),
-    };
-
-    let server_hello = serde_json::to_string(&Message::ServerHello(ServerHello {
-        server_id: "test-server".to_string(),
-        name: "Test Server".to_string(),
-        version: 1,
-        active_roles,
-        connection_reason: ConnectionReason::Playback,
-    }))
-    .unwrap();
-    write
-        .send(WsMessage::Text(server_hello.into()))
-        .await
-        .expect("send server/hello");
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = tokio::spawn(async move {
-        while let Some(Ok(msg)) = read.next().await {
-            let text = match msg {
-                WsMessage::Text(t) => t,
-                WsMessage::Close(_) => break,
-                _ => continue,
-            };
-            if tx.send(text.to_string()).is_err() {
-                break;
-            }
-        }
-    });
-
-    let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _writer_task = tokio::spawn(async move {
-        while let Some(frame) = writer_rx.recv().await {
-            if write.send(frame).await.is_err() {
-                break;
-            }
-        }
-    });
-    (supported_roles, rx, handle, writer_tx)
+/// The server end of an inbound connection after the handshake and activation.
+struct Peer {
+    supported_roles: Vec<String>,
+    server_id: String,
+    /// Every client JSON message except `client/time`.
+    rx: UnboundedReceiver<String>,
+    /// Finishes once the client closes the connection.
+    reader: JoinHandle<()>,
+    writer: UnboundedSender<WsMessage>,
 }
 
-async fn drive_peer_until_state(
-    url: &str,
+async fn run_peer(
+    ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     active_roles: Vec<String>,
-) -> (
-    Vec<String>,
-    tokio::sync::mpsc::UnboundedReceiver<String>,
-    tokio::task::JoinHandle<()>,
-    tokio::sync::mpsc::UnboundedSender<WsMessage>,
-) {
+) -> Peer {
+    let (mut server, hello) = TestServer::handshake(ws).await;
+    server.activate(active_roles).await;
+    let server_id = server.server_id.clone();
+    let (tx, rx) = unbounded_channel();
+    let (writer, writer_rx) = unbounded_channel();
+    let reader = tokio::spawn(server.serve(tx, writer_rx));
+    Peer {
+        supported_roles: hello.supported_roles,
+        server_id,
+        rx,
+        reader,
+        writer,
+    }
+}
+
+async fn drive_peer_until_state(url: &str, active_roles: Vec<String>) -> Peer {
     let (ws, _) = connect_async(url).await.expect("WS connect failed");
     run_peer(ws, active_roles).await
 }
@@ -141,7 +105,7 @@ async fn bind_listener(builder: ProtocolClientBuilder) -> (String, sendspin::Pro
 }
 
 /// `true` once a `client/goodbye` arrives; `false` if the peer goes quiet for 2s.
-async fn wait_for_goodbye(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> bool {
+async fn wait_for_goodbye(rx: &mut UnboundedReceiver<String>) -> bool {
     while let Ok(Some(text)) = timeout(Duration::from_secs(2), rx.recv()).await {
         if matches!(
             serde_json::from_str::<Message>(&text),
@@ -153,7 +117,7 @@ async fn wait_for_goodbye(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>)
     false
 }
 
-async fn wait_for_peer_close(reader: tokio::task::JoinHandle<()>) {
+async fn wait_for_peer_close(reader: JoinHandle<()>) {
     timeout(Duration::from_secs(2), reader)
         .await
         .expect("peer did not observe WebSocket close")
@@ -163,7 +127,8 @@ async fn wait_for_peer_close(reader: tokio::task::JoinHandle<()>) {
 #[tokio::test]
 async fn test_listen_role_session_delivers_player_events() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("listener-role".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Listener Role".to_string())
         .player_v1_support(player_support())
         .build();
@@ -176,7 +141,7 @@ async fn test_listen_role_session_delivers_player_events() {
         .await
         .expect("accept timeout")
         .expect("accept");
-    let (_roles, _rx, _reader, writer) = peer.await.expect("peer task");
+    let peer = peer.await.expect("peer task");
     let split = client.split();
     let output = ListenerOutput::default();
     let mut session = split.player.attach(output.clone());
@@ -191,7 +156,7 @@ async fn test_listen_role_session_delivers_player_events() {
         artwork: None,
         visualizer: None,
     });
-    writer
+    peer.writer
         .send(WsMessage::Text(
             serde_json::to_string(&start).unwrap().into(),
         ))
@@ -199,7 +164,7 @@ async fn test_listen_role_session_delivers_player_events() {
     let mut frame = vec![binary_types::PLAYER_AUDIO];
     frame.extend_from_slice(&77i64.to_be_bytes());
     frame.extend_from_slice(&[0, 0x10, 0, 0xf0]);
-    writer.send(WsMessage::Binary(frame.into())).unwrap();
+    peer.writer.send(WsMessage::Binary(frame.into())).unwrap();
     match timeout(Duration::from_secs(5), session.recv())
         .await
         .unwrap()
@@ -244,7 +209,8 @@ async fn test_listen_role_session_delivers_player_events() {
 #[tokio::test]
 async fn test_listen_accepts_and_drives_handshake() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-inbound".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test Inbound".to_string())
         .player_v1_support(player_support())
         .initial_player_state(PlayerState {
@@ -270,16 +236,13 @@ async fn test_listen_accepts_and_drives_handshake() {
         .expect("accept failed");
     assert!(peer_addr.ip().is_loopback(), "peer addr should be loopback");
 
-    // The application uses these fields for the multi-server keep-or-switch
-    // policy described on `ProtocolListener`; the listener must surface them
-    // verbatim from `server/hello`.
-    let hello = client.server_hello();
-    assert_eq!(hello.server_id, "test-server");
-    assert_eq!(hello.connection_reason, ConnectionReason::Playback);
-    assert_eq!(hello.active_roles, vec!["player@v1".to_string()]);
-
-    let (supported_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task panicked");
-    assert_eq!(supported_roles, vec!["player@v1".to_string()]);
+    let mut peer = peer.await.expect("peer task panicked");
+    assert_eq!(peer.supported_roles, vec!["player@v1".to_string()]);
+    // The application uses these for the multi-server keep-or-switch policy
+    // described on `ProtocolListener`.
+    assert_eq!(client.server_id(), peer.server_id);
+    assert!(client.activation().is_active("player@v1"));
+    let rx = &mut peer.rx;
 
     let first_after_hello = timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -303,7 +266,7 @@ async fn test_listen_accepts_and_drives_handshake() {
         .expect("disconnect");
 
     assert!(
-        wait_for_goodbye(&mut rx).await,
+        wait_for_goodbye(rx).await,
         "never received client/goodbye over inbound link"
     );
 }
@@ -311,7 +274,8 @@ async fn test_listen_accepts_and_drives_handshake() {
 #[tokio::test]
 async fn test_listen_path_match_accepts() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-path".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test Path".to_string())
         .player_v1_support(player_support())
         .build();
@@ -333,7 +297,7 @@ async fn test_listen_path_match_accepts() {
         .expect("accept timed out")
         .expect("accept");
 
-    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task");
+    let mut peer = peer.await.expect("peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
@@ -341,7 +305,7 @@ async fn test_listen_path_match_accepts() {
         .expect("disconnect");
 
     assert!(
-        wait_for_goodbye(&mut rx).await,
+        wait_for_goodbye(&mut peer.rx).await,
         "matched-path connection never delivered client/goodbye"
     );
 }
@@ -352,7 +316,8 @@ async fn test_listen_path_match_accepts() {
 #[tokio::test]
 async fn test_listen_path_normalizes_missing_leading_slash() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-path-norm".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test Path Norm".to_string())
         .player_v1_support(player_support())
         .build();
@@ -373,14 +338,14 @@ async fn test_listen_path_normalizes_missing_leading_slash() {
         .await
         .expect("accept timed out")
         .expect("accept");
-    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task");
+    let mut peer = peer.await.expect("peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
         .await
         .expect("disconnect");
     assert!(
-        wait_for_goodbye(&mut rx).await,
+        wait_for_goodbye(&mut peer.rx).await,
         "normalized-path connection never delivered client/goodbye"
     );
 }
@@ -388,7 +353,8 @@ async fn test_listen_path_normalizes_missing_leading_slash() {
 #[tokio::test]
 async fn test_listen_path_mismatch_rejects_but_listener_survives() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-path-reject".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test Path Reject".to_string())
         .player_v1_support(player_support())
         .build();
@@ -421,24 +387,24 @@ async fn test_listen_path_mismatch_rejects_but_listener_survives() {
         .await
         .expect("second accept timed out")
         .expect("second accept");
-    let (_roles, mut rx, reader, writer) = good_peer.await.expect("good peer task");
+    let mut peer = good_peer.await.expect("good peer task");
 
     client
         .disconnect(GoodbyeReason::Shutdown)
         .await
         .expect("disconnect");
     assert!(
-        wait_for_goodbye(&mut rx).await,
+        wait_for_goodbye(&mut peer.rx).await,
         "matched-path connection never delivered client/goodbye"
     );
-    drop(writer);
-    wait_for_peer_close(reader).await;
+    wait_for_peer_close(peer.reader).await;
 }
 
 #[tokio::test]
 async fn test_listen_local_addr_resolves_ephemeral_port() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-local-addr".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build();
@@ -456,7 +422,8 @@ async fn test_listen_local_addr_resolves_ephemeral_port() {
 #[tokio::test]
 async fn test_listen_send_message_fails_after_disconnect() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-listen-disc".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build();
@@ -470,22 +437,13 @@ async fn test_listen_send_message_fails_after_disconnect() {
         .await
         .expect("accept timed out")
         .expect("accept");
-    let (_roles, _rx, _peer_handle, _writer) = peer.await.expect("peer task");
+    let peer = peer.await.expect("peer task");
 
     let conn = client.split();
-    // `split()` must carry `server_hello` through to `Connection` — the
-    // post-split handle is what most apps actually hold onto, and every
-    // field it carries (server_id, connection_reason, active_roles) is on
-    // the documented arbitration path.
-    assert_eq!(conn.server_hello.server_id, "test-server");
-    assert_eq!(
-        conn.server_hello.connection_reason,
-        ConnectionReason::Playback
-    );
-    assert_eq!(
-        conn.server_hello.active_roles,
-        vec!["player@v1".to_string()]
-    );
+    // `split()` must carry the arbitration inputs through to `Connection`,
+    // the post-split handle most apps hold onto.
+    assert_eq!(conn.server_id, peer.server_id);
+    assert!(conn.activation.is_active("player@v1"));
     let sender = conn.sender;
     let guard = conn.guard;
     guard
@@ -502,13 +460,14 @@ async fn test_listen_send_message_fails_after_disconnect() {
     );
 }
 
-/// A peer that completes the WebSocket upgrade but never sends `server/hello`
+/// A peer that completes the WebSocket upgrade but never sends `server/init`
 /// must leave `accept()` pending — it must not spuriously resolve. Callers
 /// guard against this with a timeout, which this test stands in for.
 #[tokio::test]
 async fn test_listen_accept_pending_when_peer_stalls_handshake() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-stall".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build();
@@ -516,7 +475,7 @@ async fn test_listen_accept_pending_when_peer_stalls_handshake() {
 
     let _peer = tokio::spawn(async move {
         let (mut ws, _) = connect_async(&url).await.expect("connect");
-        // Read client/hello but deliberately never reply with server/hello,
+        // Read client/init but deliberately never reply with server/init,
         // holding the socket open so the SDK blocks awaiting it.
         let _ = ws.next().await;
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -526,76 +485,36 @@ async fn test_listen_accept_pending_when_peer_stalls_handshake() {
     let timed_out = timeout(Duration::from_millis(500), listener.accept())
         .await
         .is_err();
-    assert!(timed_out, "accept() resolved before server/hello arrived");
+    assert!(timed_out, "accept() resolved before server/init arrived");
 }
 
-/// TLS path: the listener terminates TLS with a runtime-generated self-signed
-/// identity and a peer that opts into trusting it completes the full
-/// WebSocket + protocol handshake. The rest of the suite only covers
-/// plaintext, so this is the sole end-to-end exercise of `tls()` and the TLS
-/// branch of `accept()`.
-#[cfg(feature = "native-tls")]
+/// Browsers always send `Origin`, so rejecting it keeps web pages from
+/// reaching the client.
 #[tokio::test]
-async fn test_listen_tls_terminates_and_drives_handshake() {
-    use tokio_tungstenite::Connector;
-
-    // Throwaway self-signed localhost identity, password "test". PKCS#12 is
-    // the one Identity format native-tls imports reliably across all three
-    // backends (SecureTransport / SChannel / OpenSSL); from_pkcs8 is rejected
-    // by SecureTransport.
-    let identity =
-        native_tls::Identity::from_pkcs12(include_bytes!("fixtures/localhost.p12"), "test")
-            .expect("build TLS identity from fixture");
-
+async fn test_listen_rejects_upgrade_with_origin() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-tls".to_string())
-        .name("Test TLS".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
+        .name("Test".to_string())
         .player_v1_support(player_support())
         .build();
-    let listener = builder
-        .listen("127.0.0.1:0")
-        .await
-        .expect("listen")
-        .tls(identity)
-        .expect("tls");
-    let addr = listener.local_addr().expect("local_addr");
-    let url = format!("wss://{addr}/");
+    let (url, listener) = bind_listener(builder).await;
 
     let peer = tokio::spawn(async move {
-        // Self-signed and freshly generated, so the peer must opt out of
-        // verification — a test decision, never a runtime one.
-        let connector = Connector::NativeTls(
-            native_tls::TlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()
-                .expect("build TLS connector"),
-        );
-        let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-            url.as_str(),
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .expect("TLS WebSocket connect");
-        run_peer(ws, vec!["player@v1".to_string()]).await
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Origin", HeaderValue::from_static("https://example.com"));
+        connect_async(request).await
     });
-
-    let (client, peer_addr) = timeout(Duration::from_secs(5), listener.accept())
+    let accepted = timeout(Duration::from_secs(5), listener.accept())
         .await
-        .expect("accept timed out")
-        .expect("accept over TLS");
-    assert!(peer_addr.ip().is_loopback(), "peer addr should be loopback");
-
-    let (_roles, mut rx, _peer_handle, _writer) = peer.await.expect("peer task panicked");
-
-    client
-        .disconnect(GoodbyeReason::Shutdown)
-        .await
-        .expect("disconnect");
-    assert!(
-        wait_for_goodbye(&mut rx).await,
-        "never received client/goodbye over TLS link"
-    );
+        .expect("accept did not return");
+    assert!(accepted.is_err(), "upgrade with Origin was accepted");
+    match peer.await.unwrap() {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), 403)
+        }
+        other => panic!("expected HTTP 403, got {other:?}"),
+    }
 }
