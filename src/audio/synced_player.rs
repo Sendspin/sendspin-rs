@@ -399,15 +399,6 @@ const QUEUE_LOW_WATER_US: u64 = 100_000;
 /// disable drift correction for the whole stream.
 const OUTPUT_DELAY_SETTLE_MAX: Duration = Duration::from_secs(10);
 
-/// How long after playback starts speed corrections are limited to
-/// [`STARTUP_MAX_SPEED_CORRECTION`]. Whatever residue of the start-up
-/// transient outlasts the settle grace period must not be corrected at the
-/// full rate, which is audible as pitch.
-const STARTUP_GENTLE_WINDOW: Duration = Duration::from_secs(20);
-
-/// Speed-correction cap during [`STARTUP_GENTLE_WINDOW`]: 0.5%, under 9 cents.
-const STARTUP_MAX_SPEED_CORRECTION: f64 = 0.005;
-
 /// Frames until the next drop or insert after a re-plan. Progress made under
 /// the previous cadence carries over, so re-planning on every callback cannot
 /// postpone a correction indefinitely.
@@ -423,7 +414,6 @@ fn replanned_countdown(countdown: u32, previous_every: u32, every: u32) -> u32 {
 /// Observations may precede playback, but startup deadlines begin at `start`.
 struct StartupCorrectionState {
     planner: CorrectionPlanner,
-    startup_planner: CorrectionPlanner,
     error_filter: SyncErrorFilter,
     engage_gate: EngageGate,
     delay_settle: OutputDelaySettle,
@@ -446,9 +436,6 @@ impl StartupCorrectionState {
     fn new() -> Self {
         Self {
             planner: CorrectionPlanner::new(),
-            startup_planner: CorrectionPlanner::with_max_speed_correction(
-                STARTUP_MAX_SPEED_CORRECTION,
-            ),
             error_filter: SyncErrorFilter::new(),
             engage_gate: EngageGate::new(),
             delay_settle: OutputDelaySettle::new(),
@@ -496,12 +483,9 @@ impl StartupCorrectionState {
     ) -> CorrectionDecision {
         let error_us = self.error_filter.update(raw_error_us);
         let elapsed = self.started_at.map(|at| now.duration_since(at));
-        let planner = if elapsed.is_some_and(|age| age < STARTUP_GENTLE_WINDOW) {
-            &self.startup_planner
-        } else {
-            &self.planner
-        };
-        let ungated = planner.plan(error_us, sample_rate, currently_correcting);
+        let ungated = self
+            .planner
+            .plan(error_us, sample_rate, currently_correcting);
         let gated =
             self.engage_gate
                 .admit(ungated, currently_correcting, self.error_filter.is_warm());
@@ -542,6 +526,92 @@ mod startup_correction_tests {
         decision
     }
 
+    /// Plays 120s of 10ms callbacks at 48 kHz against a clock drifting by
+    /// `drift_ppm`, applying each schedule as the output callback does.
+    /// Readings carry one-sided period noise, and the error jumps by 15ms at
+    /// 60s. Returns the true error and the frames dropped or inserted per
+    /// callback.
+    fn simulate(drift_ppm: f64) -> Vec<(f64, u32)> {
+        const FRAMES: u32 = 480;
+        let frame_us = 1_000_000.0 / 48_000.0;
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        let (mut insert_counter, mut drop_counter) = (0, 0);
+        let mut error_us = 0.0_f64;
+        let mut trace = Vec::new();
+        for callback in 0..12_000 {
+            let now = start + Duration::from_millis(callback * 10);
+            if callback == 6_000 {
+                error_us += 15_000.0;
+            }
+            state.observe_output_delay(now, 50_000);
+            let noise = if callback % 4 == 0 { 0 } else { 10_000 };
+            let decision = state.plan(
+                now,
+                error_us.round() as i64 + noise,
+                48_000,
+                schedule.is_correcting(),
+                true,
+            );
+            assert!(!decision.schedule.reanchor, "at callback {callback}");
+            insert_counter = replanned_countdown(
+                insert_counter,
+                schedule.insert_every_n_frames,
+                decision.schedule.insert_every_n_frames,
+            );
+            drop_counter = replanned_countdown(
+                drop_counter,
+                schedule.drop_every_n_frames,
+                decision.schedule.drop_every_n_frames,
+            );
+            schedule = decision.schedule;
+            let mut corrections = 0;
+            for _ in 0..FRAMES {
+                if schedule.drop_every_n_frames > 0 {
+                    drop_counter = drop_counter.saturating_sub(1);
+                    if drop_counter == 0 {
+                        drop_counter = schedule.drop_every_n_frames;
+                        error_us -= frame_us;
+                        corrections += 1;
+                    }
+                }
+                if schedule.insert_every_n_frames > 0 {
+                    insert_counter = insert_counter.saturating_sub(1);
+                    if insert_counter == 0 {
+                        insert_counter = schedule.insert_every_n_frames;
+                        error_us += frame_us;
+                        corrections += 1;
+                    }
+                }
+            }
+            error_us += drift_ppm * f64::from(FRAMES) * frame_us / 1_000_000.0;
+            trace.push((error_us, corrections));
+        }
+        trace
+    }
+
+    #[test]
+    fn drift_correction_meets_accuracy_target_and_speed_cap() {
+        for drift_ppm in [-100.0, -50.0, -10.0, 10.0, 50.0, 100.0] {
+            let trace = simulate(drift_ppm);
+            let worst = |range: std::ops::Range<usize>| {
+                trace[range]
+                    .iter()
+                    .map(|(error, _)| error.abs())
+                    .fold(0.0, f64::max)
+            };
+            // Steady state: settled, and recovered from the disturbance.
+            let steady = worst(1_000..6_000).max(worst(8_000..12_000));
+            assert!(steady <= 500.0, "{drift_ppm} ppm: {steady:.0}µs");
+            for window in trace.windows(15) {
+                let corrections: u32 = window.iter().map(|(_, n)| n).sum();
+                assert!(corrections <= 36, "{corrections} corrections in 150ms");
+            }
+        }
+    }
+
     #[test]
     fn cold_start_overshoot_plateau_relaxes_without_correction() {
         let start = Instant::now();
@@ -580,7 +650,7 @@ mod startup_correction_tests {
 
     #[test]
     fn settling_discards_negative_transient_and_requires_fresh_evidence() {
-        for real_error in [0, 40_000, -40_000] {
+        for real_error in [0, 10_000, -10_000] {
             let start = Instant::now();
             let mut state = StartupCorrectionState::new();
             state.start(start);
@@ -590,7 +660,7 @@ mod startup_correction_tests {
                     &mut state,
                     start + Duration::from_millis(ms),
                     50_000,
-                    -200_000,
+                    -15_000,
                     &mut schedule,
                     true,
                 );
@@ -637,7 +707,7 @@ mod startup_correction_tests {
     }
 
     #[test]
-    fn suppression_and_speed_cap_expire_at_exact_deadlines_or_late_callbacks() {
+    fn suppression_expires_at_exact_deadline_or_late_callback() {
         for late_ms in [0, 137] {
             let start = Instant::now();
             let mut state = StartupCorrectionState::new();
@@ -648,7 +718,7 @@ mod startup_correction_tests {
                     &mut state,
                     start + Duration::from_millis(ms),
                     30_000 + ms * 20,
-                    100_000,
+                    10_000,
                     &mut schedule,
                     true,
                 );
@@ -657,7 +727,7 @@ mod startup_correction_tests {
             }
             let before = state.plan(
                 start + OUTPUT_DELAY_SETTLE_MAX - Duration::from_nanos(1),
-                100_000,
+                10_000,
                 48_000,
                 false,
                 true,
@@ -668,42 +738,12 @@ mod startup_correction_tests {
                 &mut state,
                 start + OUTPUT_DELAY_SETTLE_MAX + Duration::from_millis(late_ms),
                 240_000,
-                100_000,
+                10_000,
                 &mut schedule,
                 true,
             );
             assert!(!deadline.output_delay_transient);
-            assert_eq!(schedule.drop_every_n_frames, 200);
-            for ms in (10_150..20_000).step_by(10) {
-                let decision = tick(
-                    &mut state,
-                    start + Duration::from_millis(ms),
-                    250_000 + (ms - 10_150) * 20,
-                    100_000,
-                    &mut schedule,
-                    true,
-                );
-                assert!(!decision.output_delay_transient);
-                assert_eq!(schedule.drop_every_n_frames, 200);
-                assert!(!state.delay_settle.is_settled());
-            }
-            let before_cap = state.plan(
-                start + STARTUP_GENTLE_WINDOW - Duration::from_nanos(1),
-                100_000,
-                48_000,
-                true,
-                true,
-            );
-            assert_eq!(before_cap.schedule.drop_every_n_frames, 200);
-            tick(
-                &mut state,
-                start + STARTUP_GENTLE_WINDOW + Duration::from_millis(late_ms),
-                300_000,
-                100_000,
-                &mut schedule,
-                true,
-            );
-            assert_eq!(schedule.drop_every_n_frames, 25);
+            assert_eq!(schedule.drop_every_n_frames, 222);
         }
     }
 
@@ -718,7 +758,7 @@ mod startup_correction_tests {
                 &mut state,
                 start + Duration::from_millis(ms),
                 10_000,
-                -100_000,
+                -10_000,
                 &mut schedule,
                 true,
             );
@@ -743,8 +783,8 @@ mod startup_correction_tests {
         assert!(!state.error_filter.is_warm());
         let restart = start + Duration::from_secs(30);
         state.start(restart);
-        let first = tick(&mut state, restart, 80_000, 100_000, &mut schedule, true);
-        assert_eq!(first.error_us, 100_000);
+        let first = tick(&mut state, restart, 80_000, 10_000, &mut schedule, true);
+        assert_eq!(first.error_us, 10_000);
         assert_eq!(first.gated, CorrectionSchedule::default());
         assert!(first.output_delay_transient);
         assert_eq!(state.min_playback_delta_us, 80_000);
@@ -753,12 +793,12 @@ mod startup_correction_tests {
                 &mut state,
                 restart + Duration::from_millis(ms),
                 80_000,
-                100_000,
+                10_000,
                 &mut schedule,
                 true,
             );
         }
-        assert_eq!(schedule.drop_every_n_frames, 200);
+        assert_eq!(schedule.drop_every_n_frames, 222);
     }
 
     #[test]
@@ -772,7 +812,7 @@ mod startup_correction_tests {
                 &mut state,
                 start + Duration::from_millis(ms),
                 50_000,
-                100_000,
+                10_000,
                 &mut schedule,
                 true,
             );
@@ -793,14 +833,8 @@ mod startup_correction_tests {
         assert_eq!(state.min_playback_delta_us, 50_000);
         assert!(state.delay_settle.is_settled());
         assert!(!state.error_filter.is_warm());
-        let decision = state.plan(
-            start + Duration::from_secs(4),
-            -100_000,
-            48_000,
-            false,
-            true,
-        );
-        assert_eq!(decision.error_us, -100_000);
+        let decision = state.plan(start + Duration::from_secs(4), -10_000, 48_000, false, true);
+        assert_eq!(decision.error_us, -10_000);
         assert!(!decision.gated.is_correcting());
     }
 
@@ -823,7 +857,7 @@ mod startup_correction_tests {
         for callback in 1..=150 {
             let now = start + Duration::from_millis(4000 + callback * 10);
             assert_eq!(state.observe_output_delay(now, 50_000), None);
-            state.plan(now, -100_000, 48_000, false, true);
+            state.plan(now, -10_000, 48_000, false, true);
         }
         assert!(state.error_filter.is_warm());
         assert!(state.engage_gate.pending_plans() > 0);
@@ -848,8 +882,8 @@ mod startup_correction_tests {
         for callback in 1..=150 {
             let now = settled_at + Duration::from_millis(callback * 10);
             assert_eq!(state.observe_output_delay(now, 90_000), None);
-            let decision = state.plan(now, 100_000, 48_000, false, true);
-            assert_eq!(decision.error_us, 100_000);
+            let decision = state.plan(now, 10_000, 48_000, false, true);
+            assert_eq!(decision.error_us, 10_000);
         }
         assert!(state.error_filter.is_warm());
         assert!(state.engage_gate.pending_plans() > 0);
@@ -875,32 +909,16 @@ mod startup_correction_tests {
                 &mut state,
                 start + Duration::from_millis(ms),
                 50_000 + ms * 20,
-                100_000,
+                10_000,
                 &mut schedule,
                 true,
             );
             assert!(decision.output_delay_transient);
             assert!(!schedule.is_correcting());
         }
-        let deadline = state.plan(
-            start + OUTPUT_DELAY_SETTLE_MAX,
-            100_000,
-            48_000,
-            false,
-            true,
-        );
+        let deadline = state.plan(start + OUTPUT_DELAY_SETTLE_MAX, 10_000, 48_000, false, true);
         assert!(!deadline.output_delay_transient);
-        assert_eq!(deadline.schedule.drop_every_n_frames, 200);
-        let before_cap = state.plan(
-            start + STARTUP_GENTLE_WINDOW - Duration::from_nanos(1),
-            100_000,
-            48_000,
-            true,
-            true,
-        );
-        assert_eq!(before_cap.schedule.drop_every_n_frames, 200);
-        let after_cap = state.plan(start + STARTUP_GENTLE_WINDOW, 100_000, 48_000, true, true);
-        assert_eq!(after_cap.schedule.drop_every_n_frames, 25);
+        assert_eq!(deadline.schedule.drop_every_n_frames, 222);
     }
 
     #[test]
@@ -909,7 +927,7 @@ mod startup_correction_tests {
         let mut state = StartupCorrectionState::new();
         state.start(start);
         let initial = state.plan(start, 600_000, 48_000, false, true);
-        assert!(initial.gated.reanchor);
+        assert!(initial.ungated.reanchor);
         assert!(!initial.schedule.is_correcting());
         let mut schedule = CorrectionSchedule::default();
         let mut saw_clock_suppression = false;
@@ -918,7 +936,7 @@ mod startup_correction_tests {
                 &mut state,
                 start + Duration::from_millis(ms),
                 50_000,
-                100_000,
+                10_000,
                 &mut schedule,
                 false,
             );
@@ -941,24 +959,27 @@ mod startup_correction_tests {
                 &mut state,
                 start + Duration::from_millis(4000 + callback as u64 * 10),
                 50_000,
-                -100_000,
+                -10_000,
                 &mut schedule,
                 true,
             );
-            assert_eq!(decision.error_us, -100_000);
+            assert_eq!(decision.error_us, -10_000);
             assert!(!decision.clock_warmup_suppressed);
             assert_eq!(schedule.is_correcting(), callback == evidence_needed);
         }
         assert!(schedule.insert_every_n_frames > 0);
         state.reset_measurements();
-        let gross = state.plan(
-            start + Duration::from_secs(6),
-            600_000,
-            48_000,
-            false,
-            false,
-        );
-        assert!(gross.schedule.reanchor);
+        for callback in 1..=crate::audio::sync_correction::SYNC_ERROR_WINDOW {
+            let gross = state.plan(
+                start + Duration::from_millis(6_000 + callback as u64 * 10),
+                600_000,
+                48_000,
+                false,
+                false,
+            );
+            let warm = callback == crate::audio::sync_correction::SYNC_ERROR_WINDOW;
+            assert_eq!(gross.schedule.reanchor, warm, "at callback {callback}");
+        }
     }
 }
 

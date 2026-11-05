@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking builder:** the player role is no longer enabled by default. Call `player_v1_support` to enable it. A builder with no roles fails to connect, accept, or listen.
 - **Breaking builder:** a player that advertises the `volume` or `mute` command must set the matching `volume` or `muted` field in its initial player state, otherwise it fails to connect, accept, or listen.
 - Automatic player-state reporting is enabled only with the player role and an initial player-state object; applications can disable it and use explicit partial updates or raw client-state transitions.
+- **Breaking:** `CorrectionPlanner::with_max_speed_correction` is removed. The planner now always caps speed corrections below the spec's 0.5%.
 
 ### Added
 

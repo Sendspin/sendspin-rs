@@ -38,21 +38,13 @@ impl CorrectionPlanner {
     /// Create a planner with default thresholds.
     pub fn new() -> Self {
         Self {
-            deadband_us: 1_500,
-            engage_us: 3_000,
-            reanchor_threshold_us: 500_000,
+            deadband_us: 100,
+            engage_us: 300,
+            reanchor_threshold_us: 20_000,
             target_seconds: 2.0,
-            max_speed_correction: 0.04,
-        }
-    }
-
-    /// A planner whose speed correction is capped at `max_speed_correction`
-    /// (a fraction of real time, e.g. `0.005` for 0.5%) instead of the
-    /// default. Thresholds are unchanged.
-    pub fn with_max_speed_correction(max_speed_correction: f64) -> Self {
-        Self {
-            max_speed_correction,
-            ..Self::new()
+            // Under the spec's 0.5% so that any 150ms window, which can hold
+            // one correction more than the average rate, stays within it.
+            max_speed_correction: 0.0045,
         }
     }
 
@@ -254,16 +246,23 @@ impl EngageGate {
     ///
     /// `currently_correcting` is whether a correction episode is already
     /// running; `filter_warm` is whether the error filter window is fully
-    /// populated. Reanchor plans always pass: they indicate gross real
-    /// displacement where a delayed reaction is worse than a rare false
-    /// positive.
+    /// populated. Reanchor plans skip the streak but wait for a warm filter,
+    /// so a single reading carrying period noise cannot jump the cursor.
     pub fn admit(
         &mut self,
         planned: CorrectionSchedule,
         currently_correcting: bool,
         filter_warm: bool,
     ) -> CorrectionSchedule {
-        if planned.reanchor || currently_correcting || !planned.is_correcting() {
+        if planned.reanchor {
+            self.streak = 0;
+            return if filter_warm {
+                planned
+            } else {
+                CorrectionSchedule::default()
+            };
+        }
+        if currently_correcting || !planned.is_correcting() {
             self.streak = 0;
             return planned;
         }
@@ -384,37 +383,37 @@ mod tests {
     #[test]
     fn test_no_correction_within_engage_threshold() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(2_500, 48_000, false);
-        assert!(!schedule.is_correcting(), "should not engage below 3ms");
+        let schedule = planner.plan(250, 48_000, false);
+        assert!(!schedule.is_correcting(), "should not engage below 0.3ms");
     }
 
     #[test]
     fn test_correction_engages_above_threshold() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(3_500, 48_000, false);
-        assert!(schedule.is_correcting(), "should engage above 3ms");
+        let schedule = planner.plan(400, 48_000, false);
+        assert!(schedule.is_correcting(), "should engage above 0.3ms");
         assert!(schedule.drop_every_n_frames > 0, "positive error = drop");
     }
 
     #[test]
     fn test_hysteresis_keeps_correcting_above_deadband() {
         let planner = CorrectionPlanner::new();
-        // 2ms error: below engage (3ms) but above deadband (1.5ms).
+        // 0.2ms error: below engage (0.3ms) but above deadband (0.1ms).
         // Should keep correcting if already active.
-        let schedule = planner.plan(2_000, 48_000, true);
+        let schedule = planner.plan(200, 48_000, true);
         assert!(
             schedule.is_correcting(),
-            "should keep correcting above 1.5ms deadband"
+            "should keep correcting above 0.1ms deadband"
         );
     }
 
     #[test]
     fn test_hysteresis_stops_below_deadband() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(1_000, 48_000, true);
+        let schedule = planner.plan(50, 48_000, true);
         assert!(
             !schedule.is_correcting(),
-            "should stop below 1.5ms deadband"
+            "should stop below 0.1ms deadband"
         );
     }
 
@@ -432,14 +431,14 @@ mod tests {
     #[test]
     fn test_reanchor_at_large_error() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(500_000, 48_000, false);
+        let schedule = planner.plan(20_000, 48_000, false);
         assert!(schedule.reanchor);
     }
 
     #[test]
     fn test_exact_engage_threshold_does_not_engage() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(3_000, 48_000, false);
+        let schedule = planner.plan(300, 48_000, false);
         assert!(
             !schedule.is_correcting(),
             "exactly at engage threshold should not engage (<=)"
@@ -449,7 +448,7 @@ mod tests {
     #[test]
     fn test_exact_deadband_threshold_disengages() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(1_500, 48_000, true);
+        let schedule = planner.plan(100, 48_000, true);
         assert!(
             !schedule.is_correcting(),
             "exactly at deadband threshold should disengage (<=)"
@@ -459,7 +458,7 @@ mod tests {
     #[test]
     fn test_negative_hysteresis_keeps_inserting_above_deadband() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(-2_000, 48_000, true);
+        let schedule = planner.plan(-200, 48_000, true);
         assert!(
             schedule.is_correcting(),
             "should keep correcting negative error above deadband"
@@ -484,7 +483,7 @@ mod tests {
         // 5ms error at 48 kHz, already correcting (deadband threshold):
         //   frames_error                = 5000 * 48000 / 1_000_000 = 240 frames
         //   desired_corrections_per_sec = 240 / 2.0                = 120
-        //   max_corrections_per_sec     = 48000 * 0.04             = 1920 (not binding)
+        //   max_corrections_per_sec     = 48000 * 0.0045           = 216 (not binding)
         //   interval_frames             = round(48000 / 120)       = 400
         let planner = CorrectionPlanner::new();
         let s = planner.plan(5_000, 48_000, true);
@@ -509,17 +508,33 @@ mod tests {
 
     #[test]
     fn test_drop_interval_hits_max_speed_cap() {
-        // 200ms error — large enough that the desired rate exceeds the cap:
-        //   frames_error                = 200000 * 48000 / 1_000_000 = 9600
-        //   desired_corrections_per_sec = 9600 / 2.0                 = 4800
-        //   max_corrections_per_sec     = 48000 * 0.04               = 1920 (binding)
-        //   interval_frames             = round(48000 / 1920)        = 25
+        // 15ms error, large enough that the desired rate exceeds the cap:
+        //   frames_error                = 15000 * 48000 / 1_000_000 = 720
+        //   desired_corrections_per_sec = 720 / 2.0                 = 360
+        //   max_corrections_per_sec     = 48000 * 0.0045            = 216 (binding)
+        //   interval_frames             = round(48000 / 216)        = 222
         let planner = CorrectionPlanner::new();
-        let s = planner.plan(200_000, 48_000, true);
+        let s = planner.plan(15_000, 48_000, true);
         assert_eq!(
-            s.drop_every_n_frames, 25,
-            "large drift should be capped at max speed correction (interval = 25 frames)"
+            s.drop_every_n_frames, 222,
+            "large drift should be capped at max speed correction (interval = 222 frames)"
         );
+    }
+
+    #[test]
+    fn test_speed_cap_holds_over_any_150ms_window() {
+        let planner = CorrectionPlanner::new();
+        for sample_rate in [
+            8_000, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000, 192_000,
+        ] {
+            let interval = planner.plan(19_999, sample_rate, true).drop_every_n_frames;
+            let window_frames = sample_rate * 150 / 1_000;
+            let max_corrections = (window_frames - 1) / interval + 1;
+            assert!(
+                f64::from(max_corrections) <= 0.005 * f64::from(window_frames),
+                "{sample_rate} Hz: {max_corrections} corrections in {window_frames} frames"
+            );
+        }
     }
 
     #[test]
@@ -693,15 +708,17 @@ mod tests {
     }
 
     #[test]
-    fn test_gate_reanchor_bypasses() {
+    fn test_gate_reanchor_skips_streak_but_waits_for_warm_filter() {
         let mut gate = EngageGate::new();
         let reanchor = CorrectionSchedule {
             insert_every_n_frames: 0,
             drop_every_n_frames: 0,
             reanchor: true,
         };
-        let admitted = gate.admit(reanchor, false, false);
-        assert!(admitted.reanchor, "reanchor must bypass the gate");
+        let cold = gate.admit(reanchor, false, false);
+        assert!(!cold.is_correcting(), "cold filter must not reanchor");
+        let warm = gate.admit(reanchor, false, true);
+        assert!(warm.reanchor, "reanchor must not wait for a streak");
     }
 
     #[test]
@@ -941,24 +958,5 @@ mod tests {
             tracker.update(resumed_at + SETTLE_TIME + period, 250_000);
             assert!(!tracker.is_settled());
         }
-    }
-
-    #[test]
-    fn test_capped_planner_limits_speed_correction() {
-        // 100ms of error would normally be corrected at the 4% cap.
-        let default = CorrectionPlanner::new().plan(100_000, 48_000, false);
-        let capped =
-            CorrectionPlanner::with_max_speed_correction(0.005).plan(100_000, 48_000, false);
-        assert_eq!(default.drop_every_n_frames, 25, "4% = one frame in 25");
-        assert_eq!(capped.drop_every_n_frames, 200, "0.5% = one frame in 200");
-        assert!(!capped.reanchor);
-    }
-
-    #[test]
-    fn test_capped_planner_keeps_thresholds() {
-        let capped = CorrectionPlanner::with_max_speed_correction(0.005);
-        assert!(!capped.plan(2_500, 48_000, false).is_correcting());
-        assert!(capped.plan(3_500, 48_000, false).is_correcting());
-        assert!(capped.plan(500_000, 48_000, false).reanchor);
     }
 }
