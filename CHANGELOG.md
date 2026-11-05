@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/Sendspin/sendspin-rs/compare/v0.3.8...v0.4.0) - 2026-11-05
+
+### Added
+
+- [**breaking**] Deliver player, artwork and visualizer data through typed role sessions ([#108](https://github.com/Sendspin/sendspin-rs/pull/108))
+
 ### Changed
 
 - **Breaking receiving API:** released audio now arrives through the typed `player`, `artwork`, and `visualizer` role sessions rather than the old `connection.audio` receiver and unbounded role chunks. Role configuration and controls are handled through each session’s typed events and controls.
