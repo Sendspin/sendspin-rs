@@ -3,7 +3,7 @@
 
 use clap::Parser;
 use sendspin::protocol::messages::{GoodbyeReason, Message, RepeatMode};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{MemoryStore, ProtocolClientBuilder};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Sendspin controller-only client
@@ -23,7 +23,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
     let builder = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
+        .persistence(std::sync::Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Controller Example".to_string())
         .controller()
         .build();
@@ -32,9 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Connected!");
 
     let conn = client.split();
-    let controller = conn
-        .controller
-        .expect("server should grant controller role");
+    let controller = conn.controller;
     // This example consumes controller/general data only; drop role streams to avoid unread buffers.
     drop(conn.player);
     drop(conn.artwork);

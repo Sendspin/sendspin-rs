@@ -6,7 +6,8 @@ use clap::Parser;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{Message, PlaybackState};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{FileStore, ProtocolClientBuilder};
+use std::sync::Arc;
 
 /// Sendspin metadata client using the managed inbound listener
 #[derive(Parser, Debug)]
@@ -20,9 +21,9 @@ struct Args {
     #[arg(short, long, default_value = "Metadata Listener")]
     name: String,
 
-    /// Persistent client id (defaults to a random UUID)
-    #[arg(short, long)]
-    id: Option<String>,
+    /// Directory that keeps the client's identity key across restarts
+    #[arg(short, long, default_value = "sendspin-metadata-data")]
+    data_dir: String,
 }
 
 #[tokio::main]
@@ -30,10 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let args = Args::parse();
-    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
     let listener = ProtocolClientBuilder::builder()
-        .client_id(client_id)
+        .persistence(Arc::new(FileStore::new(&args.data_dir)))
+        .unpaired_access(true)
         .name(args.name.clone())
         .metadata()
         .build()
@@ -43,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = listener.local_addr()?.port();
 
     // The manager owns the accept loop from here: concurrent inbound
-    // handshakes, the spec keep-or-switch policy (playback beats discovery,
-    // last-played breaks discovery ties), and goodbye(another_server) to
+    // handshakes, the spec keep-or-switch policy (playback beats idle,
+    // last-played breaks idle ties), and goodbye(another_server) to
     // every losing connection.
     let mut manager = ConnectionManager::new(listener);
 
@@ -69,10 +69,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // replacement.
     while let Some(mut conn) = manager.next_connection().await {
         let peer = conn.peer;
-        let server_id = conn.server_hello.server_id.clone();
+        let server_id = conn.server_id.clone();
         println!(
-            "[{peer}] now serving server_id={server_id} connection_reason={:?}",
-            conn.server_hello.connection_reason
+            "[{peer}] now serving server_id={server_id} activities={:?}",
+            conn.activation.activities
         );
 
         // This client negotiates metadata only, so role stream receivers are not consumed.
@@ -83,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match msg {
                 Message::GroupUpdate(g) if g.playback_state == Some(PlaybackState::Playing) => {
                     // Feed the policy input back so a returning server wins
-                    // discovery ties. A spec-compliant client would also
+                    // idle ties. A spec-compliant client would also
                     // persist this to disk here.
                     manager.set_last_played(Some(server_id.clone()));
                     println!("[{peer}] playing — recorded as last played");

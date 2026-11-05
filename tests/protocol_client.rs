@@ -1,17 +1,19 @@
-use futures_util::{SinkExt, StreamExt};
+mod common;
+
+use common::TestServer;
 use sendspin::audio::{AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::error::Error;
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
     ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
-    ConnectionReason, ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand,
-    PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode,
-    ServerCommand, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd,
-    StreamPlayerConfig, StreamRequestFormat, StreamStart, VisualizerDataType,
-    VisualizerFormatRequest,
+    ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand, PlayerCommandType,
+    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, ServerCommand,
+    StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd, StreamPlayerConfig,
+    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
-use sendspin::ProtocolClientBuilder;
+use sendspin::{MemoryStore, ProtocolClientBuilder};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage};
 
@@ -70,61 +72,39 @@ impl VisualizerOutput for TestOutput {
     }
 }
 
-/// Start a local WebSocket server that performs the sendspin handshake
-/// and returns the listener address and a channel to receive messages
-/// the client sends after the handshake.
+/// Start a local server for one client. It activates `granted_roles`, or every
+/// role the client supports when `None`, and then serves the connection.
+async fn start_server(
+    granted_roles: Option<Vec<String>>,
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+    tokio::sync::mpsc::UnboundedSender<WsMessage>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (server_tx, server_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (mut server, hello) = TestServer::handshake(accept_async(stream).await.unwrap()).await;
+        server
+            .activate(granted_roles.unwrap_or(hello.supported_roles))
+            .await;
+        server.serve(client_tx, server_rx).await;
+    });
+    (url, client_rx, server_tx, handle)
+}
+
+/// Start a local server that activates every role the client supports and
+/// returns the client messages after the handshake, except `client/time`.
 async fn start_test_server() -> (
     String,
     tokio::sync::mpsc::UnboundedReceiver<String>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("ws://{}", addr);
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-
-        // Receive client/hello and echo back its roles
-        let msg = ws.next().await.unwrap().unwrap();
-        let active_roles = if let WsMessage::Text(ref text) = msg {
-            match serde_json::from_str::<Message>(text).unwrap() {
-                Message::ClientHello(hello) => hello.supported_roles,
-                other => panic!("First message should be client/hello, got {:?}", other),
-            }
-        } else {
-            panic!("Expected text message for client/hello");
-        };
-
-        // Send server/hello with the roles the client requested
-        let server_hello = serde_json::to_string(&Message::ServerHello(
-            sendspin::protocol::messages::ServerHello {
-                server_id: "test-server".to_string(),
-                name: "Test Server".to_string(),
-                version: 1,
-                active_roles,
-                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
-            },
-        ))
-        .unwrap();
-        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
-
-        // Forward all subsequent messages to the channel
-        while let Some(Ok(msg)) = ws.next().await {
-            let text = match msg {
-                WsMessage::Text(text) => text,
-                WsMessage::Close(_) => break,
-                _ => continue,
-            };
-            if tx.send(text.to_string()).is_err() {
-                break;
-            }
-        }
-    });
-
+    let (url, rx, _, handle) = start_server(None).await;
     (url, rx, handle)
 }
 
@@ -212,7 +192,8 @@ async fn test_connect_sends_initial_state() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -236,11 +217,9 @@ async fn test_connect_sends_initial_state() {
 
     let client = builder.connect(&url).await.unwrap();
 
-    // Regression guard: the server_hello fields needed for multi-server
-    // arbitration must survive `connect()` just as they do `accept()`.
-    let hello = client.server_hello();
-    assert_eq!(hello.server_id, "test-server");
-    assert_eq!(hello.connection_reason, ConnectionReason::Playback);
+    // Regression guard: the activation needed for multi-server arbitration
+    // must survive `connect()` just as it does `accept()`.
+    assert!(client.activation().is_active("player@v1"));
 
     // First message after handshake should be client/state
     let first_msg = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -266,7 +245,8 @@ async fn test_connect_without_player_state_sends_state_without_player() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build();
@@ -293,7 +273,8 @@ async fn test_connect_without_player_state_sends_state_without_player() {
 async fn test_no_player_sender_can_send_sync_state_without_reporter() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -329,7 +310,8 @@ async fn test_connect_can_send_initial_external_source_state() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .initial_sync_state(ClientSyncState::ExternalSource)
@@ -357,7 +339,8 @@ async fn test_connect_initial_external_source_preserves_player_state() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .initial_sync_state(ClientSyncState::ExternalSource)
@@ -396,7 +379,8 @@ async fn test_disconnect_sends_goodbye() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -422,10 +406,11 @@ async fn test_disconnect_sends_goodbye() {
 
 #[tokio::test]
 async fn test_sender_emits_stream_request_format() {
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -462,10 +447,11 @@ async fn test_sender_emits_stream_request_format() {
 
 #[tokio::test]
 async fn test_sender_emits_artwork_stream_request_format() {
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -507,7 +493,8 @@ async fn test_sender_rejects_empty_stream_request_format() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -539,7 +526,8 @@ async fn test_sender_rejects_request_format_before_stream_start() {
     let (url, mut rx, _handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -571,10 +559,11 @@ async fn test_sender_rejects_request_format_before_stream_start() {
 
 #[tokio::test]
 async fn test_sender_visualizer_request_requires_active_stream() {
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .visualizer_v1_support(sendspin::protocol::messages::VisualizerV1Support {
             types: vec![VisualizerDataType::Spectrum],
@@ -628,10 +617,11 @@ async fn test_sender_visualizer_request_requires_active_stream() {
 #[tokio::test]
 async fn test_sender_rejects_player_request_after_stream_end() {
     // The player stream starts then ends, so the gate closes again.
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -672,10 +662,11 @@ async fn test_sender_rejects_player_request_after_stream_end() {
 async fn test_sender_rejects_artwork_request_without_artwork_stream() {
     // Only a player stream is active; an artwork request has nothing to
     // renegotiate and must be rejected for its own role.
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -715,7 +706,8 @@ async fn test_disconnect_closes_socket_and_stops_background_tasks() {
     let (url, mut rx, handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -764,7 +756,8 @@ async fn test_connection_disconnect_sends_goodbye_and_closes() {
     let (url, mut rx, handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -820,7 +813,8 @@ async fn connect_with_controller() -> (
     let (url, rx, handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -837,11 +831,8 @@ async fn connect_with_controller() -> (
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
-    let controller = conn
-        .controller
-        .take()
-        .expect("should have controller when role declared");
+    let conn = client.split();
+    let controller = conn.controller.clone();
 
     (rx, controller, conn, handle)
 }
@@ -883,7 +874,8 @@ async fn next_client_state(
 async fn test_enter_external_source_sends_external_source_state() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -905,7 +897,8 @@ async fn test_enter_external_source_sends_external_source_state() {
 async fn test_exit_external_source_sends_synchronized_state() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -930,7 +923,8 @@ async fn test_exit_external_source_sends_synchronized_state() {
 async fn test_exit_external_source_sends_full_player_state() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1075,61 +1069,13 @@ async fn test_controller_seek_relative_sends_offset() {
     assert!(ctrl.position_ms.is_none());
 }
 
-/// Start a test server that only grants specific roles, ignoring what the client requests.
-async fn start_test_server_with_roles(
-    granted_roles: Vec<String>,
-) -> (
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<String>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("ws://{}", addr);
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-
-        // Receive and discard client/hello
-        let _ = ws.next().await.unwrap().unwrap();
-
-        // Send server/hello with only the granted roles
-        let server_hello = serde_json::to_string(&Message::ServerHello(
-            sendspin::protocol::messages::ServerHello {
-                server_id: "test-server".to_string(),
-                name: "Test Server".to_string(),
-                version: 1,
-                active_roles: granted_roles,
-                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
-            },
-        ))
-        .unwrap();
-        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
-
-        while let Some(Ok(msg)) = ws.next().await {
-            let text = match msg {
-                WsMessage::Text(text) => text,
-                WsMessage::Close(_) => break,
-                _ => continue,
-            };
-            if tx.send(text.to_string()).is_err() {
-                break;
-            }
-        }
-    });
-
-    (url, rx, handle)
-}
-
 #[tokio::test]
 async fn test_no_controller_when_server_denies_role() {
-    let (url, _rx, _handle) = start_test_server_with_roles(vec!["player@v1".to_string()]).await;
+    let (url, _rx, _, _handle) = start_server(Some(vec!["player@v1".to_string()])).await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -1149,16 +1095,14 @@ async fn test_no_controller_when_server_denies_role() {
 
     let conn = client.split();
     assert!(
-        conn.controller.is_none(),
-        "should not have controller when server denies the role"
+        matches!(conn.controller.play().await, Err(Error::Protocol(_))),
+        "controller must fail when the server denies the role"
     );
-    // Post-split outbound coverage of server_hello, and the active_roles
-    // assertion in particular: the same vec drives both controller
-    // materialization (above) and the multi-server arbitration policy.
-    assert_eq!(conn.server_hello.server_id, "test-server");
+    // The same activation gates the controller (above) and feeds the
+    // multi-server arbitration policy.
     assert_eq!(
-        conn.server_hello.active_roles,
-        vec!["player@v1".to_string()]
+        conn.activation.active_roles,
+        Some(vec!["player@v1".to_string()])
     );
 }
 
@@ -1167,7 +1111,8 @@ async fn test_no_controller_when_role_not_declared() {
     let (url, _rx, _handle) = start_test_server().await;
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1177,75 +1122,9 @@ async fn test_no_controller_when_role_not_declared() {
 
     let conn = client.split();
     assert!(
-        conn.controller.is_none(),
-        "should not have controller without role"
+        matches!(conn.controller.play().await, Err(Error::Protocol(_))),
+        "controller must fail without the role"
     );
-}
-
-/// Variant of [`start_test_server`] that drives the server side directly —
-/// exposes both the send half (for server-initiated messages) and the receive
-/// half (for client-sent messages).
-async fn start_test_server_with_sender() -> (
-    String,
-    tokio::sync::mpsc::UnboundedReceiver<String>,
-    tokio::sync::mpsc::UnboundedSender<WsMessage>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let url = format!("ws://{}", addr);
-
-    let (client_tx, client_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (server_send_tx, mut server_send_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
-
-    let handle = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-
-        // Drive handshake: consume client/hello, echo roles back.
-        let msg = ws.next().await.unwrap().unwrap();
-        let active_roles = if let WsMessage::Text(ref text) = msg {
-            match serde_json::from_str::<Message>(text).unwrap() {
-                Message::ClientHello(hello) => hello.supported_roles,
-                other => panic!("First message should be client/hello, got {:?}", other),
-            }
-        } else {
-            panic!("Expected text message for client/hello");
-        };
-        let server_hello = serde_json::to_string(&Message::ServerHello(
-            sendspin::protocol::messages::ServerHello {
-                server_id: "test-server".to_string(),
-                name: "Test Server".to_string(),
-                version: 1,
-                active_roles,
-                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
-            },
-        ))
-        .unwrap();
-        ws.send(WsMessage::Text(server_hello.into())).await.unwrap();
-
-        // Fan in: forward client messages to `client_tx`, forward outgoing
-        // `server_send_rx` messages to the socket.
-        loop {
-            tokio::select! {
-                msg = ws.next() => {
-                    let Some(Ok(msg)) = msg else { break };
-                    let text = match msg {
-                        WsMessage::Text(text) => text,
-                        WsMessage::Close(_) => break,
-                        _ => continue,
-                    };
-                    if client_tx.send(text.to_string()).is_err() { break }
-                }
-                outgoing = server_send_rx.recv() => {
-                    let Some(out) = outgoing else { break };
-                    if ws.send(out).await.is_err() { break }
-                }
-            }
-        }
-    });
-
-    (url, client_rx, server_send_tx, handle)
 }
 
 #[tokio::test]
@@ -1256,7 +1135,8 @@ async fn test_clock_sync_getter_returns_shared_handle() {
     // fine but silently break sync state sharing; `Arc::ptr_eq` pins this.
     let (url, _rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1275,9 +1155,10 @@ async fn test_clock_sync_getter_returns_shared_handle() {
 #[tokio::test]
 async fn test_message_router_forwards_binary_audio() {
     // End-to-end: a binary audio frame routes into a player session.
-    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, _rx, server_tx, _handle) = start_server(None).await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -1327,9 +1208,10 @@ async fn test_message_router_forwards_binary_audio() {
 async fn test_message_router_forwards_binary_artwork() {
     // Mirror of the audio test for the artwork path. Each binary channel has
     // its own closed-flag and send wiring, so each needs separate coverage.
-    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, _rx, server_tx, _handle) = start_server(None).await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1372,9 +1254,10 @@ async fn test_message_router_forwards_binary_artwork() {
 #[tokio::test]
 async fn test_message_router_forwards_binary_visualizer() {
     // Mirror of the audio test for the visualizer path (binary type 16).
-    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, _rx, server_tx, _handle) = start_server(None).await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1422,9 +1305,10 @@ async fn test_message_router_forwards_binary_visualizer() {
 
 #[tokio::test]
 async fn test_public_websocket_clear_commands_and_fallback() {
-    let (url, mut rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, mut rx, server_tx, _handle) = start_server(None).await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -1495,9 +1379,10 @@ async fn test_public_websocket_clear_commands_and_fallback() {
 #[tokio::test]
 async fn test_message_router_forwards_text_messages() {
     // End-to-end: a server text message routes into `conn.messages`.
-    let (url, _rx, server_tx, _handle) = start_test_server_with_sender().await;
+    let (url, _rx, server_tx, _handle) = start_server(None).await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()
@@ -1548,18 +1433,16 @@ fn test_client_handles_audio_chunks() {
 async fn test_send_message_fails_after_disconnect() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .controller()
         .build()
         .connect(&url)
         .await
         .unwrap();
-    let mut conn = client.split();
-    let controller = conn
-        .controller
-        .take()
-        .expect("controller granted by test server");
+    let conn = client.split();
+    let controller = conn.controller;
     let guard = conn.guard;
 
     let _ = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
@@ -1576,7 +1459,8 @@ async fn test_send_message_fails_after_disconnect() {
 async fn test_disconnect_observes_writer_completion() {
     let (url, mut rx, _handle) = start_test_server().await;
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .controller()
         .build()
@@ -1584,11 +1468,8 @@ async fn test_disconnect_observes_writer_completion() {
         .await
         .unwrap();
 
-    let mut conn = client.split();
-    let controller = conn
-        .controller
-        .take()
-        .expect("controller granted by test server");
+    let conn = client.split();
+    let controller = conn.controller;
     let sender_clone = conn.sender.clone();
     let guard = conn.guard;
 
@@ -1614,26 +1495,22 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = accept_async(stream).await.unwrap();
-        let _ = ws.next().await; // client/hello
-        let hello = serde_json::to_string(&Message::ServerHello(
-            sendspin::protocol::messages::ServerHello {
-                server_id: "test-server".to_string(),
-                name: "Test Server".to_string(),
-                version: 1,
-                active_roles: vec!["player@v1".to_string()],
-                connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
-            },
-        ))
-        .unwrap();
-        ws.send(WsMessage::Text(hello.into())).await.unwrap();
-        let _ = ws.next().await; // initial client/state
-        ws.close(None).await.unwrap();
+        let (mut server, _) = TestServer::handshake(accept_async(stream).await.unwrap()).await;
+        server.activate(vec!["player@v1".to_string()]).await;
+        loop {
+            match server.recv().await {
+                Some(Message::ClientTime(time)) => server.answer_time(&time).await,
+                Some(Message::ClientState(_)) => break,
+                other => panic!("expected the initial client/state, got {other:?}"),
+            }
+        }
+        server.send_raw(WsMessage::Close(None)).await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
     let client = ProtocolClientBuilder::builder()
-        .client_id("test-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Test".to_string())
         .player_v1_support(player_support())
         .build()

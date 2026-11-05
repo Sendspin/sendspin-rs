@@ -1,11 +1,12 @@
 use sendspin::protocol::messages::{
-    ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
-    ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
-    ColorState, ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo,
-    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest,
-    PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig,
-    SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig,
-    VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
+    Activity, ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support,
+    AudioFormatSpec, CipherSuite, ClientCommand, ClientGoodbye, ClientHello, ClientInit,
+    ClientState, ClientSyncState, ClientTime, ColorState, ControllerCommand, ControllerCommandType,
+    DeviceInfo, GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType,
+    PlayerFormatRequest, PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime,
+    SpectrumConfig, SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat,
+    StreamVisualizerConfig, UnpairedAccess, VisualizerDataType, VisualizerFormatRequest,
+    VisualizerV1Support,
 };
 
 // =============================================================================
@@ -13,11 +14,37 @@ use sendspin::protocol::messages::{
 // =============================================================================
 
 #[test]
+fn test_client_init_serialization() {
+    let init = Message::ClientInit(ClientInit {
+        client_id: "AAAA".to_string(),
+        version: 1,
+        suite: CipherSuite::ChaChaPolySha256,
+    });
+    assert_eq!(
+        serde_json::to_string(&init).unwrap(),
+        r#"{"type":"client/init","payload":{"client_id":"AAAA","version":1,"suite":"25519_ChaChaPoly_SHA256"}}"#
+    );
+}
+
+#[test]
+fn test_server_activate_without_roles_deserializes() {
+    let json = r#"{"type":"server/activate","payload":{"activities":["playback","pairing"]}}"#;
+    match serde_json::from_str::<Message>(json).unwrap() {
+        Message::ServerActivate(activate) => {
+            assert_eq!(
+                activate.activities,
+                vec![Activity::Playback, Activity::Pairing]
+            );
+            assert_eq!(activate.active_roles, None);
+        }
+        other => panic!("Expected ServerActivate, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_client_hello_serialization() {
     let hello = ClientHello {
-        client_id: "test-client-123".to_string(),
         name: "Test Player".to_string(),
-        version: 1,
         supported_roles: vec!["player@v1".to_string()],
         device_info: Some(DeviceInfo {
             product_name: Some("Sendspin-RS Player".to_string()),
@@ -37,13 +64,14 @@ fn test_client_hello_serialization() {
         }),
         artwork_v1_support: None,
         visualizer_v1_support: None,
+        unpaired_access: UnpairedAccess { enabled: true },
     };
 
     let message = Message::ClientHello(hello);
     let json = serde_json::to_string(&message).unwrap();
 
     assert!(json.contains("\"type\":\"client/hello\""));
-    assert!(json.contains("\"client_id\":\"test-client-123\""));
+    assert!(json.contains("\"unpaired_access\":{\"enabled\":true}"));
     assert!(json.contains("\"player@v1_support\""));
     assert!(json.contains("\"player@v1\""));
 }
@@ -53,11 +81,8 @@ fn test_server_hello_deserialization() {
     let json = r#"{
         "type": "server/hello",
         "payload": {
-            "server_id": "server-456",
             "name": "Test Server",
-            "version": 1,
-            "active_roles": ["player@v1"],
-            "connection_reason": "playback"
+            "languages": ["en", "de"]
         }
     }"#;
 
@@ -65,11 +90,11 @@ fn test_server_hello_deserialization() {
 
     match message {
         Message::ServerHello(hello) => {
-            assert_eq!(hello.server_id, "server-456");
             assert_eq!(hello.name, "Test Server");
-            assert_eq!(hello.version, 1);
-            assert_eq!(hello.active_roles, vec!["player@v1"]);
-            assert_eq!(hello.connection_reason, ConnectionReason::Playback);
+            assert_eq!(
+                hello.languages,
+                Some(vec!["en".to_string(), "de".to_string()])
+            );
         }
         _ => panic!("Expected ServerHello"),
     }
@@ -575,9 +600,7 @@ fn test_stream_start_deserialization() {
 #[test]
 fn test_visualizer_negotiation_serialization() {
     let hello = ClientHello {
-        client_id: "visualizer-client".to_string(),
         name: "Visualizer".to_string(),
-        version: 1,
         supported_roles: vec!["visualizer@v1".to_string()],
         device_info: None,
         player_v1_support: None,
@@ -593,6 +616,7 @@ fn test_visualizer_negotiation_serialization() {
                 f_max: 16_000,
             }),
         }),
+        unpaired_access: UnpairedAccess { enabled: false },
     };
     let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
     assert!(json.contains("\"visualizer@v1_support\""));
@@ -1115,23 +1139,14 @@ fn test_client_hello_missing_required_fields() {
 
 #[test]
 fn test_server_hello_missing_required_fields() {
-    let json = r#"{"type": "server/hello", "payload": {"server_id": "s1"}}"#;
+    let json = r#"{"type": "server/hello", "payload": {"languages": []}}"#;
     let result = serde_json::from_str::<Message>(json);
     assert!(result.is_err());
 }
 
 #[test]
-fn test_invalid_connection_reason_rejected() {
-    let json = r#"{
-        "type": "server/hello",
-        "payload": {
-            "server_id": "s1",
-            "name": "Test",
-            "version": 1,
-            "active_roles": [],
-            "connection_reason": "invalid_reason"
-        }
-    }"#;
+fn test_invalid_activity_rejected() {
+    let json = r#"{"type": "server/activate", "payload": {"activities": ["invalid"]}}"#;
     let result = serde_json::from_str::<Message>(json);
     assert!(result.is_err());
 }

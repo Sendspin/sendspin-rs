@@ -2,7 +2,7 @@
 // ABOUTME: Role streams are intentionally dropped and not inspected
 
 use clap::Parser;
-use sendspin::ProtocolClientBuilder;
+use sendspin::{MemoryStore, ProtocolClientBuilder};
 
 /// Minimal Sendspin test client
 #[derive(Parser, Debug)]
@@ -21,7 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Connecting to {}...", args.server);
     let test = ProtocolClientBuilder::builder()
-        .client_id(uuid::Uuid::new_v4().to_string())
+        .persistence(std::sync::Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Minimal Test Client".to_string())
         .metadata()
         .build();

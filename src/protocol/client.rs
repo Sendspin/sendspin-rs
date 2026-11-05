@@ -94,10 +94,7 @@ fn strip_inactive_roles(msg: Message, activation: &ServerActivate) -> Option<Mes
     match msg {
         Message::ClientState(mut state) if !activation.is_active(PLAYER_V1) => {
             state.player = None;
-            state
-                .state
-                .is_some()
-                .then_some(Message::ClientState(state))
+            state.state.is_some().then_some(Message::ClientState(state))
         }
         other => Some(other),
     }
@@ -1091,12 +1088,8 @@ impl ProtocolClient {
             stream_state: Arc::clone(&stream_state),
         };
 
-        let writer_handle = tokio::spawn(writer_task(
-            write,
-            out_rx,
-            encryptor,
-            activation_rx.clone(),
-        ));
+        let writer_handle =
+            tokio::spawn(writer_task(write, out_rx, encryptor, activation_rx.clone()));
         let (synced_tx, synced_rx) = oneshot::channel();
         let router = Router {
             decryptor,
@@ -1470,7 +1463,11 @@ impl Router {
         // Removing a role stops its stream even if no stream/end preceded it.
         let ended: Vec<String> = [
             (PLAYER_V1, ROLE_PLAYER, self.stream_state.is_player_active()),
-            (ARTWORK_V1, ROLE_ARTWORK, self.stream_state.is_artwork_active()),
+            (
+                ARTWORK_V1,
+                ROLE_ARTWORK,
+                self.stream_state.is_artwork_active(),
+            ),
             (
                 VISUALIZER_V1,
                 ROLE_VISUALIZER,
@@ -1605,11 +1602,13 @@ mod tests {
         );
         frames.extend(
             encryptor
-                .seal_json(&Message::ServerTime(crate::protocol::messages::ServerTime {
-                    client_transmitted: 1_000,
-                    server_received: 2_000,
-                    server_transmitted: 3_000,
-                }))
+                .seal_json(&Message::ServerTime(
+                    crate::protocol::messages::ServerTime {
+                        client_transmitted: 1_000,
+                        server_received: 2_000,
+                        server_transmitted: 3_000,
+                    },
+                ))
                 .unwrap(),
         );
         for frame in frames {
