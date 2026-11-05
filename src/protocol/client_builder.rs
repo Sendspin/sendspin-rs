@@ -1,13 +1,17 @@
 // ABOUTME: Builder exposed for public usage of the library
 
 use crate::error::Error;
+use crate::protocol::client::ConnectParams;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, ClientHello, ClientState, ClientSyncState, DeviceInfo, PlayerState,
-    PlayerV1Support, VisualizerV1Support,
+    PlayerV1Support, UnpairedAccess, VisualizerV1Support,
 };
+use crate::protocol::noise::Identity;
+use crate::protocol::persistence::PersistenceProvider;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
@@ -18,7 +22,7 @@ use typed_builder::TypedBuilder;
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
 pub(crate) struct ProtocolClientBuilderRaw {
-    client_id: String,
+    persistence: Arc<dyn PersistenceProvider>,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
@@ -30,6 +34,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     automatic_player_state: bool,
+    unpaired_access: bool,
     metadata: bool,
     controller: bool,
     color: bool,
@@ -59,7 +64,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
 
         ProtocolClientBuilder {
-            client_id: raw.client_id,
+            persistence: raw.persistence,
+            identity: Arc::new(Mutex::new(None)),
             name: raw.name,
             product_name: raw.product_name,
             manufacturer: raw.manufacturer,
@@ -73,6 +79,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             initial_sync_state: raw.initial_sync_state,
             initial_player_state: raw.initial_player_state,
             automatic_player_state: raw.automatic_player_state,
+            unpaired_access: raw.unpaired_access,
         }
     }
 }
@@ -81,7 +88,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
 #[builder(build_method(into = ProtocolClientBuilder))]
 /// Builder Class for ProtocolClient
 pub struct ProtocolClientBuilderFields {
-    client_id: String,
+    /// Storage for the client's identity key, which must survive restarts.
+    persistence: Arc<dyn PersistenceProvider>,
     name: String,
     #[builder(default = None)]
     product_name: Option<String>,
@@ -107,6 +115,10 @@ pub struct ProtocolClientBuilderFields {
     /// Automatically report successful player control changes as client/state updates.
     #[builder(default = true)]
     automatic_player_state: bool,
+    /// Admit servers without a pairing record to activate roles and play.
+    /// Without pairing these connections are open to man-in-the-middle attacks.
+    #[builder(default = false)]
+    unpaired_access: bool,
     #[builder(default = false, setter(transform = || true))]
     metadata: bool,
     #[builder(default = false, setter(transform = || true))]
@@ -118,7 +130,7 @@ pub struct ProtocolClientBuilderFields {
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
     fn from(fields: ProtocolClientBuilderFields) -> Self {
         let raw = ProtocolClientBuilderRaw {
-            client_id: fields.client_id,
+            persistence: fields.persistence,
             name: fields.name,
             product_name: fields.product_name,
             manufacturer: fields.manufacturer,
@@ -130,6 +142,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             initial_sync_state: fields.initial_sync_state,
             initial_player_state: fields.initial_player_state,
             automatic_player_state: fields.automatic_player_state,
+            unpaired_access: fields.unpaired_access,
             metadata: fields.metadata,
             controller: fields.controller,
             color: fields.color,
@@ -141,7 +154,10 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
 /// Builder Class for ProtocolClient
 #[derive(Clone)]
 pub struct ProtocolClientBuilder {
-    client_id: String,
+    persistence: Arc<dyn PersistenceProvider>,
+    /// Loaded on first use and shared by clones, so concurrent connections
+    /// never generate competing keys.
+    identity: Arc<Mutex<Option<Identity>>>,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
@@ -154,6 +170,7 @@ pub struct ProtocolClientBuilder {
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     automatic_player_state: bool,
+    unpaired_access: bool,
     clock: Arc<dyn Clock>,
 }
 
@@ -194,12 +211,11 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
-        ProtocolClient::connect(request, hello, initial_state, clock, automatic_player_state).await
+        ProtocolClient::connect(request, self.into_params()?).await
     }
 
-    /// Adopt an already-handshaked WebSocket stream and drive the protocol
-    /// from `client/hello` onwards.
+    /// Adopt an already-upgraded WebSocket stream and drive the protocol
+    /// from `client/init` onwards.
     ///
     /// Use this when you're terminating TLS, routing by HTTP path, or
     /// otherwise need to own the WebSocket layer yourself. For the common
@@ -209,21 +225,14 @@ impl ProtocolClientBuilder {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
-        ProtocolClient::drive(
-            ws_stream,
-            hello,
-            initial_state,
-            clock,
-            automatic_player_state,
-        )
-        .await
+        ProtocolClient::drive(ws_stream, self.into_params()?).await
     }
 
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
     /// inbound WebSocket peers. The builder is cloned per accepted peer.
     pub async fn listen<A: ToSocketAddrs>(self, addr: A) -> Result<ProtocolListener, Error> {
         self.validate()?;
+        self.identity()?;
         let tcp = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Connection(format!("TCP bind failed: {e}")))?;
@@ -260,12 +269,19 @@ impl ProtocolClientBuilder {
         Ok(())
     }
 
-    fn into_parts(self) -> Result<(ClientHello, ClientState, Arc<dyn Clock>, bool), Error> {
+    fn identity(&self) -> Result<Identity, Error> {
+        let mut identity = self.identity.lock();
+        if identity.is_none() {
+            *identity = Some(Identity::load_or_create(self.persistence.as_ref())?);
+        }
+        Ok(identity.clone().expect("loaded above"))
+    }
+
+    fn into_params(self) -> Result<ConnectParams, Error> {
         self.validate()?;
+        let identity = self.identity()?;
         let hello = ClientHello {
-            client_id: self.client_id,
             name: self.name,
-            version: 1,
             supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
                 product_name: self.product_name,
@@ -276,6 +292,9 @@ impl ProtocolClientBuilder {
             player_v1_support: self.player_v1_support,
             artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
+            unpaired_access: UnpairedAccess {
+                enabled: self.unpaired_access,
+            },
         };
 
         let initial_state = ClientState {
@@ -283,11 +302,12 @@ impl ProtocolClientBuilder {
             player: self.initial_player_state,
         };
 
-        Ok((
+        Ok(ConnectParams {
+            identity,
             hello,
             initial_state,
-            self.clock,
-            self.automatic_player_state,
-        ))
+            clock: self.clock,
+            automatic_player_state: self.automatic_player_state,
+        })
     }
 }

@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "payload")]
 pub enum Message {
     // === Handshake messages ===
+    /// First message of a connection, naming the client's key and cipher suite
+    #[serde(rename = "client/init")]
+    ClientInit(ClientInit),
+
+    /// Server response to `client/init`
+    #[serde(rename = "server/init")]
+    ServerInit(ServerInit),
+
+    /// Server refusal of `client/init`, sent in place of `server/init`
+    #[serde(rename = "server/error")]
+    ServerError(ServerError),
+
+    /// One Noise handshake message
+    #[serde(rename = "noise/handshake")]
+    NoiseHandshake(NoiseHandshake),
+
     /// Client hello handshake message
     #[serde(rename = "client/hello")]
     ClientHello(ClientHello),
@@ -15,6 +31,10 @@ pub enum Message {
     /// Server hello handshake response
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),
+
+    /// Server declaration of the connection's activities and active roles
+    #[serde(rename = "server/activate")]
+    ServerActivate(ServerActivate),
 
     // === Time synchronization ===
     /// Client time synchronization request
@@ -75,15 +95,65 @@ pub enum Message {
 // Handshake Messages
 // =============================================================================
 
+/// Client init message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInit {
+    /// The client's static Curve25519 public key, base64url-encoded without padding
+    pub client_id: String,
+    /// Core message format version, always 1
+    pub version: u32,
+    /// Noise cipher suite the client picked
+    pub suite: CipherSuite,
+}
+
+/// Noise cipher suite
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CipherSuite {
+    /// `25519_ChaChaPoly_SHA256`
+    #[serde(rename = "25519_ChaChaPoly_SHA256")]
+    ChaChaPolySha256,
+}
+
+/// Server init message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInit {
+    /// The server's static Curve25519 public key, base64url-encoded without padding
+    pub server_id: String,
+    /// Core message format version, always 1
+    pub version: u32,
+}
+
+/// Server error message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerError {
+    /// Why the server refused `client/init`
+    pub reason: ServerErrorReason,
+}
+
+/// Reason the server refused `client/init`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerErrorReason {
+    /// The server does not implement the client's `version`
+    UnsupportedVersion,
+    /// The server does not implement the client's `suite`
+    UnsupportedSuite,
+    /// `client/init` is not valid JSON of the defined shape
+    Malformed,
+}
+
+/// Noise handshake message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoiseHandshake {
+    /// Noise handshake message bytes, base64url-encoded without padding
+    pub data: String,
+}
+
 /// Client hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
-    /// Unique client identifier
-    pub client_id: String,
     /// Human-readable client name
     pub name: String,
-    /// Protocol version number
-    pub version: u32,
     /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
     /// Device information (optional)
@@ -101,6 +171,15 @@ pub struct ClientHello {
         skip_serializing_if = "Option::is_none"
     )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
+    /// Whether the client admits servers it is not paired with
+    pub unpaired_access: UnpairedAccess,
+}
+
+/// Unpaired access setting advertised in `client/hello`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpairedAccess {
+    /// Whether a server without a pairing record may activate roles or declare `playback`
+    pub enabled: bool,
 }
 
 /// Device information (all fields optional per spec)
@@ -265,26 +344,43 @@ pub enum SpectrumScale {
 /// Server hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerHello {
-    /// Unique server identifier
-    pub server_id: String,
     /// Human-readable server name
     pub name: String,
-    /// Protocol version number
-    pub version: u32,
-    /// List of roles activated by server for this client
-    pub active_roles: Vec<String>,
-    /// Reason for connection: 'discovery' or 'playback'
-    pub connection_reason: ConnectionReason,
+    /// BCP 47 language tags the operator understands, most preferred first
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub languages: Option<Vec<String>>,
 }
 
-/// Connection reason enum
+/// Server activate message
+///
+/// The library delivers each activation with `active_roles` set to the roles
+/// in effect after applying it, also when the server omitted the field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerActivate {
+    /// The connection's current purposes
+    pub activities: Vec<Activity>,
+    /// Versioned roles active for this client, such as `player@v1`
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_roles: Option<Vec<String>>,
+}
+
+impl ServerActivate {
+    /// Whether `role` (a versioned name such as `controller@v1`) is active.
+    pub fn is_active(&self, role: &str) -> bool {
+        self.active_roles
+            .as_ref()
+            .is_some_and(|roles| roles.iter().any(|r| r == role))
+    }
+}
+
+/// Purpose a server declares for a connection
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
-pub enum ConnectionReason {
-    /// Server connected for discovery/announcement
-    Discovery,
-    /// Server connected for active playback
+pub enum Activity {
+    /// Normal playback and control
     Playback,
+    /// A pairing attempt
+    Pairing,
 }
 
 // =============================================================================
@@ -848,6 +944,10 @@ pub enum GoodbyeReason {
     Restart,
     /// User requested disconnect
     UserRequest,
+    /// The server declared activities or roles the client does not authorize
+    Unauthorized,
+    /// The server needs unpaired access, which the client does not admit
+    PairingRequired,
 }
 
 // =============================================================================
