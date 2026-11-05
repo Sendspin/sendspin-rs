@@ -154,6 +154,8 @@ struct PlaybackQueue {
     /// the enqueue trace line. Reset by `clear()`.
     enqueue_count: u64,
     silent_frame: Vec<i32>,
+    /// Silent frames `next_frame` plays before the current buffer's next frame is due.
+    silence_frames: usize,
 }
 
 impl PlaybackQueue {
@@ -169,6 +171,7 @@ impl PlaybackQueue {
             force_reanchor: true,
             enqueue_count: 0,
             silent_frame: Vec::new(),
+            silence_frames: 0,
         }
     }
 
@@ -182,6 +185,31 @@ impl PlaybackQueue {
         self.playback_reset_generation = self.playback_reset_generation.advance();
         self.force_reanchor = true;
         self.enqueue_count = 0;
+        self.silence_frames = 0;
+    }
+
+    /// Moves playback to `cursor_us`, dropping the audio before it or playing
+    /// silence until the next queued frame is due.
+    fn seek(&mut self, cursor_us: i64, channels: usize, sample_rate: u32) {
+        let rate = i64::from(sample_rate.max(1));
+        self.cursor_us = cursor_us;
+        self.cursor_remainder = 0;
+        self.silence_frames = 0;
+        let index = self.index;
+        if let Some(current) = self
+            .current
+            .take_if(|current| index + channels <= current.samples.len())
+        {
+            let next_frame_us = current.timestamp + (index / channels) as i64 * 1_000_000 / rate;
+            if next_frame_us > cursor_us {
+                self.silence_frames = ((next_frame_us - cursor_us) * rate / 1_000_000) as usize;
+                self.current = Some(current);
+                return;
+            }
+            // next_frame skips the reloaded buffer up to the cursor.
+            self.queue.push_front(current);
+            self.index = 0;
+        }
     }
 
     fn push(&mut self, buffer: AudioBuffer) {
@@ -232,6 +260,12 @@ impl PlaybackQueue {
     }
 
     fn next_frame(&mut self, channels: usize, sample_rate: u32) -> Option<&[i32]> {
+        if self.silence_frames > 0 {
+            self.silence_frames -= 1;
+            self.advance_cursor(sample_rate);
+            self.silent_frame.resize(channels, i32::EQUILIBRIUM);
+            return Some(&self.silent_frame);
+        }
         let needs_buffer = match self.current {
             None => true,
             Some(ref c) => self.index + channels > c.samples.len(),
@@ -1705,11 +1739,12 @@ impl SyncedPlayer {
                             if let Some(server_time) = sync.client_to_server_micros(client_micros) {
                                 let mut queue = queue.lock();
                                 if queue.playback_reset_generation == playback_reset_generation && queue.initialized {
-                                    if let Some(cursor_us) =
+                                    if let Some(first_playable_us) =
                                         queue.first_playable_cursor_at_or_after(server_time)
                                     {
-                                        queue.cursor_us = cursor_us;
-                                        queue.cursor_remainder = 0;
+                                        let cursor_us =
+                                            if started { server_time } else { first_playable_us };
+                                        queue.seek(cursor_us, channels, sample_rate);
                                         queue.force_reanchor = false;
                                         effective_cursor_us = cursor_us;
                                         reanchor_applied = true;
@@ -1954,9 +1989,7 @@ impl SyncedPlayer {
                                 if let Some(server_time) =
                                     sync.client_to_server_micros(client_micros)
                                 {
-                                    let mut queue = queue.lock();
-                                    queue.cursor_us = server_time;
-                                    queue.cursor_remainder = 0;
+                                    queue.lock().seek(server_time, channels, sample_rate);
                                     log::debug!(
                                         "Sync reanchor applied: cursor reset to server_time={server_time}µs"
                                     );
@@ -3192,6 +3225,55 @@ mod tests {
         // Should also be sorted: A first, then B.
         assert_eq!(queue.queue[0].timestamp, 0);
         assert_eq!(queue.queue[1].timestamp, 5_000);
+    }
+
+    /// A playing queue over one 10ms stereo buffer whose frames hold their
+    /// own index, with the first 5ms already played.
+    fn queue_halfway_through_buffer() -> PlaybackQueue {
+        let mut queue = PlaybackQueue::new();
+        let samples: Vec<i32> = (0..480).flat_map(|frame| [frame, frame]).collect();
+        queue.push(AudioBuffer {
+            timestamp: 0,
+            samples: Arc::from(samples.into_boxed_slice()),
+            format: test_format(),
+        });
+        for _ in 0..240 {
+            queue.next_frame(2, 48_000);
+        }
+        assert_eq!(queue.cursor_us, 5_000);
+        queue
+    }
+
+    #[test]
+    fn test_seek_back_plays_silence_until_the_next_frame_is_due() {
+        let mut queue = queue_halfway_through_buffer();
+        queue.seek(4_000, 2, 48_000);
+        for _ in 0..48 {
+            assert_eq!(queue.next_frame(2, 48_000), Some(&[0, 0][..]));
+        }
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[240, 240][..]));
+    }
+
+    #[test]
+    fn test_seek_forward_drops_the_frames_before_the_cursor() {
+        let mut queue = queue_halfway_through_buffer();
+        queue.seek(6_000, 2, 48_000);
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[288, 288][..]));
+    }
+
+    #[test]
+    fn test_seek_into_a_gap_plays_silence_until_the_next_buffer_is_due() {
+        let mut queue = queue_halfway_through_buffer();
+        queue.push(AudioBuffer {
+            timestamp: 20_000,
+            samples: Arc::from(vec![7; 960].into_boxed_slice()),
+            format: test_format(),
+        });
+        queue.seek(15_000, 2, 48_000);
+        for _ in 0..240 {
+            assert_eq!(queue.next_frame(2, 48_000), Some(&[0, 0][..]));
+        }
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[7, 7][..]));
     }
 
     #[test]
