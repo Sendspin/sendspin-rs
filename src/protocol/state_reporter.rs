@@ -185,7 +185,7 @@ pub(crate) async fn run(mut config: Config) {
                                 Some(player.clone())
                             },
                         })).await;
-                        let reconciled = if result.is_ok() && !external && !was_external {
+                        let reconciled = if result.is_ok() && !external {
                             reconcile_post_state(
                                 &config.output,
                                 &config.controls,
@@ -643,6 +643,49 @@ mod tests {
             .iter()
             .any(|message| message.contains("synchronized")));
         assert!(messages.iter().any(|message| message.contains("33")));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_sync_exit_reports_change_consumed_before_external_round_trip() {
+        let (commands, command_rx) = mpsc::unbounded_channel();
+        // The commands carry the older 50 while 33 is already reported, as concurrent senders can cause.
+        let (_tx, controls_rx) = watch::channel(controls(33));
+        let (output, output_rx) = mpsc::unbounded_channel();
+        let mut results = Vec::new();
+        for state in [
+            ClientSyncState::ExternalSource,
+            ClientSyncState::Synchronized,
+        ] {
+            let (ack, result) = oneshot::channel();
+            commands
+                .send(Command::State {
+                    state: ClientState {
+                        state: Some(state),
+                        player: None,
+                    },
+                    boundary_applied_controls: controls(50),
+                    ack,
+                })
+                .unwrap();
+            results.push(result);
+        }
+        let task = tokio::spawn(run(Config {
+            commands: command_rx,
+            controls: controls_rx,
+            initial: initial(50),
+            output,
+        }));
+        let messages = timeout(Duration::from_secs(1), read_messages(output_rx, 4))
+            .await
+            .unwrap();
+        assert!(messages[0].contains("33"));
+        assert!(messages[1].contains("external_source"));
+        assert!(messages[2].contains("synchronized"));
+        assert!(messages[3].contains("33"));
+        for result in results {
+            result.await.unwrap().unwrap();
+        }
         task.abort();
     }
 }
