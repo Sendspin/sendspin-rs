@@ -153,6 +153,7 @@ struct PlaybackQueue {
     /// Buffers enqueued since the last playback reset; the sampling key for
     /// the enqueue trace line. Reset by `clear()`.
     enqueue_count: u64,
+    silent_frame: Vec<i32>,
 }
 
 impl PlaybackQueue {
@@ -167,6 +168,7 @@ impl PlaybackQueue {
             playback_reset_generation: PlaybackResetGeneration::initial(),
             force_reanchor: true,
             enqueue_count: 0,
+            silent_frame: Vec::new(),
         }
     }
 
@@ -249,6 +251,26 @@ impl PlaybackQueue {
             // Pop buffers until we find one with remaining samples past the
             // cursor, or the queue is empty.
             loop {
+                // Play silence until the cursor reaches a buffer that starts
+                // later. The buffer stays queued so an earlier one can still
+                // be inserted before it.
+                if self.initialized {
+                    if let Some(front) = self.queue.front() {
+                        let timestamp = front.timestamp;
+                        let gap_us = timestamp - self.cursor_us;
+                        if gap_us >= frame_duration_us(sample_rate) {
+                            if self.current.take().is_some() {
+                                log::debug!(
+                                    "Playback queue gap: {gap_us}µs before buffer at {timestamp}µs, filling with silence"
+                                );
+                            }
+                            self.advance_cursor(sample_rate);
+                            self.silent_frame.resize(channels, i32::EQUILIBRIUM);
+                            return Some(&self.silent_frame);
+                        }
+                    }
+                }
+
                 self.current = self.queue.pop_front();
                 self.index = 0;
 
@@ -2485,7 +2507,7 @@ mod tests {
 
         // Use distinct sample values so we can verify which buffer was returned.
         // 4800 stereo frames at 48kHz = 100ms per buffer.
-        // With cursor at 150ms, the first buffer (ts=0, ends at 100ms) is stale.
+        // With cursor at 200ms, the first buffer (ts=0, ends at 100ms) is stale.
         let stale_samples: Vec<i32> = (0..4800 * 2).map(|_| 111).collect();
         let fresh_samples: Vec<i32> = (0..4800 * 2).map(|_| 222).collect();
 
@@ -2500,7 +2522,7 @@ mod tests {
             format,
         });
 
-        queue.cursor_us = 150_000;
+        queue.cursor_us = 200_000;
         queue.initialized = true;
 
         // Copy the frame data so we can release the mutable borrow on queue.
@@ -2519,8 +2541,8 @@ mod tests {
         let mut queue = PlaybackQueue::new();
         let format = test_format_mono();
 
-        // Push out of order: 300, 100, 200
-        for ts in [300_000i64, 100_000, 200_000] {
+        // Push out of order: 2ms, 0ms, 1ms
+        for ts in [2_000i64, 0, 1_000] {
             let samples = vec![ts as i32; 48]; // 1ms of mono
             queue.push(AudioBuffer {
                 timestamp: ts,
@@ -2536,7 +2558,7 @@ mod tests {
 
         // Drain and verify sorted order
         let _ = queue.next_frame(1, 48_000);
-        assert_eq!(queue.current.as_ref().unwrap().timestamp, 100_000);
+        assert_eq!(queue.current.as_ref().unwrap().timestamp, 0);
 
         // Exhaust the first buffer (48 frames)
         for _ in 1..48 {
@@ -2544,7 +2566,7 @@ mod tests {
         }
         // Next frame should come from the second buffer
         let _ = queue.next_frame(1, 48_000);
-        assert_eq!(queue.current.as_ref().unwrap().timestamp, 200_000);
+        assert_eq!(queue.current.as_ref().unwrap().timestamp, 1_000);
 
         // Exhaust the second buffer
         for _ in 1..48 {
@@ -2552,7 +2574,7 @@ mod tests {
         }
         // Next frame should come from the third buffer
         let _ = queue.next_frame(1, 48_000);
-        assert_eq!(queue.current.as_ref().unwrap().timestamp, 300_000);
+        assert_eq!(queue.current.as_ref().unwrap().timestamp, 2_000);
     }
 
     #[test]
@@ -2851,6 +2873,59 @@ mod tests {
             frame[0], 222,
             "buffer B should play from the start (no skip needed)"
         );
+    }
+
+    #[test]
+    fn test_next_frame_fills_timestamp_gap_with_silence() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        // 10ms buffers at 1.00s and 1.02s, with nothing stamped 1.01s.
+        for (timestamp, value) in [(1_000_000, 111), (1_020_000, 333)] {
+            queue.push(AudioBuffer {
+                timestamp,
+                samples: Arc::from(vec![value; 480 * 2].into_boxed_slice()),
+                format: format.clone(),
+            });
+        }
+
+        for _ in 0..480 {
+            assert_eq!(queue.next_frame(2, 48_000), Some(&[111, 111][..]));
+        }
+        for _ in 0..480 {
+            assert_eq!(queue.next_frame(2, 48_000), Some(&[0, 0][..]));
+        }
+        assert_eq!(queue.cursor_us, 1_020_000);
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[333, 333][..]));
+    }
+
+    #[test]
+    fn test_next_frame_plays_chunk_that_arrives_during_gap() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        for (timestamp, value) in [(1_000_000, 111), (1_020_000, 333)] {
+            queue.push(AudioBuffer {
+                timestamp,
+                samples: Arc::from(vec![value; 480 * 2].into_boxed_slice()),
+                format: format.clone(),
+            });
+        }
+        for _ in 0..480 + 240 {
+            let _ = queue.next_frame(2, 48_000);
+        }
+
+        // A chunk stamped 1.01s arrives halfway through the gap.
+        queue.push(AudioBuffer {
+            timestamp: 1_010_000,
+            samples: Arc::from(vec![222; 480 * 2].into_boxed_slice()),
+            format,
+        });
+
+        for _ in 0..240 {
+            assert_eq!(queue.next_frame(2, 48_000), Some(&[222, 222][..]));
+        }
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[333, 333][..]));
     }
 
     #[test]
