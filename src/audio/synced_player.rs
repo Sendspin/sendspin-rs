@@ -131,6 +131,12 @@ fn default_buffer_size(sample_rate: u32) -> cpal::BufferSize {
     }
 }
 
+/// Duration of one frame in microseconds, rounded up.
+fn frame_duration_us(sample_rate: u32) -> i64 {
+    let rate = i64::from(sample_rate.max(1));
+    (1_000_000 + rate - 1) / rate
+}
+
 struct PlaybackQueue {
     queue: VecDeque<AudioBuffer>,
     current: Option<AudioBuffer>,
@@ -204,8 +210,7 @@ impl PlaybackQueue {
         // the buffer as 24989µs, landing a third of all chunks 1µs "inside"
         // their predecessor. Evicting on those phantom overlaps silently
         // discarded ~34% of all 44.1kHz audio (heard as continuous popping).
-        let rate = i64::from(buffer.format.sample_rate.max(1));
-        let frame_us = (1_000_000 + rate - 1) / rate;
+        let frame_us = frame_duration_us(buffer.format.sample_rate);
         let new_end = buffer.timestamp + buffer.duration_us();
         self.queue.retain(|b| {
             let existing_end = b.timestamp + b.duration_us();
