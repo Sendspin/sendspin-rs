@@ -1790,13 +1790,14 @@ impl SyncedPlayer {
                         if let Some(expected_instant) = sync
                             .server_to_local_instant_with_latency(effective_cursor_us, delay_us)
                         {
-                            // Pre-start only: hold silence until the cursor's
-                            // scheduled instant. After start, "early" readings
+                            // Pre-start only: hold silence until the callback
+                            // playing the cursor's scheduled instant. After start, "early" readings
                             // are jitter — injecting silence here caused real
                             // dropouts (audible blips); the planner handles
                             // sustained earliness instead.
-                            let early_window = Duration::from_millis(1);
-                            if !started && playback_instant + early_window < expected_instant {
+                            let callback_span =
+                                Duration::from_secs_f64(frames as f64 / sample_rate as f64);
+                            if !started && playback_instant + callback_span <= expected_instant {
                                 stats.silent_callbacks += 1;
                                 if trace_logging && should_log_sample(stats.silent_callbacks) {
                                     let early_us = expected_instant
@@ -1816,7 +1817,22 @@ impl SyncedPlayer {
                                 emit_silence(data);
                                 return;
                             }
+                            let mut expected_instant = expected_instant;
                             if !started {
+                                // Start at the exact frame due now, dropping audio or
+                                // leading with silence for the part of this callback before it.
+                                let start_instant = callback_instant
+                                    + Duration::from_micros(correction.min_playback_delta_us);
+                                let offset_us = if start_instant >= expected_instant {
+                                    start_instant.duration_since(expected_instant).as_micros()
+                                        as i64
+                                } else {
+                                    -(expected_instant.duration_since(start_instant).as_micros()
+                                        as i64)
+                                };
+                                effective_cursor_us += offset_us;
+                                queue.lock().seek(effective_cursor_us, channels, sample_rate);
+                                expected_instant = start_instant;
                                 started = true;
                                 correction.start(callback_instant);
                                 log::debug!(
