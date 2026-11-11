@@ -123,10 +123,15 @@ impl Default for CorrectionPlanner {
 }
 
 /// Measurements kept by [`SyncErrorFilter`]. 101 callbacks is ~1s at the
-/// common 10ms WASAPI period (2-4s on 20-40ms periods): long enough that the
+/// common 10ms WASAPI period (longer periods are cut at
+/// [`SYNC_ERROR_WINDOW_DURATION`]): long enough that the
 /// floor mode gets sampled even through dense flapping, short enough that a
 /// real displacement reaches the output within about a second.
 pub(crate) const SYNC_ERROR_WINDOW: usize = 101;
+
+/// Longest span of [`SyncErrorFilter`]'s window, so a long callback period
+/// does not delay a real displacement by several seconds.
+pub(crate) const SYNC_ERROR_WINDOW_DURATION: Duration = Duration::from_secs(1);
 
 /// Windowed minimum (floor tracker) over recent sync-error measurements.
 ///
@@ -156,8 +161,11 @@ pub(crate) const SYNC_ERROR_WINDOW: usize = 101;
 #[derive(Debug, Clone)]
 pub(crate) struct SyncErrorFilter {
     samples: [i64; SYNC_ERROR_WINDOW],
+    times: [Instant; SYNC_ERROR_WINDOW],
     len: usize,
     next: usize,
+    first_at: Option<Instant>,
+    warm: bool,
 }
 
 impl SyncErrorFilter {
@@ -165,8 +173,11 @@ impl SyncErrorFilter {
     pub fn new() -> Self {
         Self {
             samples: [0; SYNC_ERROR_WINDOW],
+            times: [Instant::now(); SYNC_ERROR_WINDOW],
             len: 0,
             next: 0,
+            first_at: None,
+            warm: false,
         }
     }
 
@@ -175,29 +186,38 @@ impl SyncErrorFilter {
     pub fn reset(&mut self) {
         self.len = 0;
         self.next = 0;
+        self.first_at = None;
+        self.warm = false;
     }
 
-    /// True once the window is fully populated. A floor over a partial
-    /// window is still returned by [`SyncErrorFilter::update`], but engage
-    /// decisions should wait for warmth (see [`EngageGate`]).
+    /// True once the window is fully populated or spans its full duration.
+    /// A floor over a partial window is still returned by
+    /// [`SyncErrorFilter::update`], but engage decisions should wait for
+    /// warmth (see [`EngageGate`]).
     pub fn is_warm(&self) -> bool {
-        self.len == SYNC_ERROR_WINDOW
+        self.warm
     }
 
     /// Record a raw error measurement (µs) and return the windowed minimum.
-    pub fn update(&mut self, raw_error_us: i64) -> i64 {
+    pub fn update(&mut self, now: Instant, raw_error_us: i64) -> i64 {
         self.samples[self.next] = raw_error_us;
+        self.times[self.next] = now;
         self.next = (self.next + 1) % SYNC_ERROR_WINDOW;
         if self.len < SYNC_ERROR_WINDOW {
             self.len += 1;
         }
+        let first_at = *self.first_at.get_or_insert(now);
+        self.warm = self.len == SYNC_ERROR_WINDOW
+            || now.saturating_duration_since(first_at) >= SYNC_ERROR_WINDOW_DURATION;
         // While filling, the live samples are the contiguous prefix
         // (next == len until the first wrap); afterwards the whole array.
         // Stale slots past `len` are never read. `len >= 1` here, so the
         // fold always sees at least one real sample.
         self.samples[..self.len]
             .iter()
-            .copied()
+            .zip(&self.times[..self.len])
+            .filter(|(_, at)| now.saturating_duration_since(**at) < SYNC_ERROR_WINDOW_DURATION)
+            .map(|(sample, _)| *sample)
             .fold(i64::MAX, i64::min)
     }
 }
@@ -215,6 +235,10 @@ impl Default for SyncErrorFilter {
 /// warm-up, when the estimate is least trustworthy.
 pub(crate) const ENGAGE_STREAK_PLANS: u32 = 50;
 
+/// Streak span that also engages, so a long callback period waits no longer
+/// than [`ENGAGE_STREAK_PLANS`] take at 10ms.
+pub(crate) const ENGAGE_STREAK_DURATION: Duration = Duration::from_millis(500);
+
 /// Gate between the planner and the applied schedule: an idle stream only
 /// starts correcting after a sustained run of correcting plans over a warm
 /// filter. Every engaged correction mutates real audio (dropped or repeated
@@ -224,17 +248,22 @@ pub(crate) const ENGAGE_STREAK_PLANS: u32 = 50;
 #[derive(Debug, Clone)]
 pub(crate) struct EngageGate {
     streak: u32,
+    streak_since: Option<Instant>,
 }
 
 impl EngageGate {
     /// Create a gate with no accumulated streak.
     pub fn new() -> Self {
-        Self { streak: 0 }
+        Self {
+            streak: 0,
+            streak_since: None,
+        }
     }
 
     /// Clear the accumulated streak.
     pub fn reset(&mut self) {
         self.streak = 0;
+        self.streak_since = None;
     }
 
     #[cfg(test)]
@@ -250,12 +279,13 @@ impl EngageGate {
     /// so a single reading carrying period noise cannot jump the cursor.
     pub fn admit(
         &mut self,
+        now: Instant,
         planned: CorrectionSchedule,
         currently_correcting: bool,
         filter_warm: bool,
     ) -> CorrectionSchedule {
         if planned.reanchor {
-            self.streak = 0;
+            self.reset();
             return if filter_warm {
                 planned
             } else {
@@ -263,11 +293,15 @@ impl EngageGate {
             };
         }
         if currently_correcting || !planned.is_correcting() {
-            self.streak = 0;
+            self.reset();
             return planned;
         }
         self.streak = self.streak.saturating_add(1);
-        if filter_warm && self.streak >= ENGAGE_STREAK_PLANS {
+        let since = *self.streak_since.get_or_insert(now);
+        if filter_warm
+            && (self.streak >= ENGAGE_STREAK_PLANS
+                || now.saturating_duration_since(since) >= ENGAGE_STREAK_DURATION)
+        {
             planned
         } else {
             CorrectionSchedule::default()
@@ -539,21 +573,23 @@ mod tests {
 
     #[test]
     fn test_filter_constant_input_passes_through() {
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
-            assert_eq!(filter.update(4_000), 4_000);
+            assert_eq!(filter.update(now, 4_000), 4_000);
         }
         assert!(filter.is_warm());
     }
 
     #[test]
     fn test_filter_warms_only_after_full_window() {
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW - 1 {
-            filter.update(0);
+            filter.update(now, 0);
             assert!(!filter.is_warm());
         }
-        filter.update(0);
+        filter.update(now, 0);
         assert!(filter.is_warm());
     }
 
@@ -563,10 +599,11 @@ mod tests {
         // majority in the high mode — enough to drag any central-tendency
         // estimate — must not lift the floor while the quiet mode is sampled
         // at least once per window.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for i in 0..SYNC_ERROR_WINDOW * 3 {
             let raw = if i % 10 == 0 { 0 } else { 10_000 };
-            let floor = filter.update(raw);
+            let floor = filter.update(now, raw);
             if i >= 1 {
                 assert_eq!(floor, 0, "flap majority must not lift the floor");
             }
@@ -577,13 +614,14 @@ mod tests {
     fn test_filter_floor_follows_persistent_rise_after_full_window() {
         // A real displacement shifts every reading including the floor; the
         // output must follow once the old floor ages out of the window.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
-            filter.update(0);
+            filter.update(now, 0);
         }
         let mut floor = 0;
         for i in 0..SYNC_ERROR_WINDOW {
-            floor = filter.update(10_000);
+            floor = filter.update(now, 10_000);
             if i < SYNC_ERROR_WINDOW - 1 {
                 assert_eq!(floor, 0, "rise must wait for the window to age out");
             }
@@ -596,36 +634,47 @@ mod tests {
         // A running correction shrinks the error; the floor must track the
         // new low on the very next sample so the correction converges
         // without overshoot.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
-            filter.update(10_000);
+            filter.update(now, 10_000);
         }
-        assert_eq!(filter.update(2_000), 2_000, "new low becomes the floor");
+        assert_eq!(
+            filter.update(now, 2_000),
+            2_000,
+            "new low becomes the floor"
+        );
     }
 
     #[test]
     fn test_filter_handles_negative_errors() {
         // Negative true error (audio early, insert side) with one-sided
         // positive excursions on top.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for i in 0..SYNC_ERROR_WINDOW {
             let raw = if i % 3 == 0 { 10_000 } else { -5_000 };
-            filter.update(raw);
+            filter.update(now, raw);
         }
-        assert_eq!(filter.update(-5_000), -5_000);
+        assert_eq!(filter.update(now, -5_000), -5_000);
     }
 
     #[test]
     fn test_filter_single_low_evicted_exactly_after_window() {
         // One low among highs must stop being the floor exactly WINDOW
         // updates after it was recorded.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
-        filter.update(1_000);
+        filter.update(now, 1_000);
         for i in 0..SYNC_ERROR_WINDOW - 1 {
-            assert_eq!(filter.update(10_000), 1_000, "low still in window at {i}");
+            assert_eq!(
+                filter.update(now, 10_000),
+                1_000,
+                "low still in window at {i}"
+            );
         }
         assert_eq!(
-            filter.update(10_000),
+            filter.update(now, 10_000),
             10_000,
             "low must age out exactly one window after it was recorded"
         );
@@ -635,6 +684,7 @@ mod tests {
     fn test_filter_tracks_min_across_multiple_wraps() {
         // Distinct values across several ring cycles: the floor must always
         // equal the true minimum of the last WINDOW samples.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         let mut recent: Vec<i64> = Vec::new();
         for i in 0..(SYNC_ERROR_WINDOW as i64 * 5) {
@@ -644,7 +694,11 @@ mod tests {
                 recent.remove(0);
             }
             let expected = *recent.iter().min().unwrap();
-            assert_eq!(filter.update(value), expected, "mismatch at update {i}");
+            assert_eq!(
+                filter.update(now, value),
+                expected,
+                "mismatch at update {i}"
+            );
         }
     }
 
@@ -652,17 +706,35 @@ mod tests {
     fn test_filter_reset_clears_window() {
         // Fill with a LOW value so stale slots would drag the floor down if
         // reset failed to fence them off.
+        let now = Instant::now();
         let mut filter = SyncErrorFilter::new();
         for _ in 0..SYNC_ERROR_WINDOW {
-            filter.update(-10_000);
+            filter.update(now, -10_000);
         }
         filter.reset();
         assert!(!filter.is_warm());
         assert_eq!(
-            filter.update(5_000),
+            filter.update(now, 5_000),
             5_000,
             "floor after reset must reflect only new samples"
         );
+    }
+
+    #[test]
+    fn test_filter_window_is_bounded_in_time_on_long_periods() {
+        // 40ms callbacks: a full count window would span 4s.
+        let start = Instant::now();
+        let period = Duration::from_millis(40);
+        let mut filter = SyncErrorFilter::new();
+        filter.update(start, 0);
+        let mut i = 1;
+        while period * i < SYNC_ERROR_WINDOW_DURATION {
+            assert_eq!(filter.update(start + period * i, 10_000), 0);
+            assert!(!filter.is_warm(), "warm after {i} readings");
+            i += 1;
+        }
+        assert_eq!(filter.update(start + period * i, 10_000), 10_000);
+        assert!(filter.is_warm());
     }
 
     fn correcting_plan() -> CorrectionSchedule {
@@ -675,23 +747,40 @@ mod tests {
 
     #[test]
     fn test_gate_requires_sustained_streak() {
+        let now = Instant::now();
         let mut gate = EngageGate::new();
         for _ in 0..ENGAGE_STREAK_PLANS - 1 {
-            let admitted = gate.admit(correcting_plan(), false, true);
+            let admitted = gate.admit(now, correcting_plan(), false, true);
             assert!(!admitted.is_correcting(), "streak not yet sustained");
         }
-        let admitted = gate.admit(correcting_plan(), false, true);
+        let admitted = gate.admit(now, correcting_plan(), false, true);
         assert!(admitted.is_correcting(), "sustained streak must engage");
     }
 
     #[test]
+    fn test_gate_streak_engages_after_its_duration_on_long_periods() {
+        let start = Instant::now();
+        let period = Duration::from_millis(40);
+        let mut gate = EngageGate::new();
+        let mut i = 0;
+        while period * i < ENGAGE_STREAK_DURATION {
+            let admitted = gate.admit(start + period * i, correcting_plan(), false, true);
+            assert!(!admitted.is_correcting(), "engaged after {i} plans");
+            i += 1;
+        }
+        let admitted = gate.admit(start + period * i, correcting_plan(), false, true);
+        assert!(admitted.is_correcting());
+    }
+
+    #[test]
     fn test_gate_streak_resets_on_idle_plan() {
+        let now = Instant::now();
         let mut gate = EngageGate::new();
         for _ in 0..ENGAGE_STREAK_PLANS - 1 {
-            gate.admit(correcting_plan(), false, true);
+            gate.admit(now, correcting_plan(), false, true);
         }
-        gate.admit(CorrectionSchedule::default(), false, true);
-        let admitted = gate.admit(correcting_plan(), false, true);
+        gate.admit(now, CorrectionSchedule::default(), false, true);
+        let admitted = gate.admit(now, correcting_plan(), false, true);
         assert!(
             !admitted.is_correcting(),
             "an idle plan must reset the streak"
@@ -700,36 +789,39 @@ mod tests {
 
     #[test]
     fn test_gate_cold_filter_never_engages() {
+        let now = Instant::now();
         let mut gate = EngageGate::new();
         for _ in 0..ENGAGE_STREAK_PLANS * 2 {
-            let admitted = gate.admit(correcting_plan(), false, false);
+            let admitted = gate.admit(now, correcting_plan(), false, false);
             assert!(!admitted.is_correcting(), "cold filter must not engage");
         }
     }
 
     #[test]
     fn test_gate_reanchor_skips_streak_but_waits_for_warm_filter() {
+        let now = Instant::now();
         let mut gate = EngageGate::new();
         let reanchor = CorrectionSchedule {
             insert_every_n_frames: 0,
             drop_every_n_frames: 0,
             reanchor: true,
         };
-        let cold = gate.admit(reanchor, false, false);
+        let cold = gate.admit(now, reanchor, false, false);
         assert!(!cold.is_correcting(), "cold filter must not reanchor");
-        let warm = gate.admit(reanchor, false, true);
+        let warm = gate.admit(now, reanchor, false, true);
         assert!(warm.reanchor, "reanchor must not wait for a streak");
     }
 
     #[test]
     fn test_gate_running_correction_replans_freely() {
+        let now = Instant::now();
         let mut gate = EngageGate::new();
-        let admitted = gate.admit(correcting_plan(), true, true);
+        let admitted = gate.admit(now, correcting_plan(), true, true);
         assert!(
             admitted.is_correcting(),
             "a running correction must replan without gating"
         );
-        let disengage = gate.admit(CorrectionSchedule::default(), true, true);
+        let disengage = gate.admit(now, CorrectionSchedule::default(), true, true);
         assert!(
             !disengage.is_correcting(),
             "disengage must pass immediately"

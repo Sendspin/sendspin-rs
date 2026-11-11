@@ -519,14 +519,17 @@ impl StartupCorrectionState {
         currently_correcting: bool,
         clock_ready: bool,
     ) -> CorrectionDecision {
-        let error_us = self.error_filter.update(raw_error_us);
+        let error_us = self.error_filter.update(now, raw_error_us);
         let elapsed = self.started_at.map(|at| now.duration_since(at));
         let ungated = self
             .planner
             .plan(error_us, sample_rate, currently_correcting);
-        let gated =
-            self.engage_gate
-                .admit(ungated, currently_correcting, self.error_filter.is_warm());
+        let gated = self.engage_gate.admit(
+            now,
+            ungated,
+            currently_correcting,
+            self.error_filter.is_warm(),
+        );
         let output_delay_transient = !self.delay_settle.is_settled()
             && elapsed.is_some_and(|age| age < OUTPUT_DELAY_SETTLE_MAX);
         let clock_warmup_suppressed = !output_delay_transient
@@ -736,9 +739,9 @@ mod startup_correction_tests {
                 assert_eq!(
                     first_correction,
                     Some(
-                        crate::audio::sync_correction::SYNC_ERROR_WINDOW
-                            .max(crate::audio::sync_correction::ENGAGE_STREAK_PLANS as usize,)
+                        crate::audio::sync_correction::SYNC_ERROR_WINDOW_DURATION.as_millis()
                             as u64
+                            / 10
                     ),
                 );
                 assert_eq!(schedule.drop_every_n_frames > 0, real_error > 0);
@@ -807,6 +810,7 @@ mod startup_correction_tests {
         assert!(state.delay_settle.is_settled());
         assert!(schedule.is_correcting());
         state.engage_gate.admit(
+            start,
             CorrectionSchedule {
                 drop_every_n_frames: 200,
                 ..Default::default()
@@ -860,6 +864,7 @@ mod startup_correction_tests {
         }
         assert!(schedule.is_correcting());
         state.engage_gate.admit(
+            start,
             CorrectionSchedule {
                 drop_every_n_frames: 200,
                 ..Default::default()
