@@ -433,6 +433,10 @@ const QUEUE_LOW_WATER_US: u64 = 100_000;
 /// disable drift correction for the whole stream.
 const OUTPUT_DELAY_SETTLE_MAX: Duration = Duration::from_secs(10);
 
+/// Upper bound on how long after playback starts small corrections wait for
+/// the clock estimate to settle.
+const CLOCK_WARMUP_MAX: Duration = Duration::from_secs(5);
+
 /// Frames until the next drop or insert after a re-plan. Progress made under
 /// the previous cadence carries over, so re-planning on every callback cannot
 /// postpone a correction indefinitely.
@@ -525,7 +529,10 @@ impl StartupCorrectionState {
                 .admit(ungated, currently_correcting, self.error_filter.is_warm());
         let output_delay_transient = !self.delay_settle.is_settled()
             && elapsed.is_some_and(|age| age < OUTPUT_DELAY_SETTLE_MAX);
-        let clock_warmup_suppressed = !output_delay_transient && !clock_ready && !gated.reanchor;
+        let clock_warmup_suppressed = !output_delay_transient
+            && !clock_ready
+            && elapsed.is_none_or(|age| age < CLOCK_WARMUP_MAX)
+            && !gated.reanchor;
         let schedule = if output_delay_transient || clock_warmup_suppressed {
             CorrectionSchedule::default()
         } else {
@@ -1014,6 +1021,29 @@ mod startup_correction_tests {
             let warm = callback == crate::audio::sync_correction::SYNC_ERROR_WINDOW;
             assert_eq!(gross.schedule.reanchor, warm, "at callback {callback}");
         }
+    }
+
+    #[test]
+    fn clock_warmup_suppresses_corrections_only_until_its_cap() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        for ms in (0..CLOCK_WARMUP_MAX.as_millis() as u64).step_by(10) {
+            let now = start + Duration::from_millis(ms);
+            tick(&mut state, now, 50_000, 10_000, &mut schedule, false);
+            assert!(!schedule.is_correcting(), "at {ms}ms");
+        }
+        let decision = tick(
+            &mut state,
+            start + CLOCK_WARMUP_MAX,
+            50_000,
+            10_000,
+            &mut schedule,
+            false,
+        );
+        assert!(!decision.clock_warmup_suppressed);
+        assert!(schedule.is_correcting());
     }
 }
 
@@ -1708,7 +1738,7 @@ impl SyncedPlayer {
                             // estimate, not playback; start the filter fresh.
                             correction.reset_measurements();
                             log::debug!(
-                                "Clock sync settled; corrections enabled: callback={}, suppressed_during_warmup={}, playback_reset_generation={:?}",
+                                "Clock sync settled: callback={}, suppressed_during_warmup={}, playback_reset_generation={:?}",
                                 stats.callbacks,
                                 stats.warmup_suppressed_corrections,
                                 playback_reset_generation,

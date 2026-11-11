@@ -314,7 +314,8 @@ impl ClockSync {
     /// Whether the estimate has settled enough to drive fine-grained
     /// playback corrections. [`is_synchronized`](Self::is_synchronized)
     /// means conversions are available at all: playback starts when
-    /// synchronized; the correction planner waits until settled.
+    /// synchronized; the correction planner waits until settled or a few
+    /// seconds into playback.
     pub fn is_settled(&self) -> bool {
         self.filter.is_settled()
     }
