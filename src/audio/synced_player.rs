@@ -318,11 +318,14 @@ impl PlaybackQueue {
             }
         }
 
-        // Bail before advancing cursor/index when the queue is empty.
-        // Without this the cursor races ahead during underruns, causing
-        // the stale-buffer-dropping logic to discard valid buffers when
-        // audio resumes.
-        self.current.as_ref()?;
+        // Keep the cursor moving through an underrun so playback resumes at
+        // the current position and drops the audio that arrived too late.
+        if self.current.is_none() {
+            if self.initialized {
+                self.advance_cursor(sample_rate);
+            }
+            return None;
+        }
 
         let start = self.index;
         let end = self.index + channels;
@@ -2608,53 +2611,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cursor_does_not_advance_during_underrun() {
-        let mut queue = PlaybackQueue::new();
-        let format = test_format();
-
-        // Push one buffer to initialize the cursor
-        let samples = vec![i32::EQUILIBRIUM; 480 * 2]; // 10ms stereo
-        let start_ts = 1_000_000i64;
-        queue.push(AudioBuffer {
-            timestamp: start_ts,
-            samples: Arc::from(samples.into_boxed_slice()),
-            format: format.clone(),
-        });
-
-        // Consume all frames
-        for _ in 0..480 {
-            assert!(queue.next_frame(2, 48_000).is_some());
-        }
-        let cursor_after_drain = queue.cursor_us;
-
-        // Queue is now empty. Calling next_frame should return None
-        // and NOT advance the cursor.
-        for _ in 0..1000 {
-            assert!(queue.next_frame(2, 48_000).is_none());
-        }
-        assert_eq!(
-            queue.cursor_us,
-            cursor_after_drain,
-            "cursor must not advance during underrun; advanced by {}us",
-            queue.cursor_us - cursor_after_drain
-        );
-
-        // Push a new buffer after the underrun. It should NOT be
-        // dropped as stale — the cursor hasn't raced ahead.
-        let fresh_samples: Vec<i32> = (0..480 * 2).map(|_| 999).collect();
-        queue.push(AudioBuffer {
-            timestamp: cursor_after_drain, // starts right where we left off
-            samples: Arc::from(fresh_samples.into_boxed_slice()),
-            format,
-        });
-
-        let frame = queue
-            .next_frame(2, 48_000)
-            .expect("buffer should not be dropped as stale");
-        assert_eq!(frame[0], 999, "should get the fresh buffer, not stale data");
-    }
-
-    #[test]
     fn test_push_initializes_cursor_from_first_buffer() {
         let mut queue = PlaybackQueue::new();
         let format = test_format();
@@ -2925,6 +2881,31 @@ mod tests {
         for _ in 0..240 {
             assert_eq!(queue.next_frame(2, 48_000), Some(&[222, 222][..]));
         }
+        assert_eq!(queue.next_frame(2, 48_000), Some(&[333, 333][..]));
+    }
+
+    #[test]
+    fn test_next_frame_resumes_at_cursor_after_underrun() {
+        let mut queue = PlaybackQueue::new();
+        let format = test_format();
+
+        queue.push(AudioBuffer {
+            timestamp: 1_000_000,
+            samples: Arc::from(vec![111; 480 * 2].into_boxed_slice()),
+            format: format.clone(),
+        });
+        for _ in 0..480 {
+            let _ = queue.next_frame(2, 48_000);
+        }
+        for _ in 0..480 {
+            assert_eq!(queue.next_frame(2, 48_000), None);
+        }
+
+        queue.push(AudioBuffer {
+            timestamp: 1_020_000,
+            samples: Arc::from(vec![333; 480 * 2].into_boxed_slice()),
+            format,
+        });
         assert_eq!(queue.next_frame(2, 48_000), Some(&[333, 333][..]));
     }
 
