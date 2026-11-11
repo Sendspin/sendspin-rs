@@ -150,7 +150,9 @@ pub(crate) const SYNC_ERROR_WINDOW_DURATION: Duration = Duration::from_secs(1);
 /// immediately (a new low sample becomes the floor at once, so a running
 /// correction converges without overshoot), while a rise propagates only
 /// once the old floor ages out of the window — exactly the conservatism an
-/// engage decision wants. A spuriously *low* outlier would bias toward
+/// engage decision wants. Frames the player inserted or dropped shift the
+/// stored readings with them, so its own corrections propagate at once in
+/// both directions. A spuriously *low* outlier would bias toward
 /// under-correction, the safe direction. The padding term never produces
 /// one (padding cannot go below empty); the clock filter normally moves by
 /// microseconds once settled, though an outlier time sample can still step
@@ -166,6 +168,7 @@ pub(crate) struct SyncErrorFilter {
     next: usize,
     first_at: Option<Instant>,
     warm: bool,
+    corrected_us: f64,
 }
 
 impl SyncErrorFilter {
@@ -178,6 +181,7 @@ impl SyncErrorFilter {
             next: 0,
             first_at: None,
             warm: false,
+            corrected_us: 0.0,
         }
     }
 
@@ -188,6 +192,12 @@ impl SyncErrorFilter {
         self.next = 0;
         self.first_at = None;
         self.warm = false;
+        self.corrected_us = 0.0;
+    }
+
+    /// Record net frames the player inserted, negative for dropped frames.
+    pub fn record_corrections(&mut self, frames: i64, sample_rate: u32) {
+        self.corrected_us += frames as f64 * 1_000_000.0 / f64::from(sample_rate);
     }
 
     /// True once the window is fully populated or spans its full duration.
@@ -200,7 +210,8 @@ impl SyncErrorFilter {
 
     /// Record a raw error measurement (µs) and return the windowed minimum.
     pub fn update(&mut self, now: Instant, raw_error_us: i64) -> i64 {
-        self.samples[self.next] = raw_error_us;
+        let corrected_us = self.corrected_us.round() as i64;
+        self.samples[self.next] = raw_error_us - corrected_us;
         self.times[self.next] = now;
         self.next = (self.next + 1) % SYNC_ERROR_WINDOW;
         if self.len < SYNC_ERROR_WINDOW {
@@ -219,6 +230,7 @@ impl SyncErrorFilter {
             .filter(|(_, at)| now.saturating_duration_since(**at) < SYNC_ERROR_WINDOW_DURATION)
             .map(|(sample, _)| *sample)
             .fold(i64::MAX, i64::min)
+            + corrected_us
     }
 }
 
@@ -717,6 +729,18 @@ mod tests {
             filter.update(now, 5_000),
             5_000,
             "floor after reset must reflect only new samples"
+        );
+    }
+
+    #[test]
+    fn test_filter_floor_follows_inserted_frames_at_once() {
+        let start = Instant::now();
+        let mut filter = SyncErrorFilter::new();
+        filter.update(start, -5_000);
+        filter.record_corrections(48, 48_000);
+        assert_eq!(
+            filter.update(start + Duration::from_millis(10), -4_000),
+            -4_000
         );
     }
 

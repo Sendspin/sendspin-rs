@@ -495,6 +495,10 @@ impl StartupCorrectionState {
         self.started_at = Some(now);
     }
 
+    fn record_corrections(&mut self, frames: i64, sample_rate: u32) {
+        self.error_filter.record_corrections(frames, sample_rate);
+    }
+
     fn observe_output_delay(&mut self, now: Instant, delta_us: u64) -> Option<u64> {
         self.min_playback_delta_us = self.min_playback_delta_us.min(delta_us);
         let was_settled = self.delay_settle.is_settled();
@@ -619,6 +623,7 @@ mod startup_correction_tests {
                         drop_counter = schedule.drop_every_n_frames;
                         error_us -= frame_us;
                         corrections += 1;
+                        state.record_corrections(-1, 48_000);
                     }
                 }
                 if schedule.insert_every_n_frames > 0 {
@@ -627,6 +632,7 @@ mod startup_correction_tests {
                         insert_counter = schedule.insert_every_n_frames;
                         error_us += frame_us;
                         corrections += 1;
+                        state.record_corrections(1, 48_000);
                     }
                 }
             }
@@ -2092,6 +2098,7 @@ impl SyncedPlayer {
 
                     f32_buffer.resize(data.len(), 0.0);
 
+                    let mut corrected_frames = 0;
                     let (callback_underrun_frames, queued_after_us, buffers_after) = {
                         let mut queue = queue.lock();
                         let mut missing_frames = 0u64;
@@ -2104,6 +2111,7 @@ impl SyncedPlayer {
                                     // Discard one frame to catch up
                                     let _ = queue.next_frame(channels, sample_rate);
                                     drop_counter = schedule.drop_every_n_frames;
+                                    corrected_frames -= 1;
                                     // Get and output the next frame (don't repeat last_frame)
                                     if let Some(frame) = queue.next_frame(channels, sample_rate) {
                                         last_frame.copy_from_slice(frame);
@@ -2125,6 +2133,7 @@ impl SyncedPlayer {
                                 insert_counter = insert_counter.saturating_sub(1);
                                 if insert_counter == 0 {
                                     insert_counter = schedule.insert_every_n_frames;
+                                    corrected_frames += 1;
                                     for sample in &last_frame {
                                         f32_buffer[out_index] = f32::from_sample(*sample);
                                         out_index += 1;
@@ -2158,6 +2167,7 @@ impl SyncedPlayer {
                         };
                         (missing_frames, queued_after_us, buffers_after)
                     }; // queue lock dropped before user callback
+                    correction.record_corrections(corrected_frames, sample_rate);
 
                     let recovered = callback_underrun_frames == 0
                         && stats.consecutive_underrun_callbacks > 0;
