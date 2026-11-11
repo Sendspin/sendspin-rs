@@ -4,6 +4,7 @@
 use crate::audio::gain::{GainControl, GainRamp};
 use crate::audio::sync_correction::{
     CorrectionPlanner, CorrectionSchedule, EngageGate, OutputDelaySettle, SyncErrorFilter,
+    SOFT_CORRECTION_BUDGET, SOFT_CORRECTION_TARGET_US,
 };
 use crate::audio::{AudioBuffer, AudioFormat};
 use crate::error::Error;
@@ -456,6 +457,7 @@ struct StartupCorrectionState {
     engage_gate: EngageGate,
     delay_settle: OutputDelaySettle,
     started_at: Option<Instant>,
+    outside_target_since: Option<Instant>,
     /// Padding noise is one-sided: anchoring to a high sample bakes that error
     /// into the timeline. Use the playback-reset floor, replaced on settling.
     min_playback_delta_us: u64,
@@ -478,6 +480,7 @@ impl StartupCorrectionState {
             engage_gate: EngageGate::new(),
             delay_settle: OutputDelaySettle::new(),
             started_at: None,
+            outside_target_since: None,
             min_playback_delta_us: u64::MAX,
         }
     }
@@ -525,9 +528,18 @@ impl StartupCorrectionState {
     ) -> CorrectionDecision {
         let error_us = self.error_filter.update(now, raw_error_us);
         let elapsed = self.started_at.map(|at| now.duration_since(at));
-        let ungated = self
-            .planner
-            .plan(error_us, sample_rate, currently_correcting);
+        let outside_target_for = if error_us.abs() > SOFT_CORRECTION_TARGET_US {
+            now.saturating_duration_since(*self.outside_target_since.get_or_insert(now))
+        } else {
+            self.outside_target_since = None;
+            Duration::ZERO
+        };
+        let ungated = self.planner.plan_within(
+            error_us,
+            sample_rate,
+            currently_correcting,
+            SOFT_CORRECTION_BUDGET.saturating_sub(outside_target_for),
+        );
         let gated = self.engage_gate.admit(
             now,
             ungated,
@@ -574,14 +586,14 @@ mod startup_correction_tests {
         decision
     }
 
-    /// Plays 120s of 10ms callbacks at 48 kHz against a clock drifting by
-    /// `drift_ppm`, applying each schedule as the output callback does.
-    /// Readings carry one-sided period noise, and the error jumps by 15ms at
-    /// 60s. Returns the true error and the frames dropped or inserted per
-    /// callback.
-    fn simulate(drift_ppm: f64) -> Vec<(f64, u32)> {
-        const FRAMES: u32 = 480;
+    /// Plays 120s of `frames`-long callbacks at 48 kHz against a clock
+    /// drifting by `drift_ppm`, applying each schedule as the output callback
+    /// does. Readings carry one-sided period noise, and the error jumps by
+    /// `step_us` at 60s. Returns the true error and the frames dropped or
+    /// inserted per callback.
+    fn simulate(drift_ppm: f64, frames: u32, step_us: f64) -> Vec<(f64, u32)> {
         let frame_us = 1_000_000.0 / 48_000.0;
+        let period_ms = u64::from(frames) * 1_000 / 48_000;
         let start = Instant::now();
         let mut state = StartupCorrectionState::new();
         state.start(start);
@@ -589,10 +601,10 @@ mod startup_correction_tests {
         let (mut insert_counter, mut drop_counter) = (0, 0);
         let mut error_us = 0.0_f64;
         let mut trace = Vec::new();
-        for callback in 0..12_000 {
-            let now = start + Duration::from_millis(callback * 10);
-            if callback == 6_000 {
-                error_us += 15_000.0;
+        for callback in 0..120_000 / period_ms {
+            let now = start + Duration::from_millis(callback * period_ms);
+            if callback == 60_000 / period_ms {
+                error_us += step_us;
             }
             state.observe_output_delay(now, 50_000);
             let noise = if callback % 4 == 0 { 0 } else { 10_000 };
@@ -616,7 +628,7 @@ mod startup_correction_tests {
             );
             schedule = decision.schedule;
             let mut corrections = 0;
-            for _ in 0..FRAMES {
+            for _ in 0..frames {
                 if schedule.drop_every_n_frames > 0 {
                     drop_counter = drop_counter.saturating_sub(1);
                     if drop_counter == 0 {
@@ -636,7 +648,7 @@ mod startup_correction_tests {
                     }
                 }
             }
-            error_us += drift_ppm * f64::from(FRAMES) * frame_us / 1_000_000.0;
+            error_us += drift_ppm * f64::from(frames) * frame_us / 1_000_000.0;
             trace.push((error_us, corrections));
         }
         trace
@@ -645,7 +657,7 @@ mod startup_correction_tests {
     #[test]
     fn drift_correction_meets_accuracy_target_and_speed_cap() {
         for drift_ppm in [-100.0, -50.0, -10.0, 10.0, 50.0, 100.0] {
-            let trace = simulate(drift_ppm);
+            let trace = simulate(drift_ppm, 480, 15_000.0);
             let worst = |range: std::ops::Range<usize>| {
                 trace[range]
                     .iter()
@@ -658,6 +670,26 @@ mod startup_correction_tests {
             for window in trace.windows(15) {
                 let corrections: u32 = window.iter().map(|(_, n)| n).sum();
                 assert!(corrections <= 36, "{corrections} corrections in 150ms");
+            }
+        }
+    }
+
+    #[test]
+    fn soft_correction_meets_the_steady_state_deadline_at_any_period() {
+        for drift_ppm in [0.0, 100.0] {
+            for frames in [480, 960, 1_920] {
+                for step_us in [-34_000.0, -19_000.0, 5_000.0, 19_000.0, 34_000.0] {
+                    let trace = simulate(drift_ppm, frames, step_us);
+                    let deadline = (60_000 + 10_000) * 48 / frames as usize;
+                    let worst = trace[deadline..]
+                        .iter()
+                        .map(|(error, _)| error.abs())
+                        .fold(0.0, f64::max);
+                    assert!(
+                        worst <= 1_000.0,
+                        "{drift_ppm} ppm, {frames} frames, {step_us}µs: {worst:.0}µs"
+                    );
+                }
             }
         }
     }

@@ -21,6 +21,21 @@ impl CorrectionSchedule {
     }
 }
 
+/// Time after a disturbance by which the spec's steady state requires the
+/// sync error back within ±1ms.
+const STEADY_STATE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Part of [`STEADY_STATE_DEADLINE`] left for soft correction once the error
+/// window and engage streak have seen an error, keeping half a second spare.
+pub(crate) const SOFT_CORRECTION_BUDGET: Duration = STEADY_STATE_DEADLINE
+    .saturating_sub(SYNC_ERROR_WINDOW_DURATION)
+    .saturating_sub(ENGAGE_STREAK_DURATION)
+    .saturating_sub(Duration::from_millis(500));
+
+/// Error a correction racing [`SOFT_CORRECTION_BUDGET`] aims for, half the
+/// ±1ms steady-state bound.
+pub(crate) const SOFT_CORRECTION_TARGET_US: i64 = 500;
+
 /// Planner that converts sync error into a correction schedule.
 ///
 /// Uses hysteresis to prevent oscillation at the deadband boundary:
@@ -37,14 +52,18 @@ pub struct CorrectionPlanner {
 impl CorrectionPlanner {
     /// Create a planner with default thresholds.
     pub fn new() -> Self {
+        // Under the spec's 0.5% so that any 150ms window, which can hold
+        // one correction more than the average rate, stays within it.
+        let max_speed_correction = 0.0045;
         Self {
             deadband_us: 100,
             engage_us: 300,
-            reanchor_threshold_us: 20_000,
+            // Larger errors cannot be soft-corrected within the budget.
+            reanchor_threshold_us: (max_speed_correction
+                * SOFT_CORRECTION_BUDGET.as_secs_f64()
+                * 1_000_000.0) as i64,
             target_seconds: 2.0,
-            // Under the spec's 0.5% so that any 150ms window, which can hold
-            // one correction more than the average rate, stays within it.
-            max_speed_correction: 0.0045,
+            max_speed_correction,
         }
     }
 
@@ -58,6 +77,23 @@ impl CorrectionPlanner {
         error_us: i64,
         sample_rate: u32,
         currently_correcting: bool,
+    ) -> CorrectionSchedule {
+        self.plan_within(
+            error_us,
+            sample_rate,
+            currently_correcting,
+            SOFT_CORRECTION_BUDGET,
+        )
+    }
+
+    /// Like [`plan`](Self::plan), but fast enough to bring the error within
+    /// [`SOFT_CORRECTION_TARGET_US`] by the end of `remaining`.
+    pub(crate) fn plan_within(
+        &self,
+        error_us: i64,
+        sample_rate: u32,
+        currently_correcting: bool,
+        remaining: Duration,
     ) -> CorrectionSchedule {
         let abs_error = error_us.saturating_abs();
 
@@ -87,8 +123,16 @@ impl CorrectionPlanner {
         let sample_rate_f = sample_rate as f64;
         let frames_error = (error_us as f64 * sample_rate_f) / 1_000_000.0;
         let desired_corrections_per_sec = frames_error.abs() / self.target_seconds;
+        let excess_us = abs_error - SOFT_CORRECTION_TARGET_US;
+        let deadline_corrections_per_sec = if excess_us > 0 {
+            excess_us as f64 * sample_rate_f / 1_000_000.0 / remaining.as_secs_f64()
+        } else {
+            0.0
+        };
         let max_corrections_per_sec = sample_rate_f * self.max_speed_correction;
-        let corrections_per_sec = desired_corrections_per_sec.min(max_corrections_per_sec);
+        let corrections_per_sec = desired_corrections_per_sec
+            .max(deadline_corrections_per_sec)
+            .min(max_corrections_per_sec);
 
         if corrections_per_sec <= 0.0 {
             return CorrectionSchedule {
@@ -475,10 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn test_reanchor_at_large_error() {
+    fn test_reanchor_only_above_what_the_budget_can_soft_correct() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(20_000, 48_000, false);
-        assert!(schedule.reanchor);
+        assert!(!planner.plan(35_000, 48_000, false).reanchor);
+        assert!(planner.plan(36_000, 48_000, false).reanchor);
     }
 
     #[test]
