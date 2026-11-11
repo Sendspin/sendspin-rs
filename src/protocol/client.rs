@@ -840,7 +840,7 @@ const TIME_BURST_INTERVAL_SETTLING: Duration = Duration::from_secs(1);
 const TIME_BURST_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Sends `client/time` in bursts, each message after the previous reply, and
-/// feeds the clock filter only the burst's lowest-`max_error` reply.
+/// feeds the clock filter only the burst's lowest-`max_error` reply above 0.
 async fn time_sync(
     sender: WsSender,
     clock: Arc<dyn Clock>,
@@ -881,7 +881,7 @@ async fn time_sync(
             match reply {
                 Ok(Some(reply)) => {
                     let error = reply_max_error(&reply);
-                    if best.as_ref().is_none_or(|b| error < reply_max_error(b)) {
+                    if error > 0 && best.as_ref().is_none_or(|b| error < reply_max_error(b)) {
                         best = Some(reply);
                     }
                 }

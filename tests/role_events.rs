@@ -941,21 +941,21 @@ async fn time_sync_feeds_only_the_lowest_max_error_reply_of_each_burst() {
     assert_eq!(clock_sync.lock().rtt_micros(), Some(300));
     assert!(!clock_sync.lock().is_synchronized());
 
-    // The filter discards the burst's best reply when its max_error is 0, so
-    // the next burst waits a second instead of starting right away.
+    // A burst with no max_error above 0 feeds nothing, so the next burst
+    // waits a second instead of starting right away.
     let burst_start = std::time::Instant::now();
-    let second = answer_time_burst(
+    let second = answer_time_burst(&mut f.observed, &f.server_tx, &f.clock, second, &[0; 8]).await;
+    assert_eq!(clock_sync.lock().rtt_micros(), Some(300));
+    assert!(burst_start.elapsed() >= Duration::from_millis(900));
+
+    answer_time_burst(
         &mut f.observed,
         &f.server_tx,
         &f.clock,
         second,
-        &[0, 100, 100, 100, 100, 100, 100, 100],
+        &[0, 200, 0, 200, 200, 200, 200, 200],
     )
     .await;
-    assert_eq!(clock_sync.lock().rtt_micros(), Some(300));
-    assert!(burst_start.elapsed() >= Duration::from_millis(900));
-
-    answer_time_burst(&mut f.observed, &f.server_tx, &f.clock, second, &[200; 8]).await;
     assert_eq!(clock_sync.lock().rtt_micros(), Some(200));
     assert!(clock_sync.lock().is_synchronized());
 }
