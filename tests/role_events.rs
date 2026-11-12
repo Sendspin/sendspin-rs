@@ -831,7 +831,6 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
     };
     let mut split = f.client.split();
     assert_eq!(split.clock_sync.lock().rtt_micros(), None);
-    f.clock.set(t1 + 1_000);
     let mut session = split.player.attach(Events::default());
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
@@ -851,19 +850,7 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
         Some(other) => panic!("expected audio before close, got {other:?}"),
         None => panic!("session terminated before audio"),
     };
-    f.server_tx
-        .send(
-            serde_json::to_string(&Message::ServerTime(
-                sendspin::protocol::messages::ServerTime {
-                    client_transmitted: t1,
-                    server_received: t1,
-                    server_transmitted: t1,
-                },
-            ))
-            .unwrap()
-            .into(),
-        )
-        .unwrap();
+    answer_time_burst(&mut f.observed, &f.server_tx, &f.clock, t1, &[1_000; 8]).await;
     f.server_tx
         .send(
             serde_json::to_string(&Message::ServerCommand(ServerCommand { player: None }))
@@ -891,6 +878,86 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
         .await
         .expect("session shutdown timed out");
     assert_eq!(split.clock_sync.lock().rtt_micros(), Some(1_000));
+}
+
+async fn next_client_time(observed: &mut mpsc::UnboundedReceiver<Message>) -> i64 {
+    loop {
+        match timeout(Duration::from_secs(5), observed.recv())
+            .await
+            .expect("client/time timeout")
+        {
+            Some(Message::ClientTime(time)) => return time.client_transmitted,
+            Some(_) => {}
+            None => panic!("server task ended"),
+        }
+    }
+}
+
+/// Answers the burst whose first `client/time` carried `t1`, replying to
+/// message `i` after `rtts[i]` µs, and returns the next burst's first `t1`.
+async fn answer_time_burst(
+    observed: &mut mpsc::UnboundedReceiver<Message>,
+    server_tx: &mpsc::UnboundedSender<WsMessage>,
+    clock: &FakeClock,
+    mut t1: i64,
+    rtts: &[i64],
+) -> i64 {
+    for rtt in rtts {
+        assert!(
+            timeout(Duration::from_millis(50), next_client_time(observed))
+                .await
+                .is_err(),
+            "client/time sent before the previous reply"
+        );
+        clock.set(t1 + rtt);
+        let reply = Message::ServerTime(sendspin::protocol::messages::ServerTime {
+            client_transmitted: t1,
+            server_received: t1,
+            server_transmitted: t1,
+        });
+        server_tx
+            .send(serde_json::to_string(&reply).unwrap().into())
+            .unwrap();
+        t1 = next_client_time(observed).await;
+    }
+    t1
+}
+
+#[tokio::test]
+async fn time_sync_feeds_only_the_lowest_max_error_reply_of_each_burst() {
+    let mut f = fixture().await;
+    let clock_sync = f.client.clock_sync();
+    let first = next_client_time(&mut f.observed).await;
+    let last = answer_time_burst(
+        &mut f.observed,
+        &f.server_tx,
+        &f.clock,
+        first,
+        &[900, 700, 300, 500, 800, 400, 600],
+    )
+    .await;
+    assert_eq!(clock_sync.lock().rtt_micros(), None);
+    let second = answer_time_burst(&mut f.observed, &f.server_tx, &f.clock, last, &[1_000]).await;
+    assert_eq!(clock_sync.lock().rtt_micros(), Some(300));
+    assert!(!clock_sync.lock().is_synchronized());
+
+    // A burst with no max_error above 0 feeds nothing, so the next burst
+    // waits a second instead of starting right away.
+    let burst_start = std::time::Instant::now();
+    let second = answer_time_burst(&mut f.observed, &f.server_tx, &f.clock, second, &[0; 8]).await;
+    assert_eq!(clock_sync.lock().rtt_micros(), Some(300));
+    assert!(burst_start.elapsed() >= Duration::from_millis(900));
+
+    answer_time_burst(
+        &mut f.observed,
+        &f.server_tx,
+        &f.clock,
+        second,
+        &[0, 200, 0, 200, 200, 200, 200, 200],
+    )
+    .await;
+    assert_eq!(clock_sync.lock().rtt_micros(), Some(200));
+    assert!(clock_sync.lock().is_synchronized());
 }
 
 async fn next_state(

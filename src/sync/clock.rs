@@ -5,242 +5,144 @@ use super::raw_clock::{Clock, DefaultClock};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ADAPTIVE_FORGETTING_CUTOFF: f64 = 0.75;
+// Parameter values from the spec's time filter parameter table.
+const PROCESS_STD_DEV: f64 = 0.0;
+const DRIFT_PROCESS_STD_DEV: f64 = 1e-11;
+const FORGET_FACTOR: f64 = 2.0;
+const ADAPTIVE_CUTOFF: f64 = 3.0;
+const MIN_SAMPLES: u32 = 100;
+const DRIFT_SIGNIFICANCE_THRESHOLD: f64 = 2.0;
+const MAX_ERROR_SCALE: f64 = 0.5;
 
-#[derive(Debug, Clone, Copy)]
-struct TimeElement {
-    last_update: i64,
+/// The spec's time filter: a Kalman filter over clock offset and drift.
+#[derive(Debug)]
+struct TimeFilter {
     offset: f64,
     drift: f64,
+    p_oo: f64,
+    p_od: f64,
+    p_dd: f64,
+    last_update: i64,
+    count: u32,
     use_drift: bool,
 }
 
-#[derive(Debug)]
-struct TimeFilter {
-    last_update: i64,
-    count: u32,
-    offset: f64,
-    drift: f64,
-    offset_covariance: f64,
-    offset_drift_covariance: f64,
-    drift_covariance: f64,
-    process_variance: f64,
-    forget_variance_factor: f64,
-    current: TimeElement,
-}
-
 impl TimeFilter {
-    fn new(process_std_dev: f64, forget_factor: f64) -> Self {
-        let process_variance = process_std_dev * process_std_dev;
-        let forget_variance_factor = forget_factor * forget_factor;
+    fn new() -> Self {
         Self {
-            last_update: 0,
-            count: 0,
             offset: 0.0,
             drift: 0.0,
-            offset_covariance: f64::INFINITY,
-            offset_drift_covariance: 0.0,
-            drift_covariance: 0.0,
-            process_variance,
-            forget_variance_factor,
-            current: TimeElement {
-                last_update: 0,
-                offset: 0.0,
-                drift: 0.0,
-                use_drift: false,
-            },
+            p_oo: f64::INFINITY,
+            p_od: 0.0,
+            p_dd: 0.0,
+            last_update: 0,
+            count: 0,
+            use_drift: false,
         }
     }
 
-    fn update(&mut self, measurement: i64, max_error: i64, time_added: i64) {
-        if time_added <= self.last_update {
-            log::warn!(
-                "TimeFilter: non-monotonic sample rejected (t4={time_added} <= last_update={})",
-                self.last_update
-            );
-            return;
+    /// Returns false when the measurement is discarded.
+    fn update(&mut self, measurement: i64, max_error: i64, time_added: i64) -> bool {
+        if time_added <= self.last_update || max_error <= 0 {
+            return false;
         }
-
         let dt = (time_added - self.last_update) as f64;
         self.last_update = time_added;
 
-        let update_std_dev = max_error as f64;
-        let measurement_variance = update_std_dev * update_std_dev;
+        let measurement = measurement as f64;
+        let max_error = max_error as f64;
+        let r = (MAX_ERROR_SCALE * max_error) * (MAX_ERROR_SCALE * max_error);
 
         if self.count == 0 {
-            self.count = 1;
-            self.offset = measurement as f64;
-            self.offset_covariance = measurement_variance;
+            self.offset = measurement;
+            self.p_oo = r;
             self.drift = 0.0;
-            self.current = TimeElement {
-                last_update: self.last_update,
-                offset: self.offset,
-                drift: self.drift,
-                use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
-            };
-            return;
+            self.count = 1;
+            return true;
         }
 
         if self.count == 1 {
+            self.drift = (measurement - self.offset) / dt;
+            self.p_dd = (self.p_oo + r) / (dt * dt);
+            self.offset = measurement;
+            self.p_oo = r;
             self.count = 2;
-            if dt < Self::MIN_DRIFT_BASELINE_MICROS {
-                // Δoffset/Δt over a tiny Δt is measurement noise amplified
-                // without bound. Seed drift at zero with uncertainty from the
-                // floored baseline; later Kalman updates refine it.
-                self.drift = 0.0;
-                self.drift_covariance = (self.offset_covariance + measurement_variance)
-                    / (Self::MIN_DRIFT_BASELINE_MICROS * Self::MIN_DRIFT_BASELINE_MICROS);
-            } else {
-                self.drift = (measurement as f64 - self.offset) / dt;
-                // Divide by dt^2, not dt: variance of (x/c) is var(x)/c^2.
-                self.drift_covariance = (self.offset_covariance + measurement_variance) / (dt * dt);
-            }
-            self.offset = measurement as f64;
-            self.offset_covariance = measurement_variance;
-            self.current = TimeElement {
-                last_update: self.last_update,
-                offset: self.offset,
-                drift: self.drift,
-                use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
-            };
-            return;
+            return true;
         }
 
-        let predicted_offset = self.offset + self.drift * dt;
-        let dt_squared = dt * dt;
+        let offset_p = self.offset + self.drift * dt;
+        let mut p_oo_p = self.p_oo
+            + 2.0 * self.p_od * dt
+            + self.p_dd * (dt * dt)
+            + PROCESS_STD_DEV * PROCESS_STD_DEV * dt;
+        let mut p_od_p = self.p_od + self.p_dd * dt;
+        let mut p_dd_p = self.p_dd + DRIFT_PROCESS_STD_DEV * DRIFT_PROCESS_STD_DEV * dt;
 
-        let drift_process_variance = 0.0;
-        let mut new_drift_covariance = self.drift_covariance + drift_process_variance;
-
-        let offset_drift_process_variance = 0.0;
-        let mut new_offset_drift_covariance = self.offset_drift_covariance
-            + self.drift_covariance * dt
-            + offset_drift_process_variance;
-
-        let offset_process_variance = dt * self.process_variance;
-        let mut new_offset_covariance = self.offset_covariance
-            + 2.0 * self.offset_drift_covariance * dt
-            + self.drift_covariance * dt_squared
-            + offset_process_variance;
-
-        let residual = measurement as f64 - predicted_offset;
-        let max_residual_cutoff = max_error as f64 * ADAPTIVE_FORGETTING_CUTOFF;
-
-        if self.count < 100 {
+        let y = measurement - offset_p;
+        if self.count < MIN_SAMPLES {
             self.count += 1;
-        } else if residual.abs() > max_residual_cutoff {
+        } else if y.abs() > ADAPTIVE_CUTOFF * max_error {
             log::debug!(
-                "TimeFilter: outlier residual={:.1}µs exceeds cutoff={:.1}µs, inflating covariance",
-                residual,
-                max_residual_cutoff
+                "TimeFilter: residual={y:.1}µs exceeds {ADAPTIVE_CUTOFF} × max_error={max_error}µs, inflating covariance"
             );
-            new_drift_covariance *= self.forget_variance_factor;
-            new_offset_drift_covariance *= self.forget_variance_factor;
-            new_offset_covariance *= self.forget_variance_factor;
+            let forget = FORGET_FACTOR * FORGET_FACTOR;
+            p_oo_p *= forget;
+            p_od_p *= forget;
+            p_dd_p *= forget;
         }
 
-        let uncertainty = 1.0 / (new_offset_covariance + measurement_variance);
-        let offset_gain = new_offset_covariance * uncertainty;
-        let drift_gain = new_offset_drift_covariance * uncertainty;
+        let s = p_oo_p + r;
+        let k_o = p_oo_p / s;
+        let k_d = p_od_p / s;
+        self.offset = offset_p + k_o * y;
+        self.drift += k_d * y;
+        self.p_oo = p_oo_p - k_o * p_oo_p;
+        self.p_od = p_od_p - k_d * p_oo_p;
+        self.p_dd = p_dd_p - k_d * p_od_p;
 
-        self.offset = predicted_offset + offset_gain * residual;
-        self.drift += drift_gain * residual;
-
-        self.drift_covariance = new_drift_covariance - drift_gain * new_offset_drift_covariance;
-        self.offset_drift_covariance =
-            new_offset_drift_covariance - drift_gain * new_offset_covariance;
-        self.offset_covariance = new_offset_covariance - offset_gain * new_offset_covariance;
-
-        self.current = TimeElement {
-            last_update: self.last_update,
-            offset: self.offset,
-            drift: self.drift,
-            use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
-        };
+        self.use_drift = self.drift * self.drift
+            > DRIFT_SIGNIFICANCE_THRESHOLD * DRIFT_SIGNIFICANCE_THRESHOLD * self.p_dd;
+        true
     }
 
-    /// Minimum baseline for estimating drift from the first two samples.
-    /// The fast-start pair can arrive bunched to near-zero spacing, so it
-    /// never qualifies; drift converges through later Kalman updates.
-    const MIN_DRIFT_BASELINE_MICROS: f64 = 100_000.0;
-
-    /// Maximum plausible drift magnitude. Real clock drift between
-    /// hardware oscillators is measured in ppm; 20% is far beyond
-    /// physical reality. This is a last-resort safety net for a
-    /// diverged filter, not a quality gate.
-    const MAX_DRIFT: f64 = 0.2;
-
-    /// Minimum drift signal-to-noise ratio before applying drift to
-    /// conversions. `drift_covariance` is variance, so compare squared
-    /// drift against k² × covariance to avoid taking a square root.
-    const DRIFT_SNR_SIGMA: f64 = 2.0;
-
-    fn drift_is_plausible(&self) -> bool {
-        // Accept only drift <= threshold; reject NaN/incomparable values.
-        matches!(
-            self.current.drift.abs().partial_cmp(&Self::MAX_DRIFT),
-            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
-        )
-    }
-
-    fn drift_has_sufficient_snr(drift: f64, drift_covariance: f64) -> bool {
-        if !matches!(
-            drift_covariance.partial_cmp(&0.0),
-            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
-        ) {
-            return false;
-        }
-
-        let threshold = Self::DRIFT_SNR_SIGMA * Self::DRIFT_SNR_SIGMA * drift_covariance;
-        drift * drift >= threshold
-    }
-
-    /// True when the filter would apply its drift estimate but it is beyond
-    /// physical plausibility. An implausible estimate the SNR gate already
-    /// rejects blocks nothing: conversions then run with zero drift.
-    fn conversions_blocked(&self) -> bool {
-        self.current.use_drift && !self.drift_is_plausible()
-    }
-
-    fn effective_drift(&self) -> Option<f64> {
-        if self.conversions_blocked() {
-            return None;
-        }
-
-        Some(if self.current.use_drift {
-            self.current.drift
+    fn effective_drift(&self) -> f64 {
+        if self.use_drift {
+            self.drift
         } else {
             0.0
-        })
+        }
     }
 
-    fn compute_server_time(&self, client_time: i64) -> Option<i64> {
-        let effective_drift = self.effective_drift()?;
-        let dt = (client_time - self.current.last_update) as f64;
-        let offset = self.current.offset + effective_drift * dt;
-        Some(client_time + offset.round() as i64)
+    fn compute_server_time(&self, client_time: i64) -> i64 {
+        let dt = (client_time - self.last_update) as f64;
+        client_time + (self.offset + self.effective_drift() * dt).round() as i64
     }
 
-    fn compute_client_time(&self, server_time: i64) -> Option<i64> {
-        let effective_drift = self.effective_drift()?;
-        let numerator = server_time as f64 - self.current.offset
-            + effective_drift * self.current.last_update as f64;
-        Some((numerator / (1.0 + effective_drift)).round() as i64)
+    fn compute_client_time(&self, server_time: i64) -> i64 {
+        let d = self.effective_drift();
+        ((server_time as f64 - self.offset + d * self.last_update as f64) / (1.0 + d)).round()
+            as i64
     }
 
     fn is_synchronized(&self) -> bool {
-        self.count >= 2 && self.offset_covariance.is_finite()
+        self.count >= 2 && self.p_oo.is_finite()
     }
 
     /// Samples required before the estimate is trusted for fine-grained
-    /// playback corrections. At the sync cadence (two fast-start samples,
-    /// then 1Hz — see `ProtocolClient`), ten samples settle ~9s after
+    /// playback corrections. Bursts start 1s apart until then (see
+    /// `TIME_BURST_INTERVAL_SETTLING`), so ten samples settle ~8s after
     /// connect.
     const SETTLE_MIN_SAMPLES: u32 = 10;
 
     fn is_settled(&self) -> bool {
         self.count >= Self::SETTLE_MIN_SAMPLES
     }
+}
+
+/// Half the round-trip delay of one `client/time` exchange, the bound on
+/// its offset error.
+pub(crate) fn max_error(t1: i64, t2: i64, t3: i64, t4: i64) -> i64 {
+    ((t4 - t1) - (t3 - t2)) / 2
 }
 
 /// Clock synchronization quality
@@ -282,7 +184,7 @@ impl ClockSync {
         Self {
             rtt_micros: None,
             last_update: None,
-            filter: TimeFilter::new(0.01, 1.001),
+            filter: TimeFilter::new(),
             clock,
         }
     }
@@ -301,46 +203,28 @@ impl ClockSync {
     /// - `t2` = server_received (server loop µs)
     /// - `t3` = server_transmitted (server loop µs)
     /// - `t4` = client_received (raw monotonic µs from [`Clock::now_micros`])
-    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) {
-        // RTT = (t4 - t1) - (t3 - t2)
+    ///
+    /// Returns false when the filter discards the measurement.
+    pub fn update(&mut self, t1: i64, t2: i64, t3: i64, t4: i64) -> bool {
         let rtt = (t4 - t1) - (t3 - t2);
-
-        // Discard negative RTT (misordered timestamps) and high RTT
-        // (network congestion). Store only valid RTT so that quality()
-        // doesn't report Good on a negative value.
-        if !(0..=100_000).contains(&rtt) {
-            // Samples arrive at ~1Hz, so this stays bounded; a run of these
-            // lines is the "sync is starving" diagnostic.
+        let measurement = ((t2 - t1) + (t3 - t4)) / 2;
+        let was_synced = self.filter.is_synchronized();
+        if !self
+            .filter
+            .update(measurement, max_error(t1, t2, t3, t4), t4)
+        {
             log::debug!(
-                "Clock sync sample discarded: rtt={}µs outside 0..=100000µs (t1={}, t2={}, t3={}, t4={})",
-                rtt,
-                t1,
-                t2,
-                t3,
-                t4
+                "Clock sync sample discarded: rtt={rtt}µs (t1={t1}, t2={t2}, t3={t3}, t4={t4})"
             );
-            return;
+            return false;
         }
         self.rtt_micros = Some(rtt);
-
-        // NTP offset = ((t2 - t1) + (t3 - t4)) / 2
-        // Use f64 division to avoid systematic ±0.5µs bias from integer truncation.
-        let measurement = (((t2 - t1) as f64 + (t3 - t4) as f64) / 2.0).round() as i64;
-        // Floor max_error at 1µs so the Kalman filter always sees
-        // nonzero measurement variance. RTT = 0 is legitimate on
-        // localhost; without this floor, repeated zero-variance
-        // samples would drive covariance to zero and eventually NaN.
-        let max_error = (rtt / 2).max(1);
-
-        let was_synced = self.filter.is_synchronized();
-        let was_blocked = self.filter.conversions_blocked();
-        self.filter.update(measurement, max_error, t4);
         self.last_update = Some(Instant::now());
         log::trace!(
             "Clock sync sample: offset={:.0}µs, rtt={}µs, drift={:.6}, synchronized={}",
             self.filter.offset,
             rtt,
-            self.filter.current.drift,
+            self.filter.drift,
             self.filter.is_synchronized(),
         );
         if !was_synced && self.filter.is_synchronized() {
@@ -350,14 +234,7 @@ impl ClockSync {
                 rtt
             );
         }
-        if !was_blocked && self.filter.conversions_blocked() {
-            log::warn!(
-                "Clock sync: in-use drift {:.4} exceeded plausibility limit {}; \
-                 time conversions will return None until it recovers",
-                self.filter.current.drift,
-                TimeFilter::MAX_DRIFT
-            );
-        }
+        true
     }
 
     /// Get current RTT in microseconds
@@ -370,7 +247,7 @@ impl ClockSync {
         if !self.filter.is_synchronized() {
             return None;
         }
-        self.filter.compute_client_time(server_micros)
+        Some(self.filter.compute_client_time(server_micros))
     }
 
     /// Convert client clock microseconds to server loop microseconds
@@ -378,7 +255,7 @@ impl ClockSync {
         if !self.filter.is_synchronized() {
             return None;
         }
-        self.filter.compute_server_time(client_micros)
+        Some(self.filter.compute_server_time(client_micros))
     }
 
     /// Convert server loop microseconds to local Instant
@@ -437,7 +314,8 @@ impl ClockSync {
     /// Whether the estimate has settled enough to drive fine-grained
     /// playback corrections. [`is_synchronized`](Self::is_synchronized)
     /// means conversions are available at all: playback starts when
-    /// synchronized; the correction planner waits until settled.
+    /// synchronized; the correction planner waits until settled or a few
+    /// seconds into playback.
     pub fn is_settled(&self) -> bool {
         self.filter.is_settled()
     }
@@ -457,7 +335,7 @@ mod tests {
     /// and put the filter into the steady-state Kalman branch, where negative
     /// `dt` would actually corrupt the prediction/covariance math.
     fn primed_filter() -> TimeFilter {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::new();
         f.update(100, 10, 1_000);
         f.update(120, 10, 2_000);
         f.update(140, 10, 3_000);
@@ -466,18 +344,18 @@ mod tests {
         f
     }
 
-    /// Snapshot every bit of filter state that a monotonicity-guard bypass
-    /// could perturb. If the guard works, a rejected sample leaves all of
-    /// these untouched.
-    fn snapshot(f: &TimeFilter) -> (i64, u32, f64, f64, f64, f64, f64) {
+    /// Snapshot every bit of filter state that a discarded sample could
+    /// perturb.
+    fn snapshot(f: &TimeFilter) -> (i64, u32, f64, f64, f64, f64, f64, bool) {
         (
             f.last_update,
             f.count,
             f.offset,
             f.drift,
-            f.offset_covariance,
-            f.drift_covariance,
-            f.offset_drift_covariance,
+            f.p_oo,
+            f.p_dd,
+            f.p_od,
+            f.use_drift,
         )
     }
 
@@ -488,7 +366,7 @@ mod tests {
 
         // t4 < last_update: pre-fix code would compute negative dt and
         // corrupt the Kalman prediction. Post-fix, the guard rejects it.
-        f.update(999, 10, 2_500);
+        assert!(!f.update(999, 10, 2_500));
 
         assert_eq!(snapshot(&f), before, "backwards t4 must not mutate state");
     }
@@ -500,9 +378,20 @@ mod tests {
 
         // Equal t4: original == guard already handled this; make sure the
         // <= relaxation didn't accidentally change behavior for duplicates.
-        f.update(999, 10, 3_000);
+        assert!(!f.update(999, 10, 3_000));
 
         assert_eq!(snapshot(&f), before, "duplicate t4 must not mutate state");
+    }
+
+    #[test]
+    fn update_rejects_non_positive_max_error() {
+        let mut f = primed_filter();
+        let before = snapshot(&f);
+
+        assert!(!f.update(160, 0, 4_000));
+        assert!(!f.update(160, -5, 4_000));
+
+        assert_eq!(snapshot(&f), before);
     }
 
     #[test]
@@ -510,7 +399,7 @@ mod tests {
         let mut f = primed_filter();
         let before = snapshot(&f);
 
-        f.update(160, 10, 4_000);
+        assert!(f.update(160, 10, 4_000));
 
         assert_ne!(snapshot(&f), before, "forward t4 must advance the filter");
         assert_eq!(f.last_update, 4_000);
@@ -520,8 +409,8 @@ mod tests {
     fn backwards_sample_does_not_affect_later_predictions() {
         // End-to-end: a rejected backwards sample must leave future
         // conversions identical to a filter that never saw it at all.
-        let mut with_bad = TimeFilter::new(0.01, 1.001);
-        let mut without_bad = TimeFilter::new(0.01, 1.001);
+        let mut with_bad = TimeFilter::new();
+        let mut without_bad = TimeFilter::new();
 
         for (m, t) in [(100, 1_000), (120, 2_000), (140, 3_000)] {
             with_bad.update(m, 10, t);
@@ -548,62 +437,59 @@ mod tests {
     }
 
     #[test]
-    fn bunched_first_pair_seeds_zero_drift_and_keeps_conversions() {
-        let mut f = TimeFilter::new(0.01, 1.001);
-        // Fast-start pair arriving 190µs apart with a large offset delta:
-        // pre-fix, this computed drift = -6037/190 ≈ -31.8 and then blocked
-        // all conversions on implausibility for a full sample interval.
-        f.update(1_000_000, 12_797, 1_000);
-        f.update(994_000, 6_813, 1_190);
+    fn measurement_and_max_error_truncate_toward_zero() {
+        let mut sync = ClockSync::default();
+        // (T2 - T1) + (T3 - T4) = -3 and RTT = 203: rounding would give an
+        // offset of -2 and a max_error of 102.
+        sync.update(0, 100, 100, 203);
 
-        assert_eq!(f.drift, 0.0, "tiny-baseline pair must not estimate drift");
-        assert!(f.is_synchronized());
-        assert!(
-            f.compute_client_time(2_000_000).is_some(),
-            "conversions must be available right after the fast-start pair"
-        );
+        assert_eq!(sync.filter.offset, -1.0);
+        assert_eq!(sync.filter.p_oo, (0.5 * 101.0) * (0.5 * 101.0));
     }
 
     #[test]
-    fn long_baseline_pair_still_estimates_drift() {
-        let mut f = TimeFilter::new(0.01, 1.001);
-        f.update(1_000, 10, 1_000);
-        // dt = 200ms, at/above the baseline floor: quotient drift applies.
-        f.update(1_200, 10, 201_000);
-        assert!((f.drift - (200.0 / 200_000.0)).abs() < 1e-12);
-    }
-
-    #[test]
-    fn unused_implausible_drift_does_not_block_conversions() {
-        let mut f = primed_filter();
-        // A diverged-looking drift that the SNR gate refuses to use must
-        // not veto conversions: effective drift is zero, which is safe.
-        f.current.drift = 5.0;
-        f.current.use_drift = false;
-        assert!(!f.conversions_blocked());
-        assert_eq!(f.effective_drift(), Some(0.0));
-    }
-
-    #[test]
-    fn in_use_implausible_drift_blocks_conversions() {
-        let mut f = primed_filter();
-        f.current.drift = 5.0;
-        f.current.use_drift = true;
-        assert!(f.conversions_blocked());
-        assert_eq!(f.effective_drift(), None);
-    }
-
-    #[test]
-    fn in_use_plausible_drift_is_applied() {
-        let mut f = primed_filter();
-        f.current.drift = 0.0001;
-        f.current.use_drift = true;
-        assert_eq!(f.effective_drift(), Some(0.0001));
+    fn matches_reference_implementation() {
+        // Expected values come from sendspin-cpp's SendspinTimeFilter (spec
+        // parameters) fed the same sequence: 50 ppm drift, bounded noise, a
+        // 5ms second sample spacing and a 50ms outlier after min_samples.
+        let expected = [
+            (0, 3_000_150, 7_999_850),
+            (1, 3_004_868, 8_005_132),
+            (2, 4_999_657, 10_000_343),
+            (3, 5_999_863, 11_000_137),
+            (9, 11_999_425, 17_000_575),
+            (50, 52_997_346, 58_002_654),
+            (104, 106_994_718, 112_005_282),
+            (105, 107_991_313, 113_008_687),
+            (106, 108_993_137, 114_006_864),
+            (119, 121_993_802, 127_006_198),
+        ];
+        let mut f = TimeFilter::new();
+        let mut checkpoints = expected.iter();
+        let mut next = checkpoints.next();
+        for i in 0..120_i64 {
+            let t = if i == 1 {
+                1_005_000
+            } else {
+                1_000_000 + i * 1_000_000
+            };
+            let max_error = 200 + (i * 37) % 300;
+            let noise = (i * 7_919) % (2 * max_error + 1) - max_error;
+            let outlier = if i == 105 { 50_000 } else { 0 };
+            let measurement = 5_000_000 + t / 20_000 + noise + outlier;
+            assert!(f.update(measurement, max_error, t));
+            if let Some(&(at, client, server)) = next.filter(|c| c.0 == i) {
+                assert_eq!(f.compute_client_time(t + 7_000_000), client, "sample {at}");
+                assert_eq!(f.compute_server_time(t + 2_000_000), server, "sample {at}");
+                next = checkpoints.next();
+            }
+        }
+        assert!(next.is_none());
     }
 
     #[test]
     fn settles_after_minimum_samples() {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::new();
         for i in 0..i64::from(TimeFilter::SETTLE_MIN_SAMPLES) {
             assert!(!f.is_settled(), "must not settle before sample {}", i + 1);
             f.update(1_000 + i, 10, 1_000 + i * 1_000_000);

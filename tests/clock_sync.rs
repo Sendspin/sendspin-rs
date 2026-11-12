@@ -106,99 +106,47 @@ fn test_sync_quality_recovery() {
 }
 
 #[test]
-fn test_sync_quality_unchanged_after_high_rtt() {
+fn test_high_rtt_sample_is_used() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // First, establish a good RTT (30µs)
     sync.update(1_000_000, 500_000, 500_010, 1_000_040);
     assert_eq!(sync.quality(), SyncQuality::Good);
-    assert_eq!(sync.rtt_micros(), Some(30));
 
-    // Now provide a very high RTT (> 100_000µs), which should be discarded
-    // RTT = (t4 - t1) - (t3 - t2) = (3_100_020 - 3_000_000) - (700_010 - 700_000)
-    //     = 100_020 - 10 = 100_010µs
+    // RTT = (3_100_020 - 3_000_000) - (700_010 - 700_000) = 100_010µs
     sync.update(3_000_000, 700_000, 700_010, 3_100_020);
 
-    // The high RTT should not overwrite the previously stored good RTT,
-    // and the quality should remain unchanged.
-    assert_eq!(sync.quality(), SyncQuality::Good);
-    assert_eq!(sync.rtt_micros(), Some(30));
-}
-
-#[test]
-fn test_timestamp_boundary_zero_values() {
-    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
-
-    // All-zero timestamps: RTT = (0 - 0) - (0 - 0) = 0, which is valid
-    sync.update(0, 0, 0, 0);
-    assert_eq!(sync.rtt_micros(), Some(0));
+    assert_eq!(sync.rtt_micros(), Some(100_010));
+    assert_eq!(sync.quality(), SyncQuality::Lost);
 }
 
 #[test]
 fn test_clock_drift_correction() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // Low-RTT samples keep drift covariance low enough for the SNR gate to
-    // permit drift correction in both conversion directions.
-    sync.update(1_000_000, 1_005_100, 1_005_100, 1_000_000);
-    sync.update(2_000_000, 2_005_200, 2_005_200, 2_000_000);
+    // Offset grows by 100ppm: 5000µs + t / 10_000, with a 20µs RTT.
+    for second in 1..=4 {
+        let t = second * 1_000_000;
+        let server = t + 5_000 + t / 10_000 + 10;
+        sync.update(t, server, server, t + 20);
+    }
 
-    let server_time = sync.client_to_server_micros(3_000_000);
-    // Kalman filter may introduce small rounding errors
-    assert_within(server_time, 3_005_300, 10);
+    let server_time = sync.client_to_server_micros(5_000_000);
+    assert_within(server_time, 5_005_500, 10);
 }
 
 #[test]
-fn test_conversions_use_offset_only_when_drift_snr_is_low() {
+fn test_first_two_samples_do_not_apply_drift() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // First sample: offset = +100µs with tight uncertainty.
-    sync.update(1_000, 1_100, 1_100, 1_000);
-    // Second sample 200ms later (a legitimate drift baseline): offset =
-    // +120µs, but a 1ms RTT gives the drift estimate high covariance. Its
-    // SNR is below 2σ, so both conversion directions should ignore drift
-    // and use only the current offset.
-    sync.update(200_000, 200_620, 200_620, 201_000);
+    // Offset moves +100µs → +4100µs over a 200ms baseline (drift = 0.02)
+    // with a 2µs RTT. The filter seeds drift from this pair but only
+    // decides whether to apply it from the third sample on.
+    sync.update(1_000, 1_101, 1_101, 1_002);
+    sync.update(201_000, 205_101, 205_101, 201_002);
 
     assert!(sync.is_synchronized());
-    assert_eq!(sync.server_to_client_micros(3_120), Some(3_000));
-    assert_eq!(sync.client_to_server_micros(3_000), Some(3_120));
-}
-
-#[test]
-fn test_conversions_apply_drift_when_snr_is_high() {
-    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
-
-    // Offset moves +100µs → +4100µs over a 200ms baseline (drift = 0.02),
-    // with low-RTT samples. The covariance is small enough for the 2σ SNR
-    // gate to pass, so conversions apply the drift estimate.
-    sync.update(1_000, 1_100, 1_100, 1_000);
-    sync.update(201_000, 205_100, 205_100, 201_000);
-
-    assert!(sync.is_synchronized());
-    assert_eq!(sync.server_to_client_micros(3_120), Some(2_980));
-    assert_eq!(sync.client_to_server_micros(3_000), Some(3_140));
-}
-
-#[test]
-fn test_diverged_drift_returns_none() {
-    let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
-
-    // Two samples 200ms apart (a legitimate drift baseline) where the NTP
-    // offset collapses from +100µs to -99_900µs, giving drift = -0.5 with
-    // high SNR — far beyond any real hardware clock skew. The filter would
-    // apply that drift, so both conversions must refuse and return None.
-    sync.update(1_000, 1_100, 1_100, 1_000);
-    sync.update(201_000, 101_100, 101_100, 201_000);
-
-    assert!(
-        sync.server_to_client_micros(2000).is_none(),
-        "server_to_client should return None when drift has diverged"
-    );
-    assert!(
-        sync.client_to_server_micros(2000).is_none(),
-        "client_to_server should return None when drift has diverged"
-    );
+    assert_eq!(sync.server_to_client_micros(3_120), Some(-980));
+    assert_eq!(sync.client_to_server_micros(3_000), Some(7_100));
 }
 
 #[test]
@@ -216,13 +164,12 @@ fn test_negative_rtt_discarded() {
 }
 
 #[test]
-fn test_zero_rtt_accepted() {
+fn test_zero_rtt_discarded() {
     let mut sync = ClockSync::new(Arc::new(DefaultClock::new()));
 
-    // RTT = 0 is legitimate on localhost. The filter clamps max_error
-    // to 1µs so zero-variance samples don't corrupt covariance.
+    // RTT = 0 gives max_error = 0, which the time filter discards.
     sync.update(1000, 1100, 1100, 1000);
     sync.update(2000, 2100, 2100, 2000);
-    assert_eq!(sync.rtt_micros(), Some(0));
-    assert!(sync.is_synchronized(), "zero RTT should still allow sync");
+    assert_eq!(sync.rtt_micros(), None);
+    assert!(!sync.is_synchronized());
 }

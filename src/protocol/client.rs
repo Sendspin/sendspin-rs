@@ -7,10 +7,11 @@ use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
     ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
-    PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat,
-    StreamStart, VisualizerDataType, VisualizerFormatRequest,
+    PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, ServerTime, StreamEnd,
+    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
 use crate::roles::{ArtworkReceiver, VisualizerReceiver};
+use crate::sync::clock::max_error;
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
 use futures_util::{
@@ -20,6 +21,7 @@ use futures_util::{
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -222,7 +224,7 @@ impl WsSender {
 
     async fn send_raw(&self, msg: Message) -> Result<(), Error> {
         let json = serde_json::to_string(&msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        // Time pings go out at 1Hz for as long as the connection lives; keep
+        // Time pings go out in bursts for as long as the connection lives; keep
         // that housekeeping at trace so debug shows only meaningful traffic.
         let level = if matches!(msg, Message::ClientTime(_)) {
             log::Level::Trace
@@ -822,6 +824,95 @@ impl BinaryFrame {
     }
 }
 
+/// `client/time` messages per burst.
+const TIME_BURST_SIZE: usize = 8;
+
+/// How long a burst waits for each `server/time` reply before moving on.
+/// Eight timeouts still fit within the 10s the spec allows between burst
+/// starts.
+const TIME_REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Spacing between burst starts while the clock estimate settles.
+const TIME_BURST_INTERVAL_SETTLING: Duration = Duration::from_secs(1);
+
+/// Spacing between burst starts once settled, short enough that
+/// [`ClockSync::is_stale`] stays false while replies arrive.
+const TIME_BURST_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Sends `client/time` in bursts, each message after the previous reply, and
+/// feeds the clock filter only the burst's lowest-`max_error` reply above 0.
+async fn time_sync(
+    sender: WsSender,
+    clock: Arc<dyn Clock>,
+    clock_sync: Arc<Mutex<ClockSync>>,
+    mut replies: UnboundedReceiver<(ServerTime, i64)>,
+) {
+    let reply_max_error = |(st, t4): &(ServerTime, i64)| {
+        max_error(
+            st.client_transmitted,
+            st.server_received,
+            st.server_transmitted,
+            *t4,
+        )
+    };
+    loop {
+        let burst_start = tokio::time::Instant::now();
+        let mut best: Option<(ServerTime, i64)> = None;
+        for _ in 0..TIME_BURST_SIZE {
+            let t1 = clock.now_micros();
+            let msg = Message::ClientTime(ClientTime {
+                client_transmitted: t1,
+            });
+            if let Err(e) = sender.send_message(msg).await {
+                log::info!("Clock sync task exiting: {}", e);
+                return;
+            }
+            let reply = tokio::time::timeout(TIME_REPLY_TIMEOUT, async {
+                // Skip late replies to earlier messages that timed out.
+                loop {
+                    match replies.recv().await {
+                        Some(reply) if reply.0.client_transmitted == t1 => return Some(reply),
+                        Some(_) => {}
+                        None => return None,
+                    }
+                }
+            })
+            .await;
+            match reply {
+                Ok(Some(reply)) => {
+                    let error = reply_max_error(&reply);
+                    if error > 0 && best.as_ref().is_none_or(|b| error < reply_max_error(b)) {
+                        best = Some(reply);
+                    }
+                }
+                Ok(None) => return,
+                Err(_) => {
+                    log::debug!("Clock sync: no server/time reply within {TIME_REPLY_TIMEOUT:?}")
+                }
+            }
+        }
+        let interval = {
+            let mut sync = clock_sync.lock();
+            let accepted = best.is_some_and(|(st, t4)| {
+                sync.update(
+                    st.client_transmitted,
+                    st.server_received,
+                    st.server_transmitted,
+                    t4,
+                )
+            });
+            if accepted && !sync.is_synchronized() {
+                Duration::ZERO
+            } else if !sync.is_settled() {
+                TIME_BURST_INTERVAL_SETTLING
+            } else {
+                TIME_BURST_INTERVAL
+            }
+        };
+        tokio::time::sleep_until(burst_start + interval).await;
+    }
+}
+
 /// WebSocket client for Sendspin protocol
 pub struct ProtocolClient {
     out_tx: UnboundedSender<WriteCommand>,
@@ -1091,7 +1182,7 @@ impl ProtocolClient {
             None
         };
 
-        let clock_sync_router = Arc::clone(&clock_sync);
+        let (time_reply_tx, time_reply_rx) = unbounded_channel();
         let clock_router = Arc::clone(&clock);
         let stream_state_router = Arc::clone(&stream_state);
         // The router task handle is used by ConnectionGuard::closed() observers.
@@ -1099,46 +1190,24 @@ impl ProtocolClient {
             Self::message_router(
                 read,
                 &mut sinks,
-                clock_sync_router,
+                time_reply_tx,
                 clock_router,
                 stream_state_router,
             )
             .await;
         });
 
-        // First two samples fire 10ms apart so an offset estimate (and
-        // playback start) is available almost immediately; drift converges
-        // over the following 1Hz samples (see TimeFilter).
-        let sync_sender = WsSender {
-            tx: out_tx.clone(),
-            reporter: reporter_handle.as_ref().map(|_| report_tx.clone()),
-            controls: controls.clone(),
-            stream_state: Arc::clone(&stream_state),
-        };
-        let sync_handle = tokio::spawn(async move {
-            let mut sample_count: u32 = 0;
-            'sync: loop {
-                let t1 = clock.now_micros();
-                let msg = Message::ClientTime(ClientTime {
-                    client_transmitted: t1,
-                });
-                match sync_sender.send_message(msg).await {
-                    Ok(()) => {
-                        sample_count = sample_count.saturating_add(1);
-                    }
-                    Err(e) => {
-                        log::info!("Clock sync task exiting: {}", e);
-                        break 'sync;
-                    }
-                }
-                let delay = if sample_count < 2 {
-                    tokio::time::Duration::from_millis(10)
-                } else {
-                    tokio::time::Duration::from_secs(1)
-                };
-                tokio::time::sleep(delay).await;
-            }
-        });
+        let sync_handle = tokio::spawn(time_sync(
+            WsSender {
+                tx: out_tx.clone(),
+                reporter: reporter_handle.as_ref().map(|_| report_tx.clone()),
+                controls: controls.clone(),
+                stream_state: Arc::clone(&stream_state),
+            },
+            clock,
+            Arc::clone(&clock_sync),
+            time_reply_rx,
+        ));
 
         Ok(Self {
             out_tx: out_tx.clone(),
@@ -1167,7 +1236,7 @@ impl ProtocolClient {
     async fn message_router<S>(
         mut read: SplitStream<WebSocketStream<S>>,
         sinks: &mut crate::protocol::routing::ReceiveSinks,
-        clock_sync: Arc<Mutex<ClockSync>>,
+        time_replies: UnboundedSender<(ServerTime, i64)>,
         clock: Arc<dyn Clock>,
         stream_state: Arc<StreamState>,
     ) where
@@ -1247,17 +1316,12 @@ impl ProtocolClient {
                             // ServerTime is consumed here for clock sync
                             // and intentionally NOT forwarded to message_rx
                             // consumers — it's an internal protocol detail.
-                            // It also arrives at 1Hz for as long as the
+                            // It also arrives in bursts for as long as the
                             // connection lives, so it stays out of the debug
                             // view; ClockSync::update logs the computed sync
                             // state instead.
-                            if let Message::ServerTime(ref st) = msg {
-                                clock_sync.lock().update(
-                                    st.client_transmitted,
-                                    st.server_received,
-                                    st.server_transmitted,
-                                    t4,
-                                );
+                            if let Message::ServerTime(st) = msg {
+                                let _ = time_replies.send((st, t4));
                             } else {
                                 log::debug!("Received message: {:?}", msg);
                                 // Settle the request-format gate before
@@ -1415,18 +1479,11 @@ mod tests {
         drop(messages);
 
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new(3_000));
-        let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
+        let (time_reply_tx, mut time_reply_rx) = unbounded_channel();
         let stream_state = Arc::new(StreamState::default());
-        let router_clock_sync = Arc::clone(&clock_sync);
         let mut router = tokio::spawn(async move {
-            ProtocolClient::message_router(
-                read,
-                &mut sinks,
-                router_clock_sync,
-                clock,
-                stream_state,
-            )
-            .await;
+            ProtocolClient::message_router(read, &mut sinks, time_reply_tx, clock, stream_state)
+                .await;
         });
 
         server
@@ -1484,6 +1541,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(clock_sync.lock().rtt_micros(), Some(1_000));
+        let (reply, t4) = time_reply_rx.recv().await.expect("server/time forwarded");
+        assert_eq!(reply.client_transmitted, 1_000);
+        assert_eq!(t4, 3_000);
     }
 }
