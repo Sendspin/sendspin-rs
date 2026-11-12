@@ -534,24 +534,36 @@ impl StartupCorrectionState {
             self.outside_target_since = None;
             Duration::ZERO
         };
-        let ungated = self.planner.plan_within(
-            error_us,
-            sample_rate,
-            currently_correcting,
-            SOFT_CORRECTION_BUDGET.saturating_sub(outside_target_for),
-        );
+        let remaining = SOFT_CORRECTION_BUDGET.saturating_sub(outside_target_for);
+        let output_delay_transient = !self.delay_settle.is_settled()
+            && elapsed.is_some_and(|age| age < OUTPUT_DELAY_SETTLE_MAX);
+        let clock_warmup_left = if output_delay_transient || clock_ready {
+            Duration::ZERO
+        } else {
+            CLOCK_WARMUP_MAX.saturating_sub(elapsed.unwrap_or_default())
+        };
+        // Errors too large to soft-correct once the warmup ends reanchor now.
+        let ungated = if !clock_warmup_left.is_zero()
+            && error_us.abs()
+                >= self
+                    .planner
+                    .max_soft_correction_us(remaining.saturating_sub(clock_warmup_left))
+        {
+            CorrectionSchedule {
+                reanchor: true,
+                ..CorrectionSchedule::default()
+            }
+        } else {
+            self.planner
+                .plan_within(error_us, sample_rate, currently_correcting, remaining)
+        };
         let gated = self.engage_gate.admit(
             now,
             ungated,
             currently_correcting,
             self.error_filter.is_warm(),
         );
-        let output_delay_transient = !self.delay_settle.is_settled()
-            && elapsed.is_some_and(|age| age < OUTPUT_DELAY_SETTLE_MAX);
-        let clock_warmup_suppressed = !output_delay_transient
-            && !clock_ready
-            && elapsed.is_none_or(|age| age < CLOCK_WARMUP_MAX)
-            && !gated.reanchor;
+        let clock_warmup_suppressed = !clock_warmup_left.is_zero() && !gated.reanchor;
         let schedule = if output_delay_transient || clock_warmup_suppressed {
             CorrectionSchedule::default()
         } else {
@@ -1064,6 +1076,30 @@ mod startup_correction_tests {
             let warm = callback == crate::audio::sync_correction::SYNC_ERROR_WINDOW;
             assert_eq!(gross.schedule.reanchor, warm, "at callback {callback}");
         }
+    }
+
+    #[test]
+    fn clock_warmup_reanchors_errors_too_large_to_correct_after_it() {
+        let observed_at = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        for ms in (0..=3000).step_by(10) {
+            state.observe_output_delay(observed_at + Duration::from_millis(ms), 50_000);
+        }
+        let start = observed_at + Duration::from_secs(3);
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        let reanchored_at = (0..CLOCK_WARMUP_MAX.as_millis() as u64)
+            .step_by(10)
+            .find(|&ms| {
+                let now = start + Duration::from_millis(ms);
+                tick(&mut state, now, 50_000, 25_000, &mut schedule, false)
+                    .schedule
+                    .reanchor
+            });
+        assert!(
+            reanchored_at.is_some_and(|ms| ms < 1_500),
+            "{reanchored_at:?}"
+        );
     }
 
     #[test]
