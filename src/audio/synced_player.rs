@@ -511,9 +511,11 @@ impl StartupCorrectionState {
             .settled_floor_us()
             .filter(|_| !was_settled);
         if let Some(floor) = floor {
-            // A stable interval replaces the transient floor and its error history.
+            // A stable interval replaces the transient floor, its error history
+            // and the correction deadline.
             self.min_playback_delta_us = floor;
             self.reset_measurements();
+            self.outside_target_since = None;
         }
         floor
     }
@@ -923,9 +925,12 @@ mod startup_correction_tests {
             false,
         );
         assert_eq!(state.engage_gate.pending_plans(), 1);
+        let outside_target_since = state.outside_target_since;
+        assert!(outside_target_since.is_some());
         state.reset_measurements();
         assert_eq!(state.engage_gate.pending_plans(), 0);
         assert_eq!(state.started_at, Some(start));
+        assert_eq!(state.outside_target_since, outside_target_since);
         assert_eq!(state.min_playback_delta_us, 50_000);
         assert!(state.delay_settle.is_settled());
         assert!(!state.error_filter.is_warm());
@@ -1100,6 +1105,19 @@ mod startup_correction_tests {
             reanchored_at.is_some_and(|ms| ms < 1_500),
             "{reanchored_at:?}"
         );
+    }
+
+    #[test]
+    fn output_delay_settling_restarts_the_correction_deadline() {
+        let start = Instant::now();
+        let mut state = StartupCorrectionState::new();
+        state.start(start);
+        let mut schedule = CorrectionSchedule::default();
+        for ms in (0..CLOCK_WARMUP_MAX.as_millis() as u64).step_by(10) {
+            let now = start + Duration::from_millis(ms);
+            tick(&mut state, now, 50_000, 20_000, &mut schedule, false);
+            assert!(!schedule.reanchor, "at {ms}ms");
+        }
     }
 
     #[test]
