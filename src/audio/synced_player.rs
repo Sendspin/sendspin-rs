@@ -1461,10 +1461,9 @@ impl SyncedPlayer {
         if format.channels == 0 {
             return Err(Error::Output("channels must be > 0".to_string()));
         }
-        let host = cpal::default_host();
         let device = match config.device {
             Some(device) => device,
-            None => host
+            None => cpal::default_host()
                 .default_output_device()
                 .ok_or_else(|| Error::Output("No output device available".to_string()))?,
         };
