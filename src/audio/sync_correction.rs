@@ -44,7 +44,6 @@ pub(crate) const SOFT_CORRECTION_TARGET_US: i64 = 500;
 pub struct CorrectionPlanner {
     deadband_us: i64,
     engage_us: i64,
-    reanchor_threshold_us: i64,
     target_seconds: f64,
     max_speed_correction: f64,
 }
@@ -52,19 +51,19 @@ pub struct CorrectionPlanner {
 impl CorrectionPlanner {
     /// Create a planner with default thresholds.
     pub fn new() -> Self {
-        // Under the spec's 0.5% so that any 150ms window, which can hold
-        // one correction more than the average rate, stays within it.
-        let max_speed_correction = 0.0045;
         Self {
             deadband_us: 100,
             engage_us: 300,
-            // Larger errors cannot be soft-corrected within the budget.
-            reanchor_threshold_us: (max_speed_correction
-                * SOFT_CORRECTION_BUDGET.as_secs_f64()
-                * 1_000_000.0) as i64,
             target_seconds: 2.0,
-            max_speed_correction,
+            // Under the spec's 0.5% so that any 150ms window, which can hold
+            // one correction more than the average rate, stays within it.
+            max_speed_correction: 0.0045,
         }
+    }
+
+    /// Largest error the speed cap can soft-correct within `time`.
+    pub(crate) fn max_soft_correction_us(&self, time: Duration) -> i64 {
+        (self.max_speed_correction * time.as_secs_f64() * 1_000_000.0) as i64
     }
 
     /// Plan a correction schedule from sync error and sample rate.
@@ -112,7 +111,7 @@ impl CorrectionPlanner {
             };
         }
 
-        if abs_error >= self.reanchor_threshold_us {
+        if abs_error >= self.max_soft_correction_us(SOFT_CORRECTION_BUDGET) {
             return CorrectionSchedule {
                 insert_every_n_frames: 0,
                 drop_every_n_frames: 0,
