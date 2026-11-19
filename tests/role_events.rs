@@ -13,6 +13,7 @@ use sendspin::protocol::messages::{
     StreamStart, StreamVisualizerConfig, VisualizerDataType,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
+use sendspin::sync::ClockSync;
 use sendspin::{Clock, MemoryStore, ProtocolClientBuilder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -248,10 +249,11 @@ async fn fixture_with(
                 "visualizer@v1".into(),
             ])
             .await;
-        // Answer the two fast-start samples the client waits on before its
-        // initial client/state, and let tests observe and answer later ones.
-        // The clock advances so the filter accepts both samples.
-        let mut fast_start_samples = 2;
+        // Answer every client/time until the client has synchronized and
+        // sends its initial client/state; tests observe and answer later
+        // bursts themselves. The clock advances so the filter accepts each
+        // burst's best reply.
+        let mut startup = true;
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -262,12 +264,16 @@ async fn fixture_with(
                     let Some(json) = json else { break };
                     let message = serde_json::from_str::<Message>(&json).unwrap();
                     match message {
-                        Message::ClientTime(time) if fast_start_samples > 0 => {
-                            fast_start_samples -= 1;
-                            server_clock.set(server_clock.now_micros() + 1);
+                        Message::ClientTime(time) if startup => {
+                            // Advance enough that the filter's half-RTT
+                            // max_error stays positive and accepts the sample.
+                            server_clock.set(server_clock.now_micros() + 1_000);
                             server.answer_time(&time).await;
                         }
                         message => {
+                            if matches!(message, Message::ClientState(_)) {
+                                startup = false;
+                            }
                             let _ = observed_tx.send(message);
                         }
                     }
@@ -930,6 +936,10 @@ async fn time_sync_feeds_only_the_lowest_max_error_reply_of_each_burst() {
     let mut f = fixture().await;
     let clock_sync = f.client.clock_sync();
     let first = next_client_time(&mut f.observed).await;
+    // The fixture's startup bursts already synchronized the shared filter;
+    // reset it so this test measures a cold filter against the burst that is
+    // now waiting for its first reply.
+    *clock_sync.lock() = ClockSync::new(f.clock.clone());
     let last = answer_time_burst(
         &mut f.observed,
         &f.server_tx,
