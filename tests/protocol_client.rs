@@ -1598,21 +1598,24 @@ async fn test_client_waits_for_activation_and_clock_sync() {
             "client sent a message before server/activate"
         );
         server.activate(vec!["player@v1".to_string()]).await;
-        let mut samples = Vec::new();
-        for _ in 0..2 {
-            match server.recv().await {
-                Some(Message::ClientTime(time)) => samples.push((time, Instant::now())),
+        // Two complete 8-message bursts are required before ClockSync::is_synchronized() becomes true.
+        // Keep this in sync with src/protocol/client.rs:TIME_BURST_SIZE
+        const STARTUP_REQUESTS: usize = 2 * 8;
+        for sample in 0..STARTUP_REQUESTS {
+            let time = match server.recv().await {
+                Some(Message::ClientTime(time)) => time,
                 other => panic!("expected client/time, got {other:?}"),
+            };
+            let received = Instant::now();
+            if sample == 0 {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), server.recv())
+                        .await
+                        .is_err(),
+                    "client sent a message before receiving its first clock reply"
+                );
             }
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), server.recv())
-                .await
-                .is_err(),
-            "client sent client/state before its clock synchronized"
-        );
-        // Report the time each request was held so the round trip stays short.
-        for (time, received) in samples {
+            // Report the time each request was held so the round trip stays short.
             let t = time.client_transmitted;
             server
                 .send(&Message::ServerTime(ServerTime {
