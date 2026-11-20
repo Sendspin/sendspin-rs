@@ -838,7 +838,6 @@ async fn clock_reply_uses_observed_client_time_and_graceful_peer_close_rejects_h
         other => panic!("expected an observed ClientTime before reply, got {other:?}"),
     };
     let mut split = f.client.split();
-    f.clock.set(t1 + 1_000);
     let mut session = split.player.attach(Events::default());
     f.server_tx
         .send(serde_json::to_string(&player_start("pcm")).unwrap().into())
