@@ -1598,36 +1598,46 @@ async fn test_client_waits_for_activation_and_clock_sync() {
             "client sent a message before server/activate"
         );
         server.activate(vec!["player@v1".to_string()]).await;
-        // Two complete 8-message bursts are required before ClockSync::is_synchronized() becomes true.
-        // Keep this in sync with src/protocol/client.rs:TIME_BURST_SIZE
-        const STARTUP_REQUESTS: usize = 2 * 8;
-        for sample in 0..STARTUP_REQUESTS {
-            let time = match server.recv().await {
-                Some(Message::ClientTime(time)) => time,
-                other => panic!("expected client/time, got {other:?}"),
-            };
-            let received = Instant::now();
-            if sample == 0 {
-                assert!(
-                    tokio::time::timeout(Duration::from_millis(300), server.recv())
-                        .await
-                        .is_err(),
-                    "client sent a message before receiving its first clock reply"
-                );
+        // The client sends 8-message bursts and releases its initial
+        // client/state once the filter accepts a burst's best sample. Bursts
+        // keep running afterwards at zero interval, so stray requests can
+        // interleave with client/state — answer requests until it arrives.
+        const STARTUP_REQUESTS: usize = 8;
+        let mut replies = 0_usize;
+        loop {
+            match server.recv().await {
+                Some(Message::ClientTime(time)) => {
+                    let received = Instant::now();
+                    if replies == 0 {
+                        assert!(
+                            tokio::time::timeout(Duration::from_millis(300), server.recv())
+                                .await
+                                .is_err(),
+                            "client sent a message before receiving its first clock reply"
+                        );
+                    }
+                    replies += 1;
+                    // Reply immediately; the first request is the only
+                    // intentionally delayed one.
+                    let t = time.client_transmitted;
+                    server
+                        .send(&Message::ServerTime(ServerTime {
+                            client_transmitted: t,
+                            server_received: t,
+                            server_transmitted: t + received.elapsed().as_micros() as i64,
+                        }))
+                        .await;
+                }
+                Some(Message::ClientState(state)) => {
+                    assert!(
+                        replies >= STARTUP_REQUESTS,
+                        "client/state arrived after only {replies} time replies"
+                    );
+                    assert_eq!(state.state, Some(ClientSyncState::Synchronized));
+                    break;
+                }
+                other => panic!("expected client/time or client/state, got {other:?}"),
             }
-            // Report the time each request was held so the round trip stays short.
-            let t = time.client_transmitted;
-            server
-                .send(&Message::ServerTime(ServerTime {
-                    client_transmitted: t,
-                    server_received: t,
-                    server_transmitted: t + received.elapsed().as_micros() as i64,
-                }))
-                .await;
-        }
-        match server.recv().await {
-            Some(Message::ClientState(_)) => {}
-            other => panic!("expected client/state, got {other:?}"),
         }
     });
     let _client = ProtocolClientBuilder::builder()

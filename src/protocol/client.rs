@@ -946,7 +946,7 @@ async fn time_sync(
                     t4,
                 )
             });
-            if sync.is_synchronized() {
+            if accepted || sync.is_synchronized() {
                 if let Some(synced) = synced.take() {
                     let _ = synced.send(());
                 }
