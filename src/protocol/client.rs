@@ -48,6 +48,7 @@ pub(crate) enum WriteCommand {
     },
     /// Close the WebSocket without sending a Sendspin message.
     Close,
+    ReportArtwork,
 }
 
 async fn writer_task<S>(
@@ -58,9 +59,32 @@ async fn writer_task<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let mut artwork = None;
     while let Some(cmd) = rx.recv().await {
         match cmd {
+            WriteCommand::ReportArtwork => {
+                if !activation.borrow().is_active(ARTWORK_V1) {
+                    continue;
+                }
+                if let Some(artwork) = artwork.clone() {
+                    let msg = Message::ClientState(ClientState {
+                        artwork: Some(artwork),
+                        ..Default::default()
+                    });
+                    if noise::send_encrypted(&mut sink, &mut encryptor, &msg)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
             WriteCommand::Send { msg, ack } => {
+                if let Message::ClientState(state) = msg.as_ref() {
+                    if let Some(update) = &state.artwork {
+                        artwork = Some(update.clone());
+                    }
+                }
                 let gated = strip_inactive_roles(*msg, &activation.borrow());
                 let Some(msg) = gated else {
                     let _ = ack.send(Ok(()));
@@ -1561,7 +1585,11 @@ impl Router {
             self.sinks.dispatch_message(Message::StreamEnd(end));
         }
         let player_added = next.is_active(PLAYER_V1) && !current.is_active(PLAYER_V1);
+        let artwork_added = next.is_active(ARTWORK_V1) && !current.is_active(ARTWORK_V1);
         self.activation.send_replace(next.clone());
+        if artwork_added {
+            let _ = self.sender.tx.send(WriteCommand::ReportArtwork);
+        }
         if player_added {
             self.sender.queue_player_report();
         }
