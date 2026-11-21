@@ -4,7 +4,8 @@ use crate::error::Error;
 use crate::protocol::client::ConnectParams;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ArtworkV1Support, ClientHello, ClientState, ClientSyncState, DeviceInfo, PlayerState,
+    ArtworkChannelState, ArtworkClientState, ArtworkSource, ArtworkStateFormat, ArtworkV1Support,
+    ClientHello, ClientState, ClientSyncState, DeviceInfo, ImageFormat, PlayerState,
     PlayerV1Support, SupportedPairMethods, UnpairedAccess, VisualizerV1Support,
 };
 use crate::protocol::noise::Identity;
@@ -281,6 +282,42 @@ impl ProtocolClientBuilder {
 
     fn into_params(self) -> Result<ConnectParams, Error> {
         self.validate()?;
+        let artwork = self
+            .artwork_v1_support
+            .as_ref()
+            .map(|support| {
+                if !(1..=4).contains(&support.channels.len()) {
+                    return Err(Error::Protocol("artwork requires 1-4 channels".into()));
+                }
+                let channels = support
+                    .channels
+                    .iter()
+                    .map(|channel| {
+                        let enabled = channel.source != ArtworkSource::None;
+                        let format = if enabled {
+                            Some(match channel.format {
+                                ImageFormat::Jpeg => ArtworkStateFormat::Jpeg,
+                                ImageFormat::Png => ArtworkStateFormat::Png,
+                                ImageFormat::Bmp => {
+                                    return Err(Error::Protocol(
+                                        "artwork state supports only jpeg and png".into(),
+                                    ))
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(ArtworkChannelState {
+                            source: channel.source.clone(),
+                            format,
+                            width: enabled.then_some(channel.media_width),
+                            height: enabled.then_some(channel.media_height),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Ok(ArtworkClientState { channels })
+            })
+            .transpose()?;
         let identity = self.identity()?;
         let hello = ClientHello {
             name: self.name,
@@ -303,6 +340,7 @@ impl ProtocolClientBuilder {
         let initial_state = ClientState {
             state: Some(self.initial_sync_state),
             player: self.initial_player_state,
+            artwork,
         };
 
         Ok(ConnectParams {
@@ -312,5 +350,92 @@ impl ProtocolClientBuilder {
             clock: self.clock,
             automatic_player_state: self.automatic_player_state,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::messages::ArtworkChannel;
+    use crate::protocol::persistence::MemoryStore;
+
+    #[test]
+    fn initial_artwork_state_uses_channel_dimensions_and_omits_disabled_fields() {
+        let builder = ProtocolClientBuilder::builder()
+            .persistence(Arc::new(MemoryStore::default()))
+            .name("Artwork".into())
+            .artwork_v1_support(ArtworkV1Support {
+                channels: vec![
+                    ArtworkChannel {
+                        source: ArtworkSource::Album,
+                        format: ImageFormat::Png,
+                        media_width: 320,
+                        media_height: 240,
+                    },
+                    ArtworkChannel {
+                        source: ArtworkSource::None,
+                        format: ImageFormat::Bmp,
+                        media_width: 0,
+                        media_height: 0,
+                    },
+                ],
+            })
+            .build();
+        let params = builder.into_params().unwrap();
+        let value = serde_json::to_value(&params.initial_state).unwrap();
+        assert_eq!(
+            value["artwork"],
+            serde_json::json!({"channels": [
+                {"source": "album", "format": "png", "width": 320, "height": 240},
+                {"source": "none"}
+            ]})
+        );
+        assert_eq!(
+            params.hello.artwork_v1_support.unwrap().channels[0].media_width,
+            320
+        );
+        let parsed: ClientState = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.artwork, params.initial_state.artwork);
+    }
+
+    #[test]
+    fn initial_artwork_state_rejects_invalid_channel_counts_and_enabled_bmp() {
+        for (count, format) in [
+            (0, ImageFormat::Jpeg),
+            (5, ImageFormat::Jpeg),
+            (1, ImageFormat::Bmp),
+        ] {
+            let builder = ProtocolClientBuilder::builder()
+                .persistence(Arc::new(MemoryStore::default()))
+                .name("Artwork".into())
+                .artwork_v1_support(ArtworkV1Support {
+                    channels: vec![
+                        ArtworkChannel {
+                            source: ArtworkSource::Album,
+                            format,
+                            media_width: 256,
+                            media_height: 256,
+                        };
+                        count
+                    ],
+                })
+                .build();
+            assert!(matches!(builder.into_params(), Err(Error::Protocol(_))));
+        }
+    }
+
+    #[test]
+    fn initial_state_omits_artwork_without_artwork_support() {
+        let builder = ProtocolClientBuilder::builder()
+            .persistence(Arc::new(MemoryStore::default()))
+            .name("Metadata".into())
+            .metadata()
+            .build();
+        let params = builder.into_params().unwrap();
+        assert!(params.initial_state.artwork.is_none());
+        assert!(serde_json::to_value(params.initial_state)
+            .unwrap()
+            .get("artwork")
+            .is_none());
     }
 }

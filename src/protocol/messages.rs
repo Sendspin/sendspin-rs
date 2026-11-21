@@ -335,7 +335,7 @@ pub struct ArtworkChannel {
 }
 
 /// Artwork source type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ArtworkSource {
     /// Album artwork
@@ -343,6 +343,7 @@ pub enum ArtworkSource {
     /// Artist image
     Artist,
     /// No artwork (channel disabled)
+    #[default]
     None,
 }
 
@@ -510,6 +511,45 @@ pub struct ClientState {
     /// Player state (if player role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerState>,
+    /// Artwork state (if artwork role active).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkClientState>,
+}
+
+/// Requested artwork channel configurations in `client/state`.
+#[derive(Debug, Default,Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkClientState {
+    /// Positional channel configurations, from channel 0 (1-4 entries).
+    pub channels: Vec<ArtworkChannelState>,
+}
+
+/// Requested artwork channel; format and dimensions are required unless disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkChannelState {
+    /// Requested artwork source, or `none` to disable the channel.
+    pub source: ArtworkSource,
+    /// Requested encoded image format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ArtworkStateFormat>,
+    /// Delivered image width in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Delivered image height in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+/// Image formats supported by the RC1 artwork state declaration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtworkStateFormat {
+    /// JPEG image.
+    Jpeg,
+    /// PNG image.
+    Png,
+    /// An image format this implementation does not recognize.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Player state
