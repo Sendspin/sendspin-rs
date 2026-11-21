@@ -5,8 +5,8 @@ use sendspin::protocol::messages::{
     DeviceInfo, GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType,
     PlayerFormatRequest, PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime,
     SpectrumConfig, SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat,
-    StreamVisualizerConfig, UnpairedAccess, VisualizerDataType, VisualizerFormatRequest,
-    VisualizerV1Support,
+    StreamVisualizerConfig, SupportedPairMethods, UnpairedAccess, VisualizerDataType,
+    VisualizerFormatRequest, VisualizerV1Support,
 };
 
 // =============================================================================
@@ -64,6 +64,7 @@ fn test_client_hello_serialization() {
         }),
         artwork_v1_support: None,
         visualizer_v1_support: None,
+        supported_pair_methods: SupportedPairMethods::default(),
         unpaired_access: UnpairedAccess { enabled: true },
     };
 
@@ -72,6 +73,7 @@ fn test_client_hello_serialization() {
 
     assert!(json.contains("\"type\":\"client/hello\""));
     assert!(json.contains("\"unpaired_access\":{\"enabled\":true}"));
+    assert!(json.contains("\"supported_pair_methods\":{\"pairing_psk\":{}}"));
     assert!(json.contains("\"player@v1_support\""));
     assert!(json.contains("\"player@v1\""));
 }
@@ -616,6 +618,7 @@ fn test_visualizer_negotiation_serialization() {
                 f_max: 16_000,
             }),
         }),
+        supported_pair_methods: SupportedPairMethods::default(),
         unpaired_access: UnpairedAccess { enabled: false },
     };
     let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();

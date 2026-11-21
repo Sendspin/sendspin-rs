@@ -172,6 +172,8 @@ pub struct ClientHello {
         skip_serializing_if = "Option::is_none"
     )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
+    /// Pairing methods this client currently offers, keyed by method identifier
+    pub supported_pair_methods: SupportedPairMethods,
     /// Whether the client admits servers it is not paired with
     pub unpaired_access: UnpairedAccess,
 }
@@ -181,6 +183,94 @@ pub struct ClientHello {
 pub struct UnpairedAccess {
     /// Whether a server without a pairing record may activate roles or declare `playback`
     pub enabled: bool,
+}
+
+/// Pairing methods the client currently offers, advertised in `client/hello`.
+///
+/// Keyed by pairing method identifier; every client offers at least the
+/// Pairing PSK method, which [`Default`] therefore sets. See
+/// `pairing.md` (client/hello pair-method descriptor).
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SupportedPairMethods {
+    /// Pairing PSK: the client can pair using a PSK configured out-of-band
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_psk: Option<PairMethodDescriptor>,
+    /// Static pairing code: the client pairs using a code fixed for it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_pairing_code: Option<PairMethodDescriptor>,
+    /// Dynamic pairing code: the client can emit a per-session pairing code
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicPairingCodeDescriptor>,
+}
+
+impl Default for SupportedPairMethods {
+    /// The spec-mandated minimum: every client offers Pairing PSK.
+    fn default() -> Self {
+        Self {
+            pairing_psk: Some(PairMethodDescriptor::default()),
+            static_pairing_code: None,
+            dynamic_pairing_code: None,
+        }
+    }
+}
+
+/// Descriptor for pair methods whose secret is configured out-of-band
+/// (`pairing_psk`, `static_pairing_code`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PairMethodDescriptor {
+    /// Informational hint: where the operator can find the method's configured
+    /// secret (printed on the device, on a leaflet, or set by the operator)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<PairingSecretLocation>,
+}
+
+/// Where the operator can find a pairing method's configured secret
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairingSecretLocation {
+    /// Printed on the device
+    Device,
+    /// Printed on a leaflet in the box
+    Leaflet,
+    /// Set by the operator
+    Operator,
+    /// A new unknown location that this implementation does not recognize
+    #[serde(other)]
+    Unknown,
+}
+
+/// Descriptor for `dynamic_pairing_code`: a per-session code the client
+/// emits for the operator.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DynamicPairingCodeDescriptor {
+    /// Channels through which the per-session pairing code reaches the operator
+    #[serde(default)]
+    pub out_channels: Vec<PairingOutChannel>,
+    /// Emission formats the client offers; non-empty. `qr_code` requires a
+    /// display able to render a QR code.
+    #[serde(default)]
+    pub formats: Vec<PairingCodeFormat>,
+}
+
+/// Channel through which a per-session pairing code reaches the operator
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingOutChannel {
+    /// The code is shown on a display
+    Display,
+    /// The code is spoken or played through a speaker
+    Speaker,
+}
+
+/// Emission format a client offers for a dynamic pairing code
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCodeFormat {
+    /// Numeric code the operator types in
+    Digits,
+    /// QR code the server scans
+    QrCode,
 }
 
 /// Device information (all fields optional per spec)
