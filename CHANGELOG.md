@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Initial `client/state` includes artwork channel settings derived from `artwork@v1_support` while the artwork role is active. Enabled channels require JPEG or PNG; artwork configurations require 1-4 channels.
 - Added `StreamDecoder` for selecting and validating PCM, Opus, and FLAC decoders from each stream configuration.
 - Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
 - Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.

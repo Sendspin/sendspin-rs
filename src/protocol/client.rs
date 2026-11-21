@@ -93,9 +93,15 @@ async fn writer_task<S>(
 /// Remove role objects for inactive roles, returning `None` when nothing is left to send.
 fn strip_inactive_roles(msg: Message, activation: &ServerActivate) -> Option<Message> {
     match msg {
-        Message::ClientState(mut state) if !activation.is_active(PLAYER_V1) => {
-            state.player = None;
-            state.state.is_some().then_some(Message::ClientState(state))
+        Message::ClientState(mut state) => {
+            if !activation.is_active(PLAYER_V1) {
+                state.player = None;
+            }
+            if !activation.is_active(ARTWORK_V1) {
+                state.artwork = None;
+            }
+            (state.state.is_some() || state.player.is_some() || state.artwork.is_some())
+                .then_some(Message::ClientState(state))
         }
         other => Some(other),
     }
@@ -275,6 +281,7 @@ impl WsSender {
         let Some(reporter) = &self.reporter else {
             return self
                 .send_message(Message::ClientState(ClientState {
+                    artwork: None,
                     state: Some(state),
                     player: None,
                 }))
@@ -284,6 +291,7 @@ impl WsSender {
         reporter
             .send(crate::protocol::state_reporter::Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(state),
                     player: None,
                 },
@@ -304,6 +312,7 @@ impl WsSender {
         let Some(reporter) = &self.reporter else {
             return self
                 .send_message(Message::ClientState(ClientState {
+                    artwork: None,
                     state: None,
                     player: Some(player),
                 }))
@@ -313,6 +322,7 @@ impl WsSender {
         reporter
             .send(crate::protocol::state_reporter::Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: None,
                     player: Some(player),
                 },
@@ -354,6 +364,7 @@ impl WsSender {
         let Some(reporter) = &self.reporter else {
             return self
                 .send_message(Message::ClientState(ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::Synchronized),
                     player,
                 }))
@@ -487,6 +498,7 @@ impl WsSender {
         let (ack, _) = oneshot::channel();
         let _ = reporter.send(crate::protocol::state_reporter::Command::State {
             state: ClientState {
+                artwork: None,
                 state: None,
                 player: Some(PlayerState::default()),
             },
@@ -1568,6 +1580,40 @@ mod tests {
     use std::time::Duration;
     use tokio::io::duplex;
     use tokio_tungstenite::tungstenite::protocol::Role;
+
+    #[test]
+    fn artwork_state_is_sent_only_while_artwork_is_active() {
+        let artwork = serde_json::from_value(serde_json::json!({
+            "channels": [{"source": "album", "format": "jpeg", "width": 256, "height": 256}]
+        }))
+        .unwrap();
+        let state = ClientState {
+            artwork: Some(artwork),
+            ..Default::default()
+        };
+        let mut activation = ServerActivate {
+            activities: vec![],
+            active_roles: Some(vec![ARTWORK_V1.into()]),
+        };
+        let Some(Message::ClientState(filtered)) =
+            strip_inactive_roles(Message::ClientState(state.clone()), &activation)
+        else {
+            panic!("active artwork state was dropped");
+        };
+        assert_eq!(filtered.artwork, state.artwork);
+        activation.active_roles = Some(vec![PLAYER_V1.into()]);
+        assert!(strip_inactive_roles(Message::ClientState(state.clone()), &activation).is_none());
+        let Some(Message::ClientState(filtered)) = strip_inactive_roles(
+            Message::ClientState(ClientState {
+                state: Some(ClientSyncState::Synchronized),
+                ..state
+            }),
+            &activation,
+        ) else {
+            panic!("client-level state was dropped");
+        };
+        assert!(filtered.artwork.is_none());
+    }
 
     struct FakeClock(AtomicI64);
 

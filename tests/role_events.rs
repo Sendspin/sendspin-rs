@@ -1227,6 +1227,7 @@ async fn raw_client_state_partial_patch_retains_full_state_for_next_auto_report(
         .sender
         .send_message(Message::ClientState(
             sendspin::protocol::messages::ClientState {
+                artwork: None,
                 state: None,
                 player: Some(PlayerState {
                     min_buffer_ms: Some(88),
@@ -1268,6 +1269,7 @@ async fn raw_external_source_state_suppresses_pending_control_report() {
         .sender
         .send_message(Message::ClientState(
             sendspin::protocol::messages::ClientState {
+                artwork: None,
                 state: Some(ClientSyncState::ExternalSource),
                 player: None,
             },
@@ -1289,6 +1291,7 @@ async fn raw_external_source_state_suppresses_pending_control_report() {
         .sender
         .send_message(Message::ClientState(
             sendspin::protocol::messages::ClientState {
+                artwork: None,
                 state: Some(ClientSyncState::Synchronized),
                 player: Some(PlayerState {
                     muted: Some(true),

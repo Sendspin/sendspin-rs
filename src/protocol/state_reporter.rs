@@ -100,6 +100,7 @@ async fn reconcile_post_state(
     send(
         output,
         Message::ClientState(ClientState {
+            artwork: None,
             state: None,
             player: Some(player.clone()),
         }),
@@ -125,6 +126,7 @@ pub(crate) async fn run(mut config: Config) {
         if send(
             &config.output,
             Message::ClientState(ClientState {
+                artwork: None,
                 state: None,
                 player: Some(player.clone()),
             }),
@@ -145,7 +147,7 @@ pub(crate) async fn run(mut config: Config) {
                 let mut next = player.clone();
                 apply_controls(&mut next, &controls);
                 player = next.clone();
-                if let Err(error) = send(&config.output, Message::ClientState(ClientState { state: None, player: Some(next) })).await {
+                if let Err(error) = send(&config.output, Message::ClientState(ClientState { artwork: None, state: None, player: Some(next) })).await {
                     log::debug!("Player state reporter exiting: {error}");
                     break;
                 }
@@ -175,7 +177,7 @@ pub(crate) async fn run(mut config: Config) {
                             last_controls = boundary_applied_controls;
                         }
                         let entering_external = !was_external && external;
-                        let result = send(&config.output, Message::ClientState(ClientState {
+                        let result = send(&config.output, Message::ClientState(ClientState { artwork: state.artwork,
                             state: reported_state,
                             player: if entering_external {
                                 state.player.map(|_| player.clone())
@@ -202,14 +204,14 @@ pub(crate) async fn run(mut config: Config) {
                     }
                     Command::Enter { ack } => {
                         external = true;
-                        let result = send(&config.output, Message::ClientState(ClientState { state: Some(ClientSyncState::ExternalSource), player: None })).await;
+                        let result = send(&config.output, Message::ClientState(ClientState { artwork: None, state: Some(ClientSyncState::ExternalSource), player: None })).await;
                         let _ = ack.send(result);
                     }
                     Command::Exit { player: patch, controls: boundary, ack } => {
                         external = false;
                         synchronize_player(&mut player, &boundary, patch);
                         last_controls = boundary.clone();
-                        let result = send(&config.output, Message::ClientState(ClientState { state: Some(ClientSyncState::Synchronized), player: Some(player.clone()) })).await;
+                        let result = send(&config.output, Message::ClientState(ClientState { artwork: None, state: Some(ClientSyncState::Synchronized), player: Some(player.clone()) })).await;
                         let reconciled = if result.is_ok() {
                             reconcile_post_state(
                                 &config.output,
@@ -248,6 +250,7 @@ mod tests {
 
     fn initial(volume: u8) -> ClientState {
         ClientState {
+            artwork: None,
             state: Some(ClientSyncState::Synchronized),
             player: Some(PlayerState {
                 volume: Some(volume),
@@ -325,6 +328,7 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::ExternalSource),
                     player: None,
                 },
@@ -392,6 +396,7 @@ mod tests {
             commands: command_rx,
             controls: controls_rx,
             initial: ClientState {
+                artwork: None,
                 state: Some(ClientSyncState::ExternalSource),
                 player: Some(PlayerState {
                     volume: Some(50),
@@ -404,6 +409,7 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::Synchronized),
                     player: Some(PlayerState {
                         volume: Some(70),
@@ -439,6 +445,12 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "channels": [{"source": "none"}]
+                        }))
+                        .unwrap(),
+                    ),
                     state: Some(ClientSyncState::Synchronized),
                     player: Some(PlayerState {
                         min_buffer_ms: Some(25),
@@ -457,6 +469,10 @@ mod tests {
         let player = &message["payload"]["player"];
         assert_eq!(player["volume"], 30);
         assert_eq!(player["min_buffer_ms"], 25);
+        assert_eq!(
+            message["payload"]["artwork"],
+            serde_json::json!({"channels": [{"source": "none"}]})
+        );
         task.abort();
     }
 
@@ -490,6 +506,7 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::Synchronized),
                     player: Some(PlayerState {
                         min_buffer_ms: Some(40),
@@ -526,6 +543,7 @@ mod tests {
             commands: command_rx,
             controls: controls_rx,
             initial: ClientState {
+                artwork: None,
                 state: Some(ClientSyncState::ExternalSource),
                 player: Some(PlayerState {
                     volume: Some(50),
@@ -572,6 +590,7 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::ExternalSource),
                     player: None,
                 },
@@ -594,6 +613,7 @@ mod tests {
         commands
             .send(Command::State {
                 state: ClientState {
+                    artwork: None,
                     state: Some(ClientSyncState::Synchronized),
                     player: None,
                 },
@@ -655,6 +675,7 @@ mod tests {
             commands
                 .send(Command::State {
                     state: ClientState {
+                        artwork: None,
                         state: Some(state),
                         player: None,
                     },
