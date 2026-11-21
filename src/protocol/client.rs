@@ -1759,4 +1759,84 @@ mod tests {
         assert_eq!(reply.client_transmitted, 1_000);
         assert_eq!(t4, 3_000);
     }
+
+    #[tokio::test]
+    async fn burst_sync_notifies_only_after_selected_samples_synchronize() {
+        let clock = Arc::new(FakeClock::new(1_000_000));
+        let sync_clock: Arc<dyn Clock> = clock.clone();
+        let clock_sync = Arc::new(Mutex::new(ClockSync::new(sync_clock.clone())));
+        let (tx, mut commands) = unbounded_channel();
+        let (replies, reply_rx) = unbounded_channel();
+        let (synced_tx, mut synced_rx) = oneshot::channel();
+        let sender = WsSender {
+            tx,
+            reporter: None,
+            controls: watch::channel(AppliedControls {
+                volume: 100,
+                muted: false,
+                static_delay_ms: 0,
+            })
+            .1,
+            stream_state: Arc::new(StreamState::default()),
+        };
+        let task = tokio::spawn(time_sync(
+            sender,
+            sync_clock,
+            Arc::clone(&clock_sync),
+            reply_rx,
+            Some(synced_tx),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for index in 0..TIME_BURST_SIZE * 2 {
+                let Some(WriteCommand::Send { msg, ack }) = commands.recv().await else {
+                    panic!("expected client/time");
+                };
+                let Message::ClientTime(time) = *msg else {
+                    panic!("expected client/time");
+                };
+                // `synced` fires once the first accepted burst update lands,
+                // which happens after the count >= 1 startup gate is reached.
+                if index < TIME_BURST_SIZE {
+                    assert!(synced_rx.try_recv().is_err());
+                    assert_eq!(clock_sync.lock().rtt_micros(), None);
+                } else {
+                    assert_eq!(clock_sync.lock().rtt_micros(), Some(100));
+                }
+                let rtt = if index % TIME_BURST_SIZE == 0 {
+                    100
+                } else {
+                    200
+                };
+                let t1 = time.client_transmitted;
+                clock.0.store(t1 + 1_000, Ordering::Relaxed);
+                ack.send(Ok(())).unwrap();
+                replies
+                    .send((
+                        ServerTime {
+                            client_transmitted: t1,
+                            server_received: t1 + rtt / 2,
+                            server_transmitted: t1 + rtt / 2,
+                        },
+                        t1 + rtt,
+                    ))
+                    .unwrap();
+            }
+            (&mut synced_rx).await.unwrap();
+            // `synced` fires on the first accepted update; the second
+            // burst's update lands only when the task consumes the last
+            // reply. A new burst's first send proves that happened.
+            let Some(WriteCommand::Send { msg, .. }) = commands.recv().await else {
+                panic!("expected the next client/time burst");
+            };
+            let Message::ClientTime(_) = *msg else {
+                panic!("expected client/time");
+            };
+        })
+        .await
+        .unwrap();
+        assert!(clock_sync.lock().is_synchronized());
+        assert_eq!(clock_sync.lock().rtt_micros(), Some(100));
+        task.abort();
+        let _ = task.await;
+    }
 }
