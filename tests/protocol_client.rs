@@ -5,12 +5,13 @@ use sendspin::audio::{AudioBuffer, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::error::Error;
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::messages::{
-    ArtworkFormatRequest, ArtworkSource, AudioFormatSpec, ClientCommand, ClientSyncState,
-    ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand, PlayerCommandType,
-    PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode, ServerActivate, ServerCommand,
-    ServerTime, StreamArtworkChannelConfig, StreamArtworkConfig, StreamClear, StreamEnd,
-    StreamPlayerConfig, StreamRequestFormat, StreamStart, VisualizerDataType,
-    VisualizerFormatRequest,
+    ArtworkChannel, ArtworkChannelState, ArtworkClientState, ArtworkFormatRequest, ArtworkSource,
+    ArtworkStateFormat, ArtworkV1Support, AudioFormatSpec, ClientCommand, ClientState,
+    ClientSyncState, ControllerCommandType, GoodbyeReason, ImageFormat, Message, PlayerCommand,
+    PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerV1Support, RepeatMode,
+    ServerActivate, ServerCommand, ServerTime, StreamArtworkChannelConfig, StreamArtworkConfig,
+    StreamClear, StreamEnd, StreamPlayerConfig, StreamRequestFormat, StreamStart,
+    VisualizerDataType, VisualizerFormatRequest,
 };
 use sendspin::roles::{ArtworkEvent, ArtworkOutput, VisualizerEvent, VisualizerOutput};
 use sendspin::{MemoryStore, ProtocolClientBuilder};
@@ -31,6 +32,247 @@ fn player_support() -> PlayerV1Support {
         buffer_capacity: 50 * 1024 * 1024,
         supported_commands: vec![],
     }
+}
+
+async fn artwork_activation_reports_latest_settings(automatic_player_state: Option<bool>) {
+    let (url, mut observed, server_tx, server) =
+        start_server(Some(vec!["metadata@v1".into()])).await;
+    let builder = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::default()))
+        .unpaired_access(true)
+        .name("Artwork activation".into())
+        .metadata()
+        .artwork_v1_support(ArtworkV1Support {
+            channels: vec![ArtworkChannel {
+                source: ArtworkSource::Album,
+                format: ImageFormat::Jpeg,
+                media_width: 256,
+                media_height: 256,
+            }],
+        });
+    let builder = match automatic_player_state {
+        Some(automatic) => builder
+            .player_v1_support(player_support())
+            .initial_player_state(PlayerState {
+                volume: Some(50),
+                ..Default::default()
+            })
+            .automatic_player_state(automatic)
+            .build(),
+        None => builder.build(),
+    };
+    let client = builder.connect(url).await.unwrap();
+    assert!(next_client_state(&mut observed).await.artwork.is_none());
+    let activate = |artwork: bool| {
+        Message::ServerActivate(ServerActivate {
+            activities: vec![],
+            active_roles: Some(if artwork {
+                vec!["metadata@v1".into(), "artwork@v1".into()]
+            } else {
+                vec!["metadata@v1".into()]
+            }),
+        })
+    };
+    server_tx
+        .send(serde_json::to_string(&activate(true)).unwrap().into())
+        .unwrap();
+    let state = next_client_state(&mut observed).await;
+    let initial = state.artwork.unwrap();
+    assert_eq!(initial.channels[0].format, Some(ArtworkStateFormat::Jpeg));
+    assert_eq!(initial.channels[0].width, Some(256));
+    assert!(state.player.is_none());
+    let connection = client.split();
+    let updated = ArtworkClientState {
+        channels: vec![ArtworkChannelState {
+            source: ArtworkSource::Artist,
+            format: Some(ArtworkStateFormat::Png),
+            width: Some(320),
+            height: Some(240),
+        }],
+    };
+    connection
+        .sender
+        .send_message(Message::ClientState(ClientState {
+            artwork: Some(updated.clone()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        next_client_state(&mut observed).await.artwork,
+        Some(updated.clone())
+    );
+    for active in [false, true] {
+        server_tx
+            .send(serde_json::to_string(&activate(active)).unwrap().into())
+            .unwrap();
+    }
+    assert_eq!(
+        next_client_state(&mut observed).await.artwork,
+        Some(updated.clone())
+    );
+    server_tx
+        .send(serde_json::to_string(&activate(true)).unwrap().into())
+        .unwrap();
+    server_tx
+        .send(
+            serde_json::to_string(&Message::ServerCommand(ServerCommand { player: None }))
+                .unwrap()
+                .into(),
+        )
+        .unwrap();
+    let mut messages = connection.messages;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match messages.recv().await {
+                Some(Message::ServerCommand(_)) => break,
+                Some(_) => {}
+                None => panic!("connection closed before marker"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_client_state(&mut observed))
+            .await
+            .is_err()
+    );
+    connection
+        .guard
+        .disconnect(GoodbyeReason::Shutdown)
+        .await
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_artwork_activation_without_player_reports_latest_settings() {
+    artwork_activation_reports_latest_settings(None).await;
+}
+
+#[tokio::test]
+async fn test_artwork_activation_with_automatic_player_reports_latest_settings() {
+    artwork_activation_reports_latest_settings(Some(true)).await;
+}
+
+#[tokio::test]
+async fn test_artwork_activation_with_manual_player_reports_latest_settings() {
+    artwork_activation_reports_latest_settings(Some(false)).await;
+}
+
+async fn player_activation_preserves_reporting_contract(automatic: bool) {
+    let (url, mut observed, server_tx, server) =
+        start_server(Some(vec!["artwork@v1".into()])).await;
+    let client = ProtocolClientBuilder::builder()
+        .persistence(Arc::new(MemoryStore::default()))
+        .unpaired_access(true)
+        .name("Player activation".into())
+        .player_v1_support(player_support())
+        .initial_player_state(PlayerState {
+            volume: Some(50),
+            min_buffer_ms: Some(120),
+            ..Default::default()
+        })
+        .automatic_player_state(automatic)
+        .artwork_v1_support(ArtworkV1Support {
+            channels: vec![ArtworkChannel {
+                source: ArtworkSource::Album,
+                format: ImageFormat::Jpeg,
+                media_width: 256,
+                media_height: 256,
+            }],
+        })
+        .build()
+        .connect(url)
+        .await
+        .unwrap();
+    let initial = next_client_state(&mut observed).await;
+    assert!(initial.artwork.is_some());
+    assert!(initial.player.is_none());
+    let mut connection = client.split();
+    for _ in 0..2 {
+        server_tx
+            .send(
+                serde_json::to_string(&Message::ServerActivate(ServerActivate {
+                    activities: vec![],
+                    active_roles: Some(vec!["artwork@v1".into(), "player@v1".into()]),
+                }))
+                .unwrap()
+                .into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match connection.messages.recv().await {
+                    Some(Message::ServerActivate(_)) => break,
+                    Some(_) => {}
+                    None => panic!("connection closed before activation"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if !automatic {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(50),
+                next_client_state(&mut observed)
+            )
+            .await
+            .is_err());
+            connection
+                .sender
+                .set_player_state(PlayerState {
+                    volume: Some(60),
+                    min_buffer_ms: Some(120),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let state = next_client_state(&mut observed).await;
+        assert!(state.artwork.is_none());
+        let player = state.player.unwrap();
+        assert_eq!(player.volume, Some(if automatic { 50 } else { 60 }));
+        assert_eq!(player.min_buffer_ms, Some(120));
+        server_tx
+            .send(
+                serde_json::to_string(&Message::ServerActivate(ServerActivate {
+                    activities: vec![],
+                    active_roles: Some(vec!["artwork@v1".into()]),
+                }))
+                .unwrap()
+                .into(),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match connection.messages.recv().await {
+                    Some(Message::ServerActivate(_)) => break,
+                    Some(_) => {}
+                    None => panic!("connection closed before role removal"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    connection
+        .guard
+        .disconnect(GoodbyeReason::Shutdown)
+        .await
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn test_player_activation_reports_retained_player_without_repeating_artwork() {
+    player_activation_preserves_reporting_contract(true).await;
+}
+
+#[tokio::test]
+async fn test_player_activation_with_manual_reporting_requires_application_state() {
+    player_activation_preserves_reporting_contract(false).await;
 }
 
 #[derive(Clone, Default)]

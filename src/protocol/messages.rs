@@ -517,7 +517,7 @@ pub struct ClientState {
 }
 
 /// Requested artwork channel configurations in `client/state`.
-#[derive(Debug, Default,Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtworkClientState {
     /// Positional channel configurations, from channel 0 (1-4 entries).
     pub channels: Vec<ArtworkChannelState>,
