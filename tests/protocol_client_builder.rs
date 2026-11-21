@@ -4,11 +4,13 @@ use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkSource, ArtworkV1Support, AudioFormatSpec, ImageFormat, PlayerState,
     PlayerV1Support, VisualizerDataType, VisualizerV1Support,
 };
+use sendspin::MemoryStore;
+use std::sync::Arc;
 
 #[test]
 fn test_supported_roles_with_player_v1_support() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -28,7 +30,7 @@ fn test_supported_roles_with_player_v1_support() {
 #[test]
 fn test_supported_roles_with_artwork_v1_support() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .artwork_v1_support(ArtworkV1Support {
             channels: vec![ArtworkChannel {
@@ -46,7 +48,7 @@ fn test_supported_roles_with_artwork_v1_support() {
 #[test]
 fn test_supported_roles_with_metadata_role() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .metadata()
         .build();
@@ -58,7 +60,7 @@ fn test_supported_roles_with_metadata_role() {
 #[test]
 fn test_supported_roles_with_metadata_and_artwork() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .metadata()
         .artwork_v1_support(ArtworkV1Support {
@@ -78,7 +80,7 @@ fn test_supported_roles_with_metadata_and_artwork() {
 #[test]
 fn test_supported_roles_with_visualizer_v1_support() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .visualizer_v1_support(VisualizerV1Support {
             types: vec![VisualizerDataType::Spectrum],
@@ -94,7 +96,7 @@ fn test_supported_roles_with_visualizer_v1_support() {
 #[test]
 fn test_supported_roles_with_multiple_supports() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .player_v1_support(PlayerV1Support {
             supported_formats: vec![AudioFormatSpec {
@@ -133,7 +135,7 @@ fn test_supported_roles_with_multiple_supports() {
 async fn test_advertised_player_commands_require_initial_values() {
     let builder = |state: PlayerState| {
         ProtocolClientBuilder::builder()
-            .client_id("test".to_string())
+            .persistence(Arc::new(MemoryStore::new()))
             .name("Test Client".to_string())
             .player_v1_support(PlayerV1Support {
                 supported_formats: vec![],
@@ -168,7 +170,7 @@ async fn test_advertised_player_commands_require_initial_values() {
 #[tokio::test]
 async fn test_builder_without_roles_is_rejected() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .build();
     assert!(builder.supported_roles().is_empty());
@@ -192,7 +194,7 @@ fn test_explicit_player_support_is_preserved() {
     };
 
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .player_v1_support(custom_support.clone())
         .build();
@@ -207,7 +209,7 @@ fn test_explicit_player_support_is_preserved() {
 #[test]
 fn test_controller_role_added_to_supported_roles() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .controller()
         .build();
@@ -218,7 +220,7 @@ fn test_controller_role_added_to_supported_roles() {
 #[test]
 fn test_controller_role_not_present_by_default() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .build();
 
@@ -230,7 +232,7 @@ fn test_controller_role_not_present_by_default() {
 #[test]
 fn test_color_role_added_to_supported_roles() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .color()
         .build();
@@ -242,7 +244,7 @@ fn test_color_role_added_to_supported_roles() {
 #[test]
 fn test_color_role_not_present_by_default() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .build();
 
@@ -252,7 +254,7 @@ fn test_color_role_not_present_by_default() {
 #[test]
 fn test_color_role_combines_with_other_roles() {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
         .name("Test Client".to_string())
         .metadata()
         .color()

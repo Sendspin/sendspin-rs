@@ -1,13 +1,18 @@
 // ABOUTME: Builder exposed for public usage of the library
 
 use crate::error::Error;
+use crate::protocol::client::ConnectParams;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ArtworkV1Support, ClientHello, ClientState, ClientSyncState, DeviceInfo, PlayerState,
-    PlayerV1Support, VisualizerV1Support,
+    ArtworkChannelState, ArtworkClientState, ArtworkSource, ArtworkStateFormat, ArtworkV1Support,
+    ClientHello, ClientState, ClientSyncState, DeviceInfo, ImageFormat, PlayerState,
+    PlayerV1Support, SupportedPairMethods, UnpairedAccess, VisualizerV1Support,
 };
+use crate::protocol::noise::Identity;
+use crate::protocol::persistence::PersistenceProvider;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, ToSocketAddrs};
@@ -18,7 +23,7 @@ use typed_builder::TypedBuilder;
 /// Intermediate builder struct before finalization
 #[derive(Clone)]
 pub(crate) struct ProtocolClientBuilderRaw {
-    client_id: String,
+    persistence: Arc<dyn PersistenceProvider>,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
@@ -30,6 +35,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     automatic_player_state: bool,
+    unpaired_access: bool,
     metadata: bool,
     controller: bool,
     color: bool,
@@ -59,7 +65,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
 
         ProtocolClientBuilder {
-            client_id: raw.client_id,
+            persistence: raw.persistence,
+            identity: Arc::new(Mutex::new(None)),
             name: raw.name,
             product_name: raw.product_name,
             manufacturer: raw.manufacturer,
@@ -73,6 +80,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             initial_sync_state: raw.initial_sync_state,
             initial_player_state: raw.initial_player_state,
             automatic_player_state: raw.automatic_player_state,
+            unpaired_access: raw.unpaired_access,
         }
     }
 }
@@ -81,7 +89,8 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
 #[builder(build_method(into = ProtocolClientBuilder))]
 /// Builder Class for ProtocolClient
 pub struct ProtocolClientBuilderFields {
-    client_id: String,
+    /// Storage for the client's identity key, which must survive restarts.
+    persistence: Arc<dyn PersistenceProvider>,
     name: String,
     #[builder(default = None)]
     product_name: Option<String>,
@@ -105,8 +114,13 @@ pub struct ProtocolClientBuilderFields {
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
     /// Automatically report successful player control changes as client/state updates.
+    /// Without it, the app sends the player state when `player@v1` becomes active.
     #[builder(default = true)]
     automatic_player_state: bool,
+    /// Admit servers without a pairing record to activate roles and play.
+    /// Any device on the network can then act as a server for this client.
+    #[builder(default = false)]
+    unpaired_access: bool,
     #[builder(default = false, setter(transform = || true))]
     metadata: bool,
     #[builder(default = false, setter(transform = || true))]
@@ -118,7 +132,7 @@ pub struct ProtocolClientBuilderFields {
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
     fn from(fields: ProtocolClientBuilderFields) -> Self {
         let raw = ProtocolClientBuilderRaw {
-            client_id: fields.client_id,
+            persistence: fields.persistence,
             name: fields.name,
             product_name: fields.product_name,
             manufacturer: fields.manufacturer,
@@ -130,6 +144,7 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             initial_sync_state: fields.initial_sync_state,
             initial_player_state: fields.initial_player_state,
             automatic_player_state: fields.automatic_player_state,
+            unpaired_access: fields.unpaired_access,
             metadata: fields.metadata,
             controller: fields.controller,
             color: fields.color,
@@ -141,7 +156,10 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
 /// Builder Class for ProtocolClient
 #[derive(Clone)]
 pub struct ProtocolClientBuilder {
-    client_id: String,
+    persistence: Arc<dyn PersistenceProvider>,
+    /// Loaded on first use and shared by clones, so concurrent connections
+    /// never generate competing keys.
+    identity: Arc<Mutex<Option<Identity>>>,
     name: String,
     product_name: Option<String>,
     manufacturer: Option<String>,
@@ -154,6 +172,7 @@ pub struct ProtocolClientBuilder {
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
     automatic_player_state: bool,
+    unpaired_access: bool,
     clock: Arc<dyn Clock>,
 }
 
@@ -194,36 +213,29 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
-        ProtocolClient::connect(request, hello, initial_state, clock, automatic_player_state).await
+        ProtocolClient::connect(request, self.into_params()?).await
     }
 
-    /// Adopt an already-handshaked WebSocket stream and drive the protocol
-    /// from `client/hello` onwards.
+    /// Adopt an already-upgraded WebSocket stream and drive the protocol
+    /// from `client/init` onwards.
     ///
     /// Use this when you're terminating TLS, routing by HTTP path, or
     /// otherwise need to own the WebSocket layer yourself. For the common
     /// "bind a TCP socket and accept inbound peers" case, use
-    /// [`Self::listen`].
+    /// [`Self::listen`]. The caller must reject upgrades carrying an
+    /// `Origin` header, as [`ProtocolListener`] does.
     pub async fn accept<S>(self, ws_stream: WebSocketStream<S>) -> Result<ProtocolClient, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (hello, initial_state, clock, automatic_player_state) = self.into_parts()?;
-        ProtocolClient::drive(
-            ws_stream,
-            hello,
-            initial_state,
-            clock,
-            automatic_player_state,
-        )
-        .await
+        ProtocolClient::drive(ws_stream, self.into_params()?).await
     }
 
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts
     /// inbound WebSocket peers. The builder is cloned per accepted peer.
     pub async fn listen<A: ToSocketAddrs>(self, addr: A) -> Result<ProtocolListener, Error> {
         self.validate()?;
+        self.identity()?;
         let tcp = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Connection(format!("TCP bind failed: {e}")))?;
@@ -260,12 +272,55 @@ impl ProtocolClientBuilder {
         Ok(())
     }
 
-    fn into_parts(self) -> Result<(ClientHello, ClientState, Arc<dyn Clock>, bool), Error> {
+    fn identity(&self) -> Result<Identity, Error> {
+        let mut identity = self.identity.lock();
+        if identity.is_none() {
+            *identity = Some(Identity::load_or_create(self.persistence.as_ref())?);
+        }
+        Ok(identity.clone().expect("loaded above"))
+    }
+
+    fn into_params(self) -> Result<ConnectParams, Error> {
         self.validate()?;
+        let artwork = self
+            .artwork_v1_support
+            .as_ref()
+            .map(|support| {
+                if !(1..=4).contains(&support.channels.len()) {
+                    return Err(Error::Protocol("artwork requires 1-4 channels".into()));
+                }
+                let channels = support
+                    .channels
+                    .iter()
+                    .map(|channel| {
+                        let enabled = channel.source != ArtworkSource::None;
+                        let format = if enabled {
+                            Some(match channel.format {
+                                ImageFormat::Jpeg => ArtworkStateFormat::Jpeg,
+                                ImageFormat::Png => ArtworkStateFormat::Png,
+                                ImageFormat::Bmp => {
+                                    return Err(Error::Protocol(
+                                        "artwork state supports only jpeg and png".into(),
+                                    ))
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(ArtworkChannelState {
+                            source: channel.source.clone(),
+                            format,
+                            width: enabled.then_some(channel.media_width),
+                            height: enabled.then_some(channel.media_height),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, Error>>()?;
+                Ok(ArtworkClientState { channels })
+            })
+            .transpose()?;
+        let identity = self.identity()?;
         let hello = ClientHello {
-            client_id: self.client_id,
             name: self.name,
-            version: 1,
             supported_roles: self.supported_roles,
             device_info: Some(DeviceInfo {
                 product_name: self.product_name,
@@ -276,18 +331,111 @@ impl ProtocolClientBuilder {
             player_v1_support: self.player_v1_support,
             artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
+            supported_pair_methods: SupportedPairMethods::default(),
+            unpaired_access: UnpairedAccess {
+                enabled: self.unpaired_access,
+            },
         };
 
         let initial_state = ClientState {
             state: Some(self.initial_sync_state),
             player: self.initial_player_state,
+            artwork,
         };
 
-        Ok((
+        Ok(ConnectParams {
+            identity,
             hello,
             initial_state,
-            self.clock,
-            self.automatic_player_state,
-        ))
+            clock: self.clock,
+            automatic_player_state: self.automatic_player_state,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::messages::ArtworkChannel;
+    use crate::protocol::persistence::MemoryStore;
+
+    #[test]
+    fn initial_artwork_state_uses_channel_dimensions_and_omits_disabled_fields() {
+        let builder = ProtocolClientBuilder::builder()
+            .persistence(Arc::new(MemoryStore::default()))
+            .name("Artwork".into())
+            .artwork_v1_support(ArtworkV1Support {
+                channels: vec![
+                    ArtworkChannel {
+                        source: ArtworkSource::Album,
+                        format: ImageFormat::Png,
+                        media_width: 320,
+                        media_height: 240,
+                    },
+                    ArtworkChannel {
+                        source: ArtworkSource::None,
+                        format: ImageFormat::Bmp,
+                        media_width: 0,
+                        media_height: 0,
+                    },
+                ],
+            })
+            .build();
+        let params = builder.into_params().unwrap();
+        let value = serde_json::to_value(&params.initial_state).unwrap();
+        assert_eq!(
+            value["artwork"],
+            serde_json::json!({"channels": [
+                {"source": "album", "format": "png", "width": 320, "height": 240},
+                {"source": "none"}
+            ]})
+        );
+        assert_eq!(
+            params.hello.artwork_v1_support.unwrap().channels[0].media_width,
+            320
+        );
+        let parsed: ClientState = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.artwork, params.initial_state.artwork);
+    }
+
+    #[test]
+    fn initial_artwork_state_rejects_invalid_channel_counts_and_enabled_bmp() {
+        for (count, format) in [
+            (0, ImageFormat::Jpeg),
+            (5, ImageFormat::Jpeg),
+            (1, ImageFormat::Bmp),
+        ] {
+            let builder = ProtocolClientBuilder::builder()
+                .persistence(Arc::new(MemoryStore::default()))
+                .name("Artwork".into())
+                .artwork_v1_support(ArtworkV1Support {
+                    channels: vec![
+                        ArtworkChannel {
+                            source: ArtworkSource::Album,
+                            format,
+                            media_width: 256,
+                            media_height: 256,
+                        };
+                        count
+                    ],
+                })
+                .build();
+            assert!(matches!(builder.into_params(), Err(Error::Protocol(_))));
+        }
+    }
+
+    #[test]
+    fn initial_state_omits_artwork_without_artwork_support() {
+        let builder = ProtocolClientBuilder::builder()
+            .persistence(Arc::new(MemoryStore::default()))
+            .name("Metadata".into())
+            .metadata()
+            .build();
+        let params = builder.into_params().unwrap();
+        assert!(params.initial_state.artwork.is_none());
+        assert!(serde_json::to_value(params.initial_state)
+            .unwrap()
+            .get("artwork")
+            .is_none());
     }
 }

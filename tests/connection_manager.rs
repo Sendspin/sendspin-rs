@@ -1,15 +1,17 @@
 // ABOUTME: Integration tests for ConnectionManager — concurrent inbound
 // ABOUTME: handshakes, multi-server arbitration, and automatic goodbyes.
 
-use futures_util::{SinkExt, StreamExt};
+mod common;
+
+use common::{server_id, TestServer};
 use sendspin::audio::decode::{Decoder, PcmDecoder};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, OutputError, PlayerEvent, PlayerOutput};
 use sendspin::protocol::client::binary_types;
 use sendspin::protocol::manager::{ConnectionManager, ManagerConfig};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, ConnectionReason, GoodbyeReason, Message, PlayerV1Support, ServerHello,
+    Activity, AudioFormatSpec, GoodbyeReason, Message, PlayerV1Support,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{MemoryStore, ProtocolClientBuilder};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -65,79 +67,37 @@ fn player_support() -> PlayerV1Support {
     }
 }
 
-/// A test protocol-server: dials the manager's listener, answers
-/// `client/hello` with a `server/hello` carrying the given identity, and
-/// forwards every subsequent text frame to `messages`.
+/// A test protocol-server: dials the manager's listener, activates the
+/// player role as the server called `name`, and forwards every later client
+/// message except `client/time` to `messages`.
 struct Peer {
     messages: tokio::sync::mpsc::UnboundedReceiver<String>,
-    /// Send raw frames to the client, including role hello/state traffic.
+    /// Send frames to the client, including role hello/state traffic.
     writer: tokio::sync::mpsc::UnboundedSender<WsMessage>,
-    _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-async fn connect_peer(url: &str, server_id: &str, reason: ConnectionReason) -> Peer {
+async fn connect_peer(url: &str, name: &str, activities: Vec<Activity>) -> Peer {
     let (ws, _) = timeout(Duration::from_secs(5), connect_async(url))
         .await
         .expect("peer establishment timed out")
         .expect("WS connect failed");
-    let (mut write, mut read) = ws.split();
-
-    let hello_text = match read.next().await.expect("no hello").expect("ws error") {
-        WsMessage::Text(t) => t,
-        other => panic!("expected text client/hello, got {other:?}"),
-    };
-    let parsed: Message = serde_json::from_str(&hello_text).expect("client/hello must deserialize");
-    assert!(
-        matches!(parsed, Message::ClientHello(_)),
-        "first message should be client/hello"
-    );
-
-    let server_hello = serde_json::to_string(&Message::ServerHello(ServerHello {
-        server_id: server_id.to_string(),
-        name: format!("{server_id} name"),
-        version: 1,
-        active_roles: vec!["player@v1".to_string()],
-        connection_reason: reason,
-    }))
-    .unwrap();
-    write
-        .send(WsMessage::Text(server_hello.into()))
-        .await
-        .expect("send server/hello");
-
+    let (mut server, _) = TestServer::handshake_as(ws, name).await;
+    server
+        .activate_with(activities, vec!["player@v1".to_string()])
+        .await;
     let (msg_tx, msg_rx) = tokio::sync::mpsc::unbounded_channel();
-    let reader = tokio::spawn(async move {
-        while let Some(Ok(msg)) = read.next().await {
-            let text = match msg {
-                WsMessage::Text(t) => t,
-                WsMessage::Close(_) => break,
-                _ => continue,
-            };
-            if msg_tx.send(text.to_string()).is_err() {
-                break;
-            }
-        }
-    });
-
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
-    let writer = tokio::spawn(async move {
-        while let Some(frame) = out_rx.recv().await {
-            if write.send(frame).await.is_err() {
-                break;
-            }
-        }
-    });
-
+    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(server.serve(msg_tx, out_rx));
     Peer {
         messages: msg_rx,
         writer: out_tx,
-        _tasks: vec![reader, writer],
     }
 }
 
 async fn manager(config: Option<ManagerConfig>) -> (String, ConnectionManager) {
     let builder = ProtocolClientBuilder::builder()
-        .client_id("test-managed-client".to_string())
+        .persistence(Arc::new(MemoryStore::new()))
+        .unpaired_access(true)
         .name("Managed Client".to_string())
         .player_v1_support(player_support())
         .build();
@@ -199,7 +159,7 @@ async fn expect_channels_close(conn: &mut sendspin::ManagedConnection) {
 #[tokio::test]
 async fn manager_role_session_handoff_and_displacement_fences_audio() {
     let (url, mut mgr) = manager(None).await;
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .unwrap()
@@ -258,7 +218,7 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
         }
         other => panic!("expected audio event, got {other:?}"),
     };
-    let peer_b = connect_peer(&url, "server-b", ConnectionReason::Playback).await;
+    let peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -370,29 +330,26 @@ async fn manager_role_session_handoff_and_displacement_fences_audio() {
 async fn test_first_server_is_promoted() {
     let (url, mut mgr) = manager(None).await;
 
-    let _peer = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let _peer = connect_peer(&url, "server-a", vec![]).await;
 
     let conn = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn.server_hello.server_id, "server-a");
-    assert_eq!(
-        conn.server_hello.connection_reason,
-        ConnectionReason::Discovery
-    );
+    assert_eq!(conn.server_id, server_id("server-a"));
+    assert!(conn.activation.activities.is_empty());
     assert!(conn.peer.ip().is_loopback());
 }
 
 #[tokio::test]
-async fn test_playback_displaces_discovery_incumbent() {
+async fn test_playback_displaces_idle_incumbent() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let _peer_b = connect_peer(&url, "server-b", ConnectionReason::Playback).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
 
     // The displaced incumbent gets an automatic goodbye(another_server)...
     assert_eq!(
@@ -406,20 +363,20 @@ async fn test_playback_displaces_discovery_incumbent() {
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn_b.server_hello.server_id, "server-b");
+    assert_eq!(conn_b.server_id, server_id("server-b"));
 }
 
 #[tokio::test]
-async fn test_discovery_never_displaces_playback() {
+async fn test_idle_never_displaces_playback() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
     // Even the last-played server cannot displace active playback.
-    mgr.set_last_played(Some("server-b".to_string()));
-    let mut peer_b = connect_peer(&url, "server-b", ConnectionReason::Discovery).await;
+    mgr.set_last_played(Some(server_id("server-b")));
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
 
     // The rejected newcomer gets the goodbye; the incumbent stays quiet.
     assert_eq!(
@@ -430,15 +387,15 @@ async fn test_discovery_never_displaces_playback() {
 }
 
 #[tokio::test]
-async fn test_last_played_breaks_discovery_tie() {
+async fn test_last_played_breaks_idle_tie() {
     let (url, mut mgr) = manager(None).await;
-    mgr.set_last_played(Some("server-b".to_string()));
+    mgr.set_last_played(Some(server_id("server-b")));
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let _peer_b = connect_peer(&url, "server-b", ConnectionReason::Discovery).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -447,18 +404,18 @@ async fn test_last_played_breaks_discovery_tie() {
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn_b.server_hello.server_id, "server-b");
+    assert_eq!(conn_b.server_id, server_id("server-b"));
 }
 
 #[tokio::test]
-async fn test_discovery_tie_defaults_to_keep() {
+async fn test_idle_tie_defaults_to_keep() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
-    let mut peer_b = connect_peer(&url, "server-b", ConnectionReason::Discovery).await;
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
     assert_eq!(
         expect_goodbye(&mut peer_b).await,
         GoodbyeReason::AnotherServer
@@ -470,22 +427,22 @@ async fn test_discovery_tie_defaults_to_keep() {
 async fn test_incumbent_death_frees_slot() {
     let (url, mut mgr) = manager(None).await;
 
-    let peer_a = connect_peer(&url, "server-a", ConnectionReason::Discovery).await;
+    let peer_a = connect_peer(&url, "server-a", vec![]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
     // Server A goes away (socket closed, no goodbye exchange).
     drop(peer_a);
     expect_channels_close(&mut conn_a).await;
 
-    // A plain discovery connection (not last-played) must now be promoted:
+    // A plain idle connection (not last-played) must now be promoted:
     // the dead incumbent may no longer win arbitration.
-    let mut peer_b = connect_peer(&url, "server-b", ConnectionReason::Discovery).await;
+    let mut peer_b = connect_peer(&url, "server-b", vec![]).await;
     let conn_b = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn_b.server_hello.server_id, "server-b");
+    assert_eq!(conn_b.server_id, server_id("server-b"));
     assert_no_goodbye(&mut peer_b, Duration::from_millis(300)).await;
 }
 
@@ -498,7 +455,7 @@ async fn test_disconnect_sends_goodbye_and_keeps_listening() {
         .await
         .expect("no-op disconnect");
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let mut conn_a = mgr.next_connection().await.expect("manager stopped");
 
     mgr.disconnect(GoodbyeReason::UserRequest)
@@ -511,24 +468,24 @@ async fn test_disconnect_sends_goodbye_and_keeps_listening() {
     expect_channels_close(&mut conn_a).await;
 
     // The manager keeps listening: a new server can still connect.
-    let _peer_b = connect_peer(&url, "server-b", ConnectionReason::Discovery).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![]).await;
     let conn_b = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn_b.server_hello.server_id, "server-b");
+    assert_eq!(conn_b.server_id, server_id("server-b"));
 }
 
 #[tokio::test]
 async fn test_playback_displaces_playback() {
     let (url, mut mgr) = manager(None).await;
 
-    let mut peer_a = connect_peer(&url, "server-a", ConnectionReason::Playback).await;
+    let mut peer_a = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn_a = mgr.next_connection().await.expect("manager stopped");
-    assert_eq!(conn_a.server_hello.server_id, "server-a");
+    assert_eq!(conn_a.server_id, server_id("server-a"));
 
     // Newest playback intent wins even against a playback incumbent.
-    let _peer_b = connect_peer(&url, "server-b", ConnectionReason::Playback).await;
+    let _peer_b = connect_peer(&url, "server-b", vec![Activity::Playback]).await;
     assert_eq!(
         expect_goodbye(&mut peer_a).await,
         GoodbyeReason::AnotherServer
@@ -537,7 +494,7 @@ async fn test_playback_displaces_playback() {
         .await
         .expect("next_connection timed out")
         .expect("manager stopped");
-    assert_eq!(conn_b.server_hello.server_id, "server-b");
+    assert_eq!(conn_b.server_id, server_id("server-b"));
 }
 
 #[tokio::test]
@@ -600,12 +557,12 @@ async fn test_stalled_handshake_is_reaped_and_frees_slot() {
 
     // A real server connecting behind it must still establish once the
     // stalled peer is reaped at the deadline.
-    let _peer = connect_peer(&url, "server-a", ConnectionReason::Playback).await;
+    let _peer = connect_peer(&url, "server-a", vec![Activity::Playback]).await;
     let conn = timeout(Duration::from_secs(5), mgr.next_connection())
         .await
         .expect("next_connection timed out — stalled peer was never reaped")
         .expect("manager stopped");
-    assert_eq!(conn.server_hello.server_id, "server-a");
+    assert_eq!(conn.server_id, server_id("server-a"));
 
     drop(stalled);
 }

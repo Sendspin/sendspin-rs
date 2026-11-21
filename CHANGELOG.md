@@ -15,12 +15,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking builder:** a player that advertises the `volume` or `mute` command must set the matching `volume` or `muted` field in its initial player state, otherwise it fails to connect, accept, or listen.
 - Automatic player-state reporting is enabled only with the player role and an initial player-state object; applications can disable it and use explicit partial updates or raw client-state transitions.
 - **Breaking:** `CorrectionPlanner::with_max_speed_correction` is removed. The planner now always caps speed corrections below the spec's 0.5%.
+- **Breaking protocol:** the client speaks Sendspin rc1 only. It sends `client/init`, runs the Noise handshake, encrypts every later message, and uses no role until the server sends `server/activate`. Servers that speak the earlier protocol can no longer connect.
+- **Breaking builder:** `persistence` replaces `client_id`. It stores the client's identity key, which the `client_id` is derived from, so it must survive restarts.
+- **Breaking API:** `ServerHello` carries only `name` and `languages`. `ProtocolClient` and `Connection` expose the server's `server_id` and its first `activation`, and later activations arrive as `Message::ServerActivate` with `active_roles` filled in.
+- **Breaking API:** `Connection::controller` is always present, and its commands fail while `controller@v1` is not active.
+- **Breaking API:** `should_switch` compares activations instead of connection reasons: a server with the `playback` activity wins, an idle server loses to a playing one, and between idle servers the last-played one wins. `ConnectionReason` is removed.
+- With the player role active, the first `client/state` waits until the clock is synchronized.
+- When the server removes a role, the client ends that role's stream.
+- `ProtocolListener` rejects WebSocket upgrades that carry an `Origin` header.
 
 ### Added
 
+- Initial `client/state` includes artwork channel settings derived from `artwork@v1_support` while the artwork role is active. Enabled channels require JPEG or PNG; artwork configurations require 1-4 channels.
+- Later artwork activation and reactivation report the latest artwork channel settings, independently of automatic player reporting. Omitting artwork from other state updates leaves the retained settings unchanged.
 - Added `StreamDecoder` for selecting and validating PCM, Opus, and FLAC decoders from each stream configuration.
 - Added explicit output contracts for player, artwork, and visualizer role sessions, with retained controls and lifecycle status.
 - Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
+- Added `FileStore` and `MemoryStore` implementations of the new `PersistenceProvider` trait.
+- Added the `unpaired_access` builder option, off by default, which lets servers the client is not paired with activate roles and play.
+- `client/hello` now carries the required `supported_pair_methods` field, offering `pairing_psk` as the spec-mandated minimum. Method descriptors for `static_pairing_code` and `dynamic_pairing_code` are typed but not yet advertised.
+
+### Removed
+
+- **Breaking:** removed `ProtocolListener::tls` and the `secure_socket` example. Outgoing `wss://` connections still work with the `native-tls` feature.
 
 ## [0.3.8](https://github.com/Sendspin/sendspin-rs/compare/v0.3.7...v0.3.8) - 2026-10-15
 

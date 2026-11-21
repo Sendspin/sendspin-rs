@@ -6,7 +6,7 @@ use crate::error::Error;
 use crate::protocol::client::{Connection, ConnectionGuard, Controller, WsSender};
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
-    ConnectionReason, GoodbyeReason, Message, PlayerState, ServerHello,
+    Activity, GoodbyeReason, Message, PlayerState, ServerActivate, ServerHello,
 };
 use crate::roles::{ArtworkReceiver, VisualizerReceiver};
 use crate::sync::ClockSync;
@@ -18,25 +18,26 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
-/// The spec's multi-server arbitration rule: should the newly established
-/// `candidate` displace the `current` server?
+/// The multi-server arbitration rule: should the newly activated server
+/// `candidate_server_id` displace the `current` server?
+/// Each side is judged by the activities of its first `server/activate`.
 ///
 /// [`ConnectionManager`] applies this automatically; it is public so
 /// applications running their own [`ProtocolListener::accept`] loop can make
 /// the identical decision.
 pub fn should_switch(
-    current: &ServerHello,
-    candidate: &ServerHello,
+    current: &ServerActivate,
+    candidate: &ServerActivate,
+    candidate_server_id: &str,
     last_played: Option<&str>,
 ) -> bool {
+    let plays = |activation: &ServerActivate| activation.activities.contains(&Activity::Playback);
     // Matched as (candidate, current) — reverse of the parameter order —
     // so the new server reads first in each arm.
-    match (&candidate.connection_reason, &current.connection_reason) {
-        (ConnectionReason::Playback, _) => true,
-        (ConnectionReason::Discovery, ConnectionReason::Playback) => false,
-        (ConnectionReason::Discovery, ConnectionReason::Discovery) => {
-            matches!(last_played, Some(lp) if candidate.server_id == lp)
-        }
+    match (plays(candidate), plays(current)) {
+        (true, _) => true,
+        (false, true) => false,
+        (false, false) => last_played == Some(candidate_server_id),
     }
 }
 
@@ -52,8 +53,8 @@ pub const DEFAULT_GOODBYE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tuning for [`ConnectionManager`].
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
-    /// Deadline for an inbound connection to complete TLS + WebSocket +
-    /// protocol handshake, measured from TCP accept. Peers that stall are
+    /// Deadline for an inbound connection to complete the WebSocket and
+    /// protocol handshakes, measured from TCP accept. Peers that stall are
     /// dropped. Default: [`DEFAULT_ESTABLISH_TIMEOUT`].
     pub establish_timeout: Duration,
     /// Maximum number of inbound connections concurrently working through
@@ -99,10 +100,14 @@ pub struct ManagedConnection {
     pub clock_sync: Arc<Mutex<ClockSync>>,
     /// Sender for writing messages to the server.
     pub sender: WsSender,
-    /// Controller handle, if the server granted the `controller@v1` role.
-    pub controller: Option<Controller>,
-    /// The `server/hello` received during handshake.
+    /// Controller handle. Its commands fail while `controller@v1` is not active.
+    pub controller: Controller,
+    /// The server's `server_id` from `server/init`, its static public key.
+    pub server_id: String,
+    /// The `server/hello` received during the handshake.
     pub server_hello: ServerHello,
+    /// The first `server/activate`. Later activations arrive on `messages`.
+    pub activation: ServerActivate,
     /// Peer address of the winning connection.
     pub peer: SocketAddr,
 }
@@ -129,7 +134,8 @@ enum Command {
 /// the application is still consuming.
 struct Incumbent {
     guard: ConnectionGuard,
-    server_hello: ServerHello,
+    server_id: String,
+    activation: ServerActivate,
     peer: SocketAddr,
 }
 
@@ -158,11 +164,12 @@ struct Incumbent {
 /// shutdown.
 ///
 /// ```no_run
-/// # use sendspin::{ConnectionManager, ProtocolClientBuilder};
+/// # use sendspin::{ConnectionManager, FileStore, ProtocolClientBuilder};
+/// # use std::sync::Arc;
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// # let player_support: sendspin::protocol::messages::PlayerV1Support = todo!();
 /// let listener = ProtocolClientBuilder::builder()
-///     .client_id(uuid::Uuid::new_v4().to_string())
+///     .persistence(Arc::new(FileStore::new("/var/lib/kitchen-speaker")))
 ///     .name("Kitchen Speaker".to_string())
 ///     .player_v1_support(player_support)
 ///     .build()
@@ -237,7 +244,7 @@ impl ConnectionManager {
     }
 
     /// Set (or clear, with `None`) the last-played server ID used to break
-    /// ties between two `discovery` connections. Persisting this across runs
+    /// ties between two idle connections. Persisting this across runs
     /// is the application's responsibility.
     pub fn set_last_played(&self, server_id: Option<String>) {
         // Send failure means the driver is gone; arbitration is moot then.
@@ -380,7 +387,7 @@ async fn driver(
                 let inc = current.take().expect("closed() only fires with an incumbent");
                 log::info!(
                     "Server {} ({}) disconnected; awaiting next server",
-                    inc.server_hello.server_id,
+                    inc.server_id,
                     inc.peer
                 );
             }
@@ -455,17 +462,22 @@ fn arbitrate(
         let dead = current.take().expect("checked Some above");
         log::info!(
             "Server {} ({}) already disconnected; arbitration proceeds without it",
-            dead.server_hello.server_id,
+            dead.server_id,
             dead.peer
         );
     }
 
     if let Some(inc) = current.as_ref() {
-        if !should_switch(&inc.server_hello, &conn.server_hello, last_played) {
+        if !should_switch(
+            &inc.activation,
+            &conn.activation,
+            &conn.server_id,
+            last_played,
+        ) {
             log::info!(
                 "Keeping server {} — rejecting {} ({peer}) with goodbye(another_server)",
-                inc.server_hello.server_id,
-                conn.server_hello.server_id,
+                inc.server_id,
+                conn.server_id,
             );
             // Spawned so a slow flush can't stall arbitration; dropping the
             // rest of `conn` closes its channels.
@@ -479,8 +491,8 @@ fn arbitrate(
         let displaced = current.take().expect("checked Some above");
         log::info!(
             "Switching {} -> {} — goodbye(another_server) to displaced server",
-            displaced.server_hello.server_id,
-            conn.server_hello.server_id,
+            displaced.server_id,
+            conn.server_id,
         );
         goodbyes.spawn(async move {
             let _ = flush_goodbye(
@@ -492,9 +504,9 @@ fn arbitrate(
         });
     } else {
         log::info!(
-            "Server {} ({peer}) connected (reason: {:?})",
-            conn.server_hello.server_id,
-            conn.server_hello.connection_reason,
+            "Server {} ({peer}) connected (activities: {:?})",
+            conn.server_id,
+            conn.activation.activities,
         );
     }
 
@@ -506,13 +518,16 @@ fn arbitrate(
         clock_sync,
         sender,
         controller,
+        server_id,
         server_hello,
+        activation,
         guard,
     } = conn;
 
     *current = Some(Incumbent {
         guard,
-        server_hello: server_hello.clone(),
+        server_id: server_id.clone(),
+        activation: activation.clone(),
         peer,
     });
 
@@ -526,7 +541,9 @@ fn arbitrate(
         clock_sync,
         sender,
         controller,
+        server_id,
         server_hello,
+        activation,
         peer,
     });
 }
@@ -535,13 +552,10 @@ fn arbitrate(
 mod tests {
     use super::*;
 
-    fn hello(server_id: &str, reason: ConnectionReason) -> ServerHello {
-        ServerHello {
-            server_id: server_id.to_string(),
-            name: format!("{server_id} name"),
-            version: 1,
-            active_roles: vec![],
-            connection_reason: reason,
+    fn activation(activities: &[Activity]) -> ServerActivate {
+        ServerActivate {
+            activities: activities.to_vec(),
+            active_roles: Some(vec![]),
         }
     }
 
@@ -549,42 +563,42 @@ mod tests {
 
     #[test]
     fn playback_candidate_always_wins() {
-        let current = hello("a", ConnectionReason::Playback);
-        let candidate = hello("b", ConnectionReason::Playback);
-        assert!(should_switch(&current, &candidate, None));
+        let current = activation(&[Activity::Playback]);
+        let candidate = activation(&[Activity::Playback]);
+        assert!(should_switch(&current, &candidate, "b", None));
 
-        let current = hello("a", ConnectionReason::Discovery);
-        assert!(should_switch(&current, &candidate, None));
+        let current = activation(&[]);
+        assert!(should_switch(&current, &candidate, "b", None));
 
         // Even when the incumbent is the last-played server.
-        assert!(should_switch(&current, &candidate, Some("a")));
+        assert!(should_switch(&current, &candidate, "b", Some("a")));
     }
 
     #[test]
-    fn discovery_never_displaces_playback() {
-        let current = hello("a", ConnectionReason::Playback);
-        let candidate = hello("b", ConnectionReason::Discovery);
-        assert!(!should_switch(&current, &candidate, None));
+    fn idle_never_displaces_playback() {
+        let current = activation(&[Activity::Playback]);
+        let candidate = activation(&[]);
+        assert!(!should_switch(&current, &candidate, "b", None));
         // Even when the candidate is the last-played server.
-        assert!(!should_switch(&current, &candidate, Some("b")));
+        assert!(!should_switch(&current, &candidate, "b", Some("b")));
     }
 
     #[test]
-    fn both_discovery_prefers_last_played() {
-        let current = hello("a", ConnectionReason::Discovery);
-        let candidate = hello("b", ConnectionReason::Discovery);
+    fn both_idle_prefers_last_played() {
+        let current = activation(&[]);
+        let candidate = activation(&[]);
 
-        assert!(should_switch(&current, &candidate, Some("b")));
-        assert!(!should_switch(&current, &candidate, Some("a")));
+        assert!(should_switch(&current, &candidate, "b", Some("b")));
+        assert!(!should_switch(&current, &candidate, "b", Some("a")));
     }
 
     #[test]
-    fn both_discovery_defaults_to_keep() {
-        let current = hello("a", ConnectionReason::Discovery);
-        let candidate = hello("b", ConnectionReason::Discovery);
+    fn both_idle_defaults_to_keep() {
+        let current = activation(&[]);
+        let candidate = activation(&[]);
 
-        assert!(!should_switch(&current, &candidate, None));
+        assert!(!should_switch(&current, &candidate, "b", None));
         // Last-played matches neither: keep.
-        assert!(!should_switch(&current, &candidate, Some("c")));
+        assert!(!should_switch(&current, &candidate, "b", Some("c")));
     }
 }
