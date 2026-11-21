@@ -5,7 +5,7 @@ use crate::protocol::client::ConnectParams;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, ClientHello, ClientState, ClientSyncState, DeviceInfo, PlayerState,
-    PlayerV1Support, UnpairedAccess, VisualizerV1Support,
+    PlayerV1Support, SupportedPairMethods, UnpairedAccess, VisualizerV1Support,
 };
 use crate::protocol::noise::Identity;
 use crate::protocol::persistence::PersistenceProvider;
@@ -294,6 +294,7 @@ impl ProtocolClientBuilder {
             player_v1_support: self.player_v1_support,
             artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
+            supported_pair_methods: SupportedPairMethods::default(),
             unpaired_access: UnpairedAccess {
                 enabled: self.unpaired_access,
             },

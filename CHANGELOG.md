@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `ControlUpdate`, `PlayerSession::update_controls`, and `PlayerSession::set_controls` for application- and hardware-originated local control updates.
 - Added `FileStore` and `MemoryStore` implementations of the new `PersistenceProvider` trait.
 - Added the `unpaired_access` builder option, off by default, which lets servers the client is not paired with activate roles and play.
+- `client/hello` now carries the required `supported_pair_methods` field, offering `pairing_psk` as the spec-mandated minimum. Method descriptors for `static_pairing_code` and `dynamic_pairing_code` are typed but not yet advertised.
 
 ### Removed
 
