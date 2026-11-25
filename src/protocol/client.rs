@@ -1064,7 +1064,11 @@ impl ConnectionGuard {
         }
 
         // Goodbye + close are flushed; tear the reader down now.
-        if let Some(h) = self.router_handle.take() {
+        // Wait a grace period before dropping the socket, to prevent
+        // a potential race where the goodbye frame is dropped before
+        // being processed.
+        if let Some(mut h) = self.router_handle.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut h).await;
             h.abort();
         }
 
