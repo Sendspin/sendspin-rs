@@ -1804,6 +1804,13 @@ mod tests {
                     assert!(synced_rx.try_recv().is_err());
                     assert_eq!(clock_sync.lock().rtt_micros(), None);
                 } else {
+                    if index == TIME_BURST_SIZE {
+                        assert!(!clock_sync.lock().is_synchronized());
+                        synced_rx.try_recv().expect(
+                            "synced must fire after the first accepted burst, \
+                             before full synchronization",
+                        );
+                    }
                     assert_eq!(clock_sync.lock().rtt_micros(), Some(100));
                 }
                 let rtt = if index % TIME_BURST_SIZE == 0 {
@@ -1825,10 +1832,6 @@ mod tests {
                     ))
                     .unwrap();
             }
-            (&mut synced_rx).await.unwrap();
-            // `synced` fires on the first accepted update; the second
-            // burst's update lands only when the task consumes the last
-            // reply. A new burst's first send proves that happened.
             let Some(WriteCommand::Send { msg, .. }) = commands.recv().await else {
                 panic!("expected the next client/time burst");
             };
