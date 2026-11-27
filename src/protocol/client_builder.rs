@@ -269,6 +269,9 @@ impl ProtocolClientBuilder {
                 ));
             }
         }
+        if let Some(support) = &self.artwork_v1_support {
+            artwork_client_state(support)?;
+        }
         Ok(())
     }
 
@@ -285,38 +288,7 @@ impl ProtocolClientBuilder {
         let artwork = self
             .artwork_v1_support
             .as_ref()
-            .map(|support| {
-                if !(1..=4).contains(&support.channels.len()) {
-                    return Err(Error::Protocol("artwork requires 1-4 channels".into()));
-                }
-                let channels = support
-                    .channels
-                    .iter()
-                    .map(|channel| {
-                        let enabled = channel.source != ArtworkSource::None;
-                        let format = if enabled {
-                            Some(match channel.format {
-                                ImageFormat::Jpeg => ArtworkStateFormat::Jpeg,
-                                ImageFormat::Png => ArtworkStateFormat::Png,
-                                ImageFormat::Bmp => {
-                                    return Err(Error::Protocol(
-                                        "artwork state supports only jpeg and png".into(),
-                                    ))
-                                }
-                            })
-                        } else {
-                            None
-                        };
-                        Ok(ArtworkChannelState {
-                            source: channel.source.clone(),
-                            format,
-                            width: enabled.then_some(channel.media_width),
-                            height: enabled.then_some(channel.media_height),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                Ok(ArtworkClientState { channels })
-            })
+            .map(artwork_client_state)
             .transpose()?;
         let identity = self.identity()?;
         let hello = ClientHello {
@@ -351,6 +323,43 @@ impl ProtocolClientBuilder {
             automatic_player_state: self.automatic_player_state,
         })
     }
+}
+
+/// Build the initial `client/state` artwork object from the hello support
+/// configuration, rejecting channel sets the state object cannot represent.
+/// `client/state` allows only jpeg and png, so BMP is valid solely on
+/// disabled (`none`) channels, where the format is not reported.
+fn artwork_client_state(support: &ArtworkV1Support) -> Result<ArtworkClientState, Error> {
+    if !(1..=4).contains(&support.channels.len()) {
+        return Err(Error::Protocol("artwork requires 1-4 channels".into()));
+    }
+    let channels = support
+        .channels
+        .iter()
+        .map(|channel| {
+            let enabled = channel.source != ArtworkSource::None;
+            let format = if enabled {
+                Some(match channel.format {
+                    ImageFormat::Jpeg => ArtworkStateFormat::Jpeg,
+                    ImageFormat::Png => ArtworkStateFormat::Png,
+                    ImageFormat::Bmp => {
+                        return Err(Error::Protocol(
+                            "artwork state supports only jpeg and png".into(),
+                        ))
+                    }
+                })
+            } else {
+                None
+            };
+            Ok(ArtworkChannelState {
+                source: channel.source.clone(),
+                format,
+                width: enabled.then_some(channel.media_width),
+                height: enabled.then_some(channel.media_height),
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(ArtworkClientState { channels })
 }
 
 #[cfg(test)]
@@ -398,6 +407,26 @@ mod tests {
         assert_eq!(parsed.artwork, params.initial_state.artwork);
     }
 
+    fn artwork_builder(channels: Vec<ArtworkChannel>) -> ProtocolClientBuilder {
+        ProtocolClientBuilder::builder()
+            .persistence(Arc::new(MemoryStore::default()))
+            .name("Artwork".into())
+            .artwork_v1_support(ArtworkV1Support { channels })
+            .build()
+    }
+
+    fn album_channels(count: usize, format: ImageFormat) -> Vec<ArtworkChannel> {
+        vec![
+            ArtworkChannel {
+                source: ArtworkSource::Album,
+                format,
+                media_width: 256,
+                media_height: 256,
+            };
+            count
+        ]
+    }
+
     #[test]
     fn initial_artwork_state_rejects_invalid_channel_counts_and_enabled_bmp() {
         for (count, format) in [
@@ -405,23 +434,41 @@ mod tests {
             (5, ImageFormat::Jpeg),
             (1, ImageFormat::Bmp),
         ] {
-            let builder = ProtocolClientBuilder::builder()
-                .persistence(Arc::new(MemoryStore::default()))
-                .name("Artwork".into())
-                .artwork_v1_support(ArtworkV1Support {
-                    channels: vec![
-                        ArtworkChannel {
-                            source: ArtworkSource::Album,
-                            format,
-                            media_width: 256,
-                            media_height: 256,
-                        };
-                        count
-                    ],
-                })
-                .build();
+            let builder = artwork_builder(album_channels(count, format.clone()));
             assert!(matches!(builder.into_params(), Err(Error::Protocol(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn listen_rejects_invalid_artwork_before_binding() {
+        for (count, format) in [
+            (0, ImageFormat::Jpeg),
+            (5, ImageFormat::Jpeg),
+            (1, ImageFormat::Bmp),
+        ] {
+            let builder = artwork_builder(album_channels(count, format.clone()));
+            assert!(
+                matches!(builder.listen("127.0.0.1:0").await, Err(Error::Protocol(_))),
+                "artwork with {count} {format:?} channels must fail listen() validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listen_accepts_four_channels_and_disabled_bmp_placeholder() {
+        let mut channels = album_channels(3, ImageFormat::Jpeg);
+        channels.push(ArtworkChannel {
+            source: ArtworkSource::None,
+            format: ImageFormat::Bmp,
+            media_width: 0,
+            media_height: 0,
+        });
+        let builder = artwork_builder(channels);
+        let listener = builder
+            .listen("127.0.0.1:0")
+            .await
+            .expect("four channels with a disabled BMP placeholder must validate");
+        drop(listener);
     }
 
     #[test]
