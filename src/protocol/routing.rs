@@ -361,9 +361,9 @@ mod tests {
         StreamArtworkConfig {
             channels: vec![StreamArtworkChannelConfig {
                 source: crate::protocol::messages::ArtworkSource::Album,
-                format: crate::protocol::messages::ImageFormat::Png,
-                width: 10,
-                height: 10,
+                format: Some(crate::protocol::messages::ImageFormat::Png),
+                width: Some(10),
+                height: Some(10),
             }],
         }
     }

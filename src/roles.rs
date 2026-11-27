@@ -703,9 +703,9 @@ mod tests {
         StreamArtworkConfig {
             channels: vec![StreamArtworkChannelConfig {
                 source: ArtworkSource::Album,
-                format: ImageFormat::Png,
-                width: 1,
-                height: 1,
+                format: Some(ImageFormat::Png),
+                width: Some(1),
+                height: Some(1),
             }],
         }
     }

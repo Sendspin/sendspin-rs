@@ -898,12 +898,15 @@ pub struct StreamArtworkConfig {
 pub struct StreamArtworkChannelConfig {
     /// Artwork source type
     pub source: ArtworkSource,
-    /// Format of the encoded image
-    pub format: ImageFormat,
-    /// Width in pixels of the encoded image
-    pub width: u32,
-    /// Height in pixels of the encoded image
-    pub height: u32,
+    /// Format of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ImageFormat>,
+    /// Width in pixels of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Height in pixels of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// Stream visualizer configuration.

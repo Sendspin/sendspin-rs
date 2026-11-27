@@ -520,6 +520,89 @@ async fn queued_codec_transition(first: Codec) {
 }
 
 #[tokio::test]
+async fn artwork_stream_update_with_disabled_channel_replaces_configuration() {
+    // aiosendspin omits format/width/height on a channel whose source is none,
+    // e.g. in the stream/start following a channel change. The update must
+    // reach the artwork role instead of being dropped as unparseable, which
+    // would leave the role running with its stale configuration.
+    let f = fixture().await;
+    let split = f.client.split();
+    let mut artwork = split.artwork.attach(Events::default());
+    f.server_tx
+        .send(
+            serde_json::json!({
+                "type": "stream/start",
+                "payload": {
+                    "artwork": {
+                        "channels": [
+                            { "source": "album", "format": "jpeg", "width": 800, "height": 800 },
+                            { "source": "artist", "format": "png", "width": 400, "height": 400 }
+                        ]
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        )
+        .unwrap();
+    let Some(ArtworkEvent::Start(initial)) = timeout(Duration::from_secs(5), artwork.recv())
+        .await
+        .expect("initial artwork stream/start was not delivered")
+    else {
+        panic!("expected initial artwork start");
+    };
+    assert_eq!(initial.channels[1].source, ArtworkSource::Artist);
+
+    f.server_tx
+        .send(
+            serde_json::json!({
+                "type": "stream/start",
+                "payload": {
+                    "artwork": {
+                        "channels": [
+                            { "source": "album", "format": "jpeg", "width": 800, "height": 800 },
+                            { "source": "none" }
+                        ]
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        )
+        .unwrap();
+    let Some(ArtworkEvent::Start(updated)) = timeout(Duration::from_secs(5), artwork.recv())
+        .await
+        .expect("artwork stream/start with a disabled channel was dropped")
+    else {
+        panic!("expected updated artwork start");
+    };
+    assert_eq!(updated.channels.len(), 2);
+    let enabled = &updated.channels[0];
+    assert_eq!(enabled.format, Some(ImageFormat::Jpeg));
+    assert_eq!(enabled.width, Some(800));
+    assert_eq!(enabled.height, Some(800));
+    let disabled = &updated.channels[1];
+    assert_eq!(disabled.source, ArtworkSource::None);
+    assert_eq!(disabled.format, None);
+    assert_eq!(disabled.width, None);
+    assert_eq!(disabled.height, None);
+
+    // The stream stays usable: artwork chunks after the update still decode.
+    f.server_tx
+        .send(WsMessage::Binary(
+            vec![binary_types::ARTWORK_CHANNEL_0, 0, 0, 0, 0, 0, 0, 0, 1, 7].into(),
+        ))
+        .unwrap();
+    match timeout(Duration::from_secs(5), artwork.recv())
+        .await
+        .expect("artwork chunk was not delivered after the stream update")
+    {
+        Some(ArtworkEvent::Data(work)) => assert_eq!(work.data(), &[7]),
+        _ => panic!("expected artwork data after the stream update"),
+    }
+}
+
+#[tokio::test]
 async fn queued_pcm_to_opus_decodes_in_order() {
     queued_codec_transition(Codec::Pcm).await;
 }
@@ -540,9 +623,9 @@ async fn artwork_and_visualizer_roles_stay_independent_without_player_stream() {
         artwork: Some(StreamArtworkConfig {
             channels: vec![StreamArtworkChannelConfig {
                 source: ArtworkSource::Album,
-                format: ImageFormat::Png,
-                width: 2,
-                height: 2,
+                format: Some(ImageFormat::Png),
+                width: Some(2),
+                height: Some(2),
             }],
         }),
         visualizer: Some(StreamVisualizerConfig {

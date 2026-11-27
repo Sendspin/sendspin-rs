@@ -1132,9 +1132,9 @@ fn test_stream_start_artwork_deserialization() {
             assert_eq!(artwork.channels.len(), 1);
             let ch = &artwork.channels[0];
             assert_eq!(ch.source, ArtworkSource::Album);
-            assert_eq!(ch.format, ImageFormat::Jpeg);
-            assert_eq!(ch.width, 800);
-            assert_eq!(ch.height, 800);
+            assert_eq!(ch.format, Some(ImageFormat::Jpeg));
+            assert_eq!(ch.width, Some(800));
+            assert_eq!(ch.height, Some(800));
         }
         _ => panic!("Expected StreamStart"),
     }
@@ -1162,19 +1162,56 @@ fn test_stream_start_artwork_multi_channel() {
             assert_eq!(artwork.channels.len(), 2);
             assert_eq!(artwork.channels[0].source, ArtworkSource::Album);
             assert_eq!(artwork.channels[1].source, ArtworkSource::Artist);
-            assert_eq!(artwork.channels[1].format, ImageFormat::Png);
+            assert_eq!(artwork.channels[1].format, Some(ImageFormat::Png));
         }
         _ => panic!("Expected StreamStart"),
     }
 }
 
 #[test]
+fn test_stream_start_artwork_disabled_channel_omits_format_and_dimensions() {
+    // aiosendspin omits format/width/height on channels whose source is none,
+    // e.g. in the stream/start following a channel change.
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "artwork": {
+                "channels": [
+                    { "source": "album", "format": "jpeg", "width": 800, "height": 800 },
+                    { "source": "none" }
+                ]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    let Message::StreamStart(start) = message else {
+        panic!("Expected StreamStart");
+    };
+    let artwork = start.artwork.expect("Expected artwork config");
+    assert_eq!(artwork.channels.len(), 2);
+    let enabled = &artwork.channels[0];
+    assert_eq!(enabled.format, Some(ImageFormat::Jpeg));
+    assert_eq!(enabled.width, Some(800));
+    assert_eq!(enabled.height, Some(800));
+    let disabled = &artwork.channels[1];
+    assert_eq!(disabled.source, ArtworkSource::None);
+    assert_eq!(disabled.format, None);
+    assert_eq!(disabled.width, None);
+    assert_eq!(disabled.height, None);
+
+    let serialized = serde_json::to_value(disabled).unwrap();
+    assert_eq!(serialized, serde_json::json!({ "source": "none" }));
+}
+
+#[test]
 fn test_stream_artwork_channel_config_roundtrip() {
     let config = StreamArtworkChannelConfig {
         source: ArtworkSource::Album,
-        format: ImageFormat::Jpeg,
-        width: 256,
-        height: 256,
+        format: Some(ImageFormat::Jpeg),
+        width: Some(256),
+        height: Some(256),
     };
 
     let json = serde_json::to_string(&config).unwrap();
@@ -1184,7 +1221,7 @@ fn test_stream_artwork_channel_config_roundtrip() {
 
     let parsed: StreamArtworkChannelConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.source, ArtworkSource::Album);
-    assert_eq!(parsed.width, 256);
+    assert_eq!(parsed.width, Some(256));
 }
 
 // =============================================================================

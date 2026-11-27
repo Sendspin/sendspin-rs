@@ -379,9 +379,9 @@ fn artwork_stream_start() -> WsMessage {
         artwork: Some(StreamArtworkConfig {
             channels: vec![StreamArtworkChannelConfig {
                 source: ArtworkSource::Artist,
-                format: ImageFormat::Png,
-                width: 640,
-                height: 640,
+                format: Some(ImageFormat::Png),
+                width: Some(640),
+                height: Some(640),
             }],
         }),
         visualizer: None,
