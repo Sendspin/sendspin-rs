@@ -1,11 +1,12 @@
 use sendspin::protocol::messages::{
-    ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
-    ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
-    ColorState, ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo,
-    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest,
-    PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig,
-    SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig,
-    VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
+    Activity, ArtworkChannel, ArtworkChannelState, ArtworkClientState, ArtworkFormatRequest,
+    ArtworkSource, ArtworkStateFormat, ArtworkV1Support, AudioFormatSpec, CipherSuite,
+    ClientCommand, ClientGoodbye, ClientHello, ClientInit, ClientState, ClientSyncState,
+    ClientTime, ColorState, ControllerCommand, ControllerCommandType, DeviceInfo, GoodbyeReason,
+    ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest, PlayerState,
+    PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig, SpectrumScale,
+    StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig, SupportedPairMethods,
+    UnpairedAccess, VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
 };
 
 // =============================================================================
@@ -13,11 +14,37 @@ use sendspin::protocol::messages::{
 // =============================================================================
 
 #[test]
+fn test_client_init_serialization() {
+    let init = Message::ClientInit(ClientInit {
+        client_id: "AAAA".to_string(),
+        version: 1,
+        suite: CipherSuite::ChaChaPolySha256,
+    });
+    assert_eq!(
+        serde_json::to_string(&init).unwrap(),
+        r#"{"type":"client/init","payload":{"client_id":"AAAA","version":1,"suite":"25519_ChaChaPoly_SHA256"}}"#
+    );
+}
+
+#[test]
+fn test_server_activate_without_roles_deserializes() {
+    let json = r#"{"type":"server/activate","payload":{"activities":["playback","pairing"]}}"#;
+    match serde_json::from_str::<Message>(json).unwrap() {
+        Message::ServerActivate(activate) => {
+            assert_eq!(
+                activate.activities,
+                vec![Activity::Playback, Activity::Pairing]
+            );
+            assert_eq!(activate.active_roles, None);
+        }
+        other => panic!("Expected ServerActivate, got {other:?}"),
+    }
+}
+
+#[test]
 fn test_client_hello_serialization() {
     let hello = ClientHello {
-        client_id: "test-client-123".to_string(),
         name: "Test Player".to_string(),
-        version: 1,
         supported_roles: vec!["player@v1".to_string()],
         device_info: Some(DeviceInfo {
             product_name: Some("Sendspin-RS Player".to_string()),
@@ -37,13 +64,16 @@ fn test_client_hello_serialization() {
         }),
         artwork_v1_support: None,
         visualizer_v1_support: None,
+        supported_pair_methods: SupportedPairMethods::default(),
+        unpaired_access: UnpairedAccess { enabled: true },
     };
 
     let message = Message::ClientHello(hello);
     let json = serde_json::to_string(&message).unwrap();
 
     assert!(json.contains("\"type\":\"client/hello\""));
-    assert!(json.contains("\"client_id\":\"test-client-123\""));
+    assert!(json.contains("\"unpaired_access\":{\"enabled\":true}"));
+    assert!(json.contains("\"supported_pair_methods\":{\"pairing_psk\":{}}"));
     assert!(json.contains("\"player@v1_support\""));
     assert!(json.contains("\"player@v1\""));
 }
@@ -53,11 +83,8 @@ fn test_server_hello_deserialization() {
     let json = r#"{
         "type": "server/hello",
         "payload": {
-            "server_id": "server-456",
             "name": "Test Server",
-            "version": 1,
-            "active_roles": ["player@v1"],
-            "connection_reason": "playback"
+            "languages": ["en", "de"]
         }
     }"#;
 
@@ -65,11 +92,11 @@ fn test_server_hello_deserialization() {
 
     match message {
         Message::ServerHello(hello) => {
-            assert_eq!(hello.server_id, "server-456");
             assert_eq!(hello.name, "Test Server");
-            assert_eq!(hello.version, 1);
-            assert_eq!(hello.active_roles, vec!["player@v1"]);
-            assert_eq!(hello.connection_reason, ConnectionReason::Playback);
+            assert_eq!(
+                hello.languages,
+                Some(vec!["en".to_string(), "de".to_string()])
+            );
         }
         _ => panic!("Expected ServerHello"),
     }
@@ -82,6 +109,7 @@ fn test_server_hello_deserialization() {
 #[test]
 fn test_client_state_serialization() {
     let state = ClientState {
+        artwork: None,
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
             volume: Some(100),
@@ -105,6 +133,7 @@ fn test_client_state_serialization() {
 #[test]
 fn test_client_sync_state_external_source() {
     let state = ClientState {
+        artwork: None,
         state: Some(ClientSyncState::ExternalSource),
         player: None,
     };
@@ -575,9 +604,7 @@ fn test_stream_start_deserialization() {
 #[test]
 fn test_visualizer_negotiation_serialization() {
     let hello = ClientHello {
-        client_id: "visualizer-client".to_string(),
         name: "Visualizer".to_string(),
-        version: 1,
         supported_roles: vec!["visualizer@v1".to_string()],
         device_info: None,
         player_v1_support: None,
@@ -593,6 +620,8 @@ fn test_visualizer_negotiation_serialization() {
                 f_max: 16_000,
             }),
         }),
+        supported_pair_methods: SupportedPairMethods::default(),
+        unpaired_access: UnpairedAccess { enabled: false },
     };
     let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
     assert!(json.contains("\"visualizer@v1_support\""));
@@ -841,6 +870,89 @@ fn test_repeat_mode_variants() {
 // =============================================================================
 
 #[test]
+fn test_artwork_channel_state_roundtrip() {
+    for (source, format, source_name, format_name) in [
+        (
+            ArtworkSource::Album,
+            ArtworkStateFormat::Jpeg,
+            "album",
+            "jpeg",
+        ),
+        (
+            ArtworkSource::Artist,
+            ArtworkStateFormat::Png,
+            "artist",
+            "png",
+        ),
+    ] {
+        let channel = ArtworkChannelState {
+            source,
+            format: Some(format),
+            width: Some(320),
+            height: Some(240),
+        };
+        let json = serde_json::to_string(&channel).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "source": source_name,
+                "format": format_name,
+                "width": 320,
+                "height": 240
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtworkChannelState>(&json).unwrap(),
+            channel
+        );
+    }
+}
+
+#[test]
+fn test_disabled_artwork_channel_state_roundtrip() {
+    let json = r#"{"source":"none"}"#;
+    let channel: ArtworkChannelState = serde_json::from_str(json).unwrap();
+    assert_eq!(channel.source, ArtworkSource::None);
+    assert!(channel.format.is_none());
+    assert!(channel.width.is_none());
+    assert!(channel.height.is_none());
+    assert_eq!(serde_json::to_string(&channel).unwrap(), json);
+}
+
+#[test]
+fn test_client_state_artwork_roundtrip() {
+    let json = serde_json::json!({
+        "type": "client/state",
+        "payload": {
+            "artwork": {
+                "channels": [
+                    {"source": "album", "format": "jpeg", "width": 640, "height": 480},
+                    {"source": "none"},
+                    {"source": "artist", "format": "png", "width": 320, "height": 240}
+                ]
+            }
+        }
+    });
+    let message: Message = serde_json::from_value(json.clone()).unwrap();
+    let Message::ClientState(state) = &message else {
+        panic!("expected client/state");
+    };
+    assert!(state.state.is_none());
+    assert!(state.player.is_none());
+    let artwork = state.artwork.as_ref().unwrap();
+    assert_eq!(artwork.channels.len(), 3);
+    assert_eq!(artwork.channels[0].source, ArtworkSource::Album);
+    assert_eq!(artwork.channels[1].source, ArtworkSource::None);
+    assert_eq!(artwork.channels[2].source, ArtworkSource::Artist);
+    let artwork_json = serde_json::to_string(artwork).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ArtworkClientState>(&artwork_json).unwrap(),
+        *artwork
+    );
+    assert_eq!(serde_json::to_value(&message).unwrap(), json);
+}
+
+#[test]
 fn test_artwork_v1_support_serialization() {
     let support = ArtworkV1Support {
         channels: vec![
@@ -1020,9 +1132,9 @@ fn test_stream_start_artwork_deserialization() {
             assert_eq!(artwork.channels.len(), 1);
             let ch = &artwork.channels[0];
             assert_eq!(ch.source, ArtworkSource::Album);
-            assert_eq!(ch.format, ImageFormat::Jpeg);
-            assert_eq!(ch.width, 800);
-            assert_eq!(ch.height, 800);
+            assert_eq!(ch.format, Some(ImageFormat::Jpeg));
+            assert_eq!(ch.width, Some(800));
+            assert_eq!(ch.height, Some(800));
         }
         _ => panic!("Expected StreamStart"),
     }
@@ -1050,19 +1162,56 @@ fn test_stream_start_artwork_multi_channel() {
             assert_eq!(artwork.channels.len(), 2);
             assert_eq!(artwork.channels[0].source, ArtworkSource::Album);
             assert_eq!(artwork.channels[1].source, ArtworkSource::Artist);
-            assert_eq!(artwork.channels[1].format, ImageFormat::Png);
+            assert_eq!(artwork.channels[1].format, Some(ImageFormat::Png));
         }
         _ => panic!("Expected StreamStart"),
     }
 }
 
 #[test]
+fn test_stream_start_artwork_disabled_channel_omits_format_and_dimensions() {
+    // aiosendspin omits format/width/height on channels whose source is none,
+    // e.g. in the stream/start following a channel change.
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "artwork": {
+                "channels": [
+                    { "source": "album", "format": "jpeg", "width": 800, "height": 800 },
+                    { "source": "none" }
+                ]
+            }
+        }
+    }"#;
+
+    let message: Message = serde_json::from_str(json).unwrap();
+
+    let Message::StreamStart(start) = message else {
+        panic!("Expected StreamStart");
+    };
+    let artwork = start.artwork.expect("Expected artwork config");
+    assert_eq!(artwork.channels.len(), 2);
+    let enabled = &artwork.channels[0];
+    assert_eq!(enabled.format, Some(ImageFormat::Jpeg));
+    assert_eq!(enabled.width, Some(800));
+    assert_eq!(enabled.height, Some(800));
+    let disabled = &artwork.channels[1];
+    assert_eq!(disabled.source, ArtworkSource::None);
+    assert_eq!(disabled.format, None);
+    assert_eq!(disabled.width, None);
+    assert_eq!(disabled.height, None);
+
+    let serialized = serde_json::to_value(disabled).unwrap();
+    assert_eq!(serialized, serde_json::json!({ "source": "none" }));
+}
+
+#[test]
 fn test_stream_artwork_channel_config_roundtrip() {
     let config = StreamArtworkChannelConfig {
         source: ArtworkSource::Album,
-        format: ImageFormat::Jpeg,
-        width: 256,
-        height: 256,
+        format: Some(ImageFormat::Jpeg),
+        width: Some(256),
+        height: Some(256),
     };
 
     let json = serde_json::to_string(&config).unwrap();
@@ -1072,7 +1221,7 @@ fn test_stream_artwork_channel_config_roundtrip() {
 
     let parsed: StreamArtworkChannelConfig = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.source, ArtworkSource::Album);
-    assert_eq!(parsed.width, 256);
+    assert_eq!(parsed.width, Some(256));
 }
 
 // =============================================================================
@@ -1115,23 +1264,14 @@ fn test_client_hello_missing_required_fields() {
 
 #[test]
 fn test_server_hello_missing_required_fields() {
-    let json = r#"{"type": "server/hello", "payload": {"server_id": "s1"}}"#;
+    let json = r#"{"type": "server/hello", "payload": {"languages": []}}"#;
     let result = serde_json::from_str::<Message>(json);
     assert!(result.is_err());
 }
 
 #[test]
-fn test_invalid_connection_reason_rejected() {
-    let json = r#"{
-        "type": "server/hello",
-        "payload": {
-            "server_id": "s1",
-            "name": "Test",
-            "version": 1,
-            "active_roles": [],
-            "connection_reason": "invalid_reason"
-        }
-    }"#;
+fn test_invalid_activity_rejected() {
+    let json = r#"{"type": "server/activate", "payload": {"activities": ["invalid"]}}"#;
     let result = serde_json::from_str::<Message>(json);
     assert!(result.is_err());
 }
@@ -1258,6 +1398,7 @@ fn test_player_state_ignores_legacy_state_field() {
 #[test]
 fn test_player_state_supported_commands_roundtrip() {
     let state = ClientState {
+        artwork: None,
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
             volume: Some(100),

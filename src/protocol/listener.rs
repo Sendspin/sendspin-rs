@@ -9,10 +9,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http;
-use tokio_tungstenite::{accept_async, accept_hdr_async, WebSocketStream};
-
-#[cfg(feature = "native-tls")]
-use tokio_native_tls::TlsAcceptor;
+use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
 /// Accept inbound WebSocket peers and drive each one through the
 /// protocol-client state machine. Construct via
@@ -20,7 +17,7 @@ use tokio_native_tls::TlsAcceptor;
 ///
 /// Sendspin's protocol-client/server roles are independent of who
 /// initiates the TCP connection — the protocol-client always sends
-/// `client/hello` first. This listener handles the server-initiated
+/// `client/init` first. This listener handles the server-initiated
 /// case; the [`ProtocolClient`] returned by [`Self::accept`] is
 /// indistinguishable in shape from one returned by
 /// [`ProtocolClientBuilder::connect`].
@@ -28,17 +25,20 @@ use tokio_native_tls::TlsAcceptor;
 /// [`Self::accept`] drives the full protocol handshake before returning, so
 /// it serves one inbound connection at a time — a slow handshake blocks the
 /// next `accept()`. If you need concurrent handshakes, or want to own the
-/// transport (custom TLS, HTTP routing, …), accept your own streams and drive
+/// transport (HTTP routing, …), accept your own streams and drive
 /// [`ProtocolClientBuilder::accept`] on each, `tokio::spawn`-ing per peer.
+///
+/// Upgrade requests that carry an `Origin` header, which browsers always
+/// send, are rejected with HTTP 403.
 ///
 /// The Sendspin spec allows multiple servers to initiate connections to the
 /// same client. For the batteries-included path, hand this listener to
 /// [`ConnectionManager`], which runs inbound handshakes concurrently,
 /// applies the spec keep-or-switch policy ([`should_switch`]), and sends
 /// [`GoodbyeReason::AnotherServer`] to losers automatically. To run the
-/// policy yourself instead: read [`ProtocolClient::server_hello`] for
-/// `server_id` and `connection_reason`, decide with [`should_switch`]
-/// against your persisted last-played server, and send the loser's goodbye.
+/// policy yourself instead: read [`ProtocolClient::server_id`] and
+/// [`ProtocolClient::activation`], decide with [`should_switch`] against
+/// your persisted last-played server, and send the loser's goodbye.
 /// This listener itself does not enforce a policy.
 ///
 /// Practical notes for the manual path:
@@ -55,8 +55,6 @@ pub struct ProtocolListener {
     tcp: TcpListener,
     template: ProtocolClientBuilder,
     path: Option<String>,
-    #[cfg(feature = "native-tls")]
-    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl std::fmt::Debug for ProtocolListener {
@@ -66,8 +64,6 @@ impl std::fmt::Debug for ProtocolListener {
         let mut s = f.debug_struct("ProtocolListener");
         s.field("local_addr", &self.tcp.local_addr().ok());
         s.field("path", &self.path);
-        #[cfg(feature = "native-tls")]
-        s.field("tls", &self.tls_acceptor.is_some());
         s.finish()
     }
 }
@@ -78,8 +74,6 @@ impl ProtocolListener {
             tcp,
             template,
             path: None,
-            #[cfg(feature = "native-tls")]
-            tls_acceptor: None,
         }
     }
 
@@ -101,25 +95,9 @@ impl ProtocolListener {
         self
     }
 
-    /// Terminate TLS on every accepted connection using the given identity.
-    /// The identity is fixed for the listener's lifetime — to rotate
-    /// certificates, rebind. For mTLS, custom ALPN, or any other
-    /// non-trivial TLS need, terminate TLS yourself and use
-    /// [`ProtocolClientBuilder::accept`] instead.
-    ///
-    /// Unlike [`Self::path`] this returns `Result`, so chain it last:
-    /// `listener.path("/x").tls(id)?`.
-    #[cfg(feature = "native-tls")]
-    pub fn tls(mut self, identity: native_tls::Identity) -> Result<Self, Error> {
-        let acceptor = native_tls::TlsAcceptor::new(identity)
-            .map_err(|e| Error::Connection(format!("TLS acceptor build failed: {e}")))?;
-        self.tls_acceptor = Some(TlsAcceptor::from(acceptor));
-        Ok(self)
-    }
-
     /// Accept the next inbound connection, returning the driven
     /// [`ProtocolClient`] and the peer's address. Performs the WebSocket
-    /// handshake and protocol-client hello/state exchange.
+    /// upgrade and the protocol handshake through the first activation.
     ///
     /// Per-peer failures surface as [`Error`] without affecting the
     /// listener; callers typically call `accept()` in a loop.
@@ -158,24 +136,12 @@ impl ProtocolListener {
         Ok((tcp_stream, peer_addr))
     }
 
-    /// Drive TLS (if configured), the WebSocket upgrade, and the protocol
-    /// hello/state exchange over an accepted TCP stream.
+    /// Drive the WebSocket upgrade and the protocol handshake over an
+    /// accepted TCP stream.
     pub(crate) async fn handshake_and_drive(
         &self,
         tcp_stream: TcpStream,
     ) -> Result<ProtocolClient, Error> {
-        // Branched (rather than unified through a trait-object stream)
-        // so the WS handshake is monomorphized on the concrete transport.
-        #[cfg(feature = "native-tls")]
-        if let Some(tls) = &self.tls_acceptor {
-            let tls_stream = tls
-                .accept(tcp_stream)
-                .await
-                .map_err(|e| Error::Connection(format!("TLS handshake failed: {e}")))?;
-            let ws = self.handshake_ws(tls_stream).await?;
-            return self.template.clone().accept(ws).await;
-        }
-
         let ws = self.handshake_ws(tcp_stream).await?;
         self.template.clone().accept(ws).await
     }
@@ -187,33 +153,34 @@ impl ProtocolListener {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        match &self.path {
-            Some(expected_path) => {
-                let expected = expected_path.clone();
-                let callback = move |request: &Request, response: Response| {
-                    if request.uri().path() == expected {
-                        Ok(response)
-                    } else {
-                        log::debug!(
-                            "Rejecting inbound connection: path {:?} != expected {:?}",
-                            request.uri().path(),
-                            expected
-                        );
-                        Err(http::Response::builder()
-                            .status(http::StatusCode::NOT_FOUND)
-                            .body(None)
-                            .expect("static 404 response is well-formed"))
-                            as Result<Response, ErrorResponse>
-                    }
-                };
-                accept_hdr_async(stream, callback)
-                    .await
-                    .map_err(|e| Error::WebSocket(format!("WebSocket handshake failed: {e}")))
+        let expected_path = self.path.clone();
+        let callback = move |request: &Request, response: Response| {
+            let reject = |status| {
+                Err(http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .expect("static error response is well-formed"))
+                    as Result<Response, ErrorResponse>
+            };
+            if request.headers().contains_key(http::header::ORIGIN) {
+                log::debug!("Rejecting inbound connection carrying an Origin header");
+                return reject(http::StatusCode::FORBIDDEN);
             }
-            None => accept_async(stream)
-                .await
-                .map_err(|e| Error::WebSocket(format!("WebSocket handshake failed: {e}"))),
-        }
+            match &expected_path {
+                Some(expected) if request.uri().path() != expected => {
+                    log::debug!(
+                        "Rejecting inbound connection: path {:?} != expected {:?}",
+                        request.uri().path(),
+                        expected
+                    );
+                    reject(http::StatusCode::NOT_FOUND)
+                }
+                _ => Ok(response),
+            }
+        };
+        accept_hdr_async(stream, callback)
+            .await
+            .map_err(|e| Error::WebSocket(format!("WebSocket handshake failed: {e}")))
     }
 
     /// Local bound address.

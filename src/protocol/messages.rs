@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", content = "payload")]
 pub enum Message {
     // === Handshake messages ===
+    /// First message of a connection, naming the client's key and cipher suite
+    #[serde(rename = "client/init")]
+    ClientInit(ClientInit),
+
+    /// Server response to `client/init`
+    #[serde(rename = "server/init")]
+    ServerInit(ServerInit),
+
+    /// Server refusal of `client/init`, sent in place of `server/init`
+    #[serde(rename = "server/error")]
+    ServerError(ServerError),
+
+    /// One Noise handshake message
+    #[serde(rename = "noise/handshake")]
+    NoiseHandshake(NoiseHandshake),
+
     /// Client hello handshake message
     #[serde(rename = "client/hello")]
     ClientHello(ClientHello),
@@ -15,6 +31,10 @@ pub enum Message {
     /// Server hello handshake response
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),
+
+    /// Server declaration of the connection's activities and active roles
+    #[serde(rename = "server/activate")]
+    ServerActivate(ServerActivate),
 
     // === Time synchronization ===
     /// Client time synchronization request
@@ -75,15 +95,66 @@ pub enum Message {
 // Handshake Messages
 // =============================================================================
 
+/// Client init message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInit {
+    /// The client's static Curve25519 public key, base64url-encoded without padding
+    pub client_id: String,
+    /// Core message format version, always 1
+    pub version: u32,
+    /// Noise cipher suite the client picked
+    pub suite: CipherSuite,
+}
+
+/// Noise cipher suite
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CipherSuite {
+    /// `25519_ChaChaPoly_SHA256`
+    #[serde(rename = "25519_ChaChaPoly_SHA256")]
+    ChaChaPolySha256,
+}
+
+/// Server init message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInit {
+    /// The server's static Curve25519 public key, base64url-encoded without padding
+    pub server_id: String,
+    /// Core message format version, always 1
+    pub version: u32,
+}
+
+/// Server error message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerError {
+    /// Why the server refused `client/init`
+    pub reason: ServerErrorReason,
+}
+
+/// Reason the server refused `client/init`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerErrorReason {
+    /// The server does not implement the client's `version`
+    UnsupportedVersion,
+    /// The server does not implement the client's `suite`
+    UnsupportedSuite,
+    /// `client/init` is not valid JSON of the defined shape
+    Malformed,
+}
+
+/// Noise handshake message
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoiseHandshake {
+    /// Noise handshake message bytes, base64url-encoded without padding
+    pub data: String,
+}
+
 /// Client hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
-    /// Unique client identifier
-    pub client_id: String,
     /// Human-readable client name
     pub name: String,
-    /// Protocol version number
-    pub version: u32,
     /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
     /// Device information (optional)
@@ -101,6 +172,105 @@ pub struct ClientHello {
         skip_serializing_if = "Option::is_none"
     )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
+    /// Pairing methods this client currently offers, keyed by method identifier
+    pub supported_pair_methods: SupportedPairMethods,
+    /// Whether the client admits servers it is not paired with
+    pub unpaired_access: UnpairedAccess,
+}
+
+/// Unpaired access setting advertised in `client/hello`
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpairedAccess {
+    /// Whether a server without a pairing record may activate roles or declare `playback`
+    pub enabled: bool,
+}
+
+/// Pairing methods the client currently offers, advertised in `client/hello`.
+///
+/// Keyed by pairing method identifier; every client offers at least the
+/// Pairing PSK method, which [`Default`] therefore sets. See
+/// `pairing.md` (client/hello pair-method descriptor).
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SupportedPairMethods {
+    /// Pairing PSK: the client can pair using a PSK configured out-of-band
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_psk: Option<PairMethodDescriptor>,
+    /// Static pairing code: the client pairs using a code fixed for it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_pairing_code: Option<PairMethodDescriptor>,
+    /// Dynamic pairing code: the client can emit a per-session pairing code
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pairing_code: Option<DynamicPairingCodeDescriptor>,
+}
+
+impl Default for SupportedPairMethods {
+    /// The spec-mandated minimum: every client offers Pairing PSK.
+    fn default() -> Self {
+        Self {
+            pairing_psk: Some(PairMethodDescriptor::default()),
+            static_pairing_code: None,
+            dynamic_pairing_code: None,
+        }
+    }
+}
+
+/// Descriptor for pair methods whose secret is configured out-of-band
+/// (`pairing_psk`, `static_pairing_code`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct PairMethodDescriptor {
+    /// Informational hint: where the operator can find the method's configured
+    /// secret (printed on the device, on a leaflet, or set by the operator)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub locations: Vec<PairingSecretLocation>,
+}
+
+/// Where the operator can find a pairing method's configured secret
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PairingSecretLocation {
+    /// Printed on the device
+    Device,
+    /// Printed on a leaflet in the box
+    Leaflet,
+    /// Set by the operator
+    Operator,
+    /// A new unknown location that this implementation does not recognize
+    #[serde(other)]
+    Unknown,
+}
+
+/// Descriptor for `dynamic_pairing_code`: a per-session code the client
+/// emits for the operator.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DynamicPairingCodeDescriptor {
+    /// Channels through which the per-session pairing code reaches the operator
+    #[serde(default)]
+    pub out_channels: Vec<PairingOutChannel>,
+    /// Emission formats the client offers; non-empty. `qr_code` requires a
+    /// display able to render a QR code.
+    #[serde(default)]
+    pub formats: Vec<PairingCodeFormat>,
+}
+
+/// Channel through which a per-session pairing code reaches the operator
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingOutChannel {
+    /// The code is shown on a display
+    Display,
+    /// The code is spoken or played through a speaker
+    Speaker,
+}
+
+/// Emission format a client offers for a dynamic pairing code
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCodeFormat {
+    /// Numeric code the operator types in
+    Digits,
+    /// QR code the server scans
+    QrCode,
 }
 
 /// Device information (all fields optional per spec)
@@ -165,7 +335,7 @@ pub struct ArtworkChannel {
 }
 
 /// Artwork source type
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ArtworkSource {
     /// Album artwork
@@ -173,6 +343,7 @@ pub enum ArtworkSource {
     /// Artist image
     Artist,
     /// No artwork (channel disabled)
+    #[default]
     None,
 }
 
@@ -265,26 +436,44 @@ pub enum SpectrumScale {
 /// Server hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerHello {
-    /// Unique server identifier
-    pub server_id: String,
     /// Human-readable server name
     pub name: String,
-    /// Protocol version number
-    pub version: u32,
-    /// List of roles activated by server for this client
-    pub active_roles: Vec<String>,
-    /// Reason for connection: 'discovery' or 'playback'
-    pub connection_reason: ConnectionReason,
+    /// BCP 47 language tags the operator understands, most preferred first
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub languages: Option<Vec<String>>,
 }
 
-/// Connection reason enum
+/// Server activate message
+///
+/// The library delivers each activation with `active_roles` set to the roles
+/// in effect after applying it, also when the server omitted the field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerActivate {
+    /// The connection's current purposes
+    pub activities: Vec<Activity>,
+    /// Versioned roles active for this client, such as `player@v1`
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_roles: Option<Vec<String>>,
+}
+
+impl ServerActivate {
+    /// Whether the versioned `role` is active.
+    pub fn is_active(&self, role: &str) -> bool {
+        self.active_roles
+            .as_ref()
+            .is_some_and(|roles| roles.iter().any(|r| r == role))
+    }
+}
+
+/// Purpose a server declares for a connection
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ConnectionReason {
-    /// Server connected for discovery/announcement
-    Discovery,
-    /// Server connected for active playback
+#[non_exhaustive]
+pub enum Activity {
+    /// Normal playback and control
     Playback,
+    /// A pairing attempt
+    Pairing,
 }
 
 // =============================================================================
@@ -322,6 +511,45 @@ pub struct ClientState {
     /// Player state (if player role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerState>,
+    /// Artwork state (if artwork role active).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artwork: Option<ArtworkClientState>,
+}
+
+/// Requested artwork channel configurations in `client/state`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkClientState {
+    /// Positional channel configurations, from channel 0 (1-4 entries).
+    pub channels: Vec<ArtworkChannelState>,
+}
+
+/// Requested artwork channel; format and dimensions are required unless disabled.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtworkChannelState {
+    /// Requested artwork source, or `none` to disable the channel.
+    pub source: ArtworkSource,
+    /// Requested encoded image format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ArtworkStateFormat>,
+    /// Delivered image width in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Delivered image height in pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+/// Image formats supported by the RC1 artwork state declaration.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtworkStateFormat {
+    /// JPEG image.
+    Jpeg,
+    /// PNG image.
+    Png,
+    /// An image format this implementation does not recognize.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Player state
@@ -670,12 +898,15 @@ pub struct StreamArtworkConfig {
 pub struct StreamArtworkChannelConfig {
     /// Artwork source type
     pub source: ArtworkSource,
-    /// Format of the encoded image
-    pub format: ImageFormat,
-    /// Width in pixels of the encoded image
-    pub width: u32,
-    /// Height in pixels of the encoded image
-    pub height: u32,
+    /// Format of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ImageFormat>,
+    /// Width in pixels of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    /// Height in pixels of the encoded image; absent for disabled (`none`) channels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// Stream visualizer configuration.
@@ -848,6 +1079,10 @@ pub enum GoodbyeReason {
     Restart,
     /// User requested disconnect
     UserRequest,
+    /// The server declared activities or roles the client does not authorize
+    Unauthorized,
+    /// The server needs unpaired access, which the client does not admit
+    PairingRequired,
 }
 
 // =============================================================================

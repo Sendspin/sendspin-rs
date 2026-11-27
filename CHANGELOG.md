@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Initial `client/state` includes artwork channel settings derived from `artwork@v1_support` while the artwork role is active. Enabled channels require JPEG or PNG; artwork configurations require 1-4 channels.
+- Later artwork activation and reactivation report the latest artwork channel settings, independently of automatic player reporting. Omitting artwork from other state updates leaves the retained settings unchanged.
+- Added `FileStore` and `MemoryStore` implementations of the new `PersistenceProvider` trait.
+- Added the `unpaired_access` builder option, off by default, which lets servers the client is not paired with activate roles and play.
+- `client/hello` now carries the required `supported_pair_methods` field, offering `pairing_psk` as the spec-mandated minimum. Method descriptors for `static_pairing_code` and `dynamic_pairing_code` are typed but not yet advertised.
+
+### Changed
+
+- **Breaking protocol:** the client speaks Sendspin rc1 only. It sends `client/init`, runs the Noise handshake, encrypts every later message, and uses no role until the server sends `server/activate`. Servers that speak the earlier protocol can no longer connect.
+- **Breaking builder:** `persistence` replaces `client_id`. It stores the client's identity key, which the `client_id` is derived from, so it must survive restarts.
+- **Breaking API:** `ServerHello` carries only `name` and `languages`. `ProtocolClient` and `Connection` expose the server's `server_id` and its first `activation`, and later activations arrive as `Message::ServerActivate` with `active_roles` filled in.
+- **Breaking API:** `Connection::controller` is always present, and its commands fail while `controller@v1` is not active.
+- **Breaking API:** `should_switch` compares activations instead of connection reasons: a server with the `playback` activity wins, an idle server loses to a playing one, and between idle servers the last-played one wins. `ConnectionReason` is removed.
+- With the player role active, the first `client/state` waits until the clock is synchronized.
+- When the server removes a role, the client ends that role's stream.
+- `ProtocolListener` rejects WebSocket upgrades that carry an `Origin` header.
+
+### Removed
+
+- **Breaking:** removed `ProtocolListener::tls` and the `secure_socket` example. Outgoing `wss://` connections still work with the `native-tls` feature.
+
 ## [0.4.0](https://github.com/Sendspin/sendspin-rs/compare/v0.3.8...v0.4.0) - 2026-11-23
 
 ### Added

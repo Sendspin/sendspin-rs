@@ -60,6 +60,26 @@ fn attach<O: sendspin::audio::PlayerOutput>(
 
 The guide covers output recovery, controls, and prepared audio work.
 
+## Unpaired access
+
+Every connection is encrypted with a key that proves the server's identity once the client is paired with it. This library does not support pairing yet, so every server connects unpaired. Unless you turn on unpaired access, the client closes the connection with `pairing_required` as soon as such a server activates a role or starts playback:
+
+```rust,no_run
+use sendspin::{FileStore, ProtocolClientBuilder};
+use std::sync::Arc;
+
+let builder = ProtocolClientBuilder::builder()
+    .persistence(Arc::new(FileStore::new("sendspin-data")))
+    .name("Living Room".to_string())
+    .metadata()
+    .unpaired_access(true)
+    .build();
+```
+
+With unpaired access on, any device on your network can act as a server for this client, so only turn it on in a network you trust. The examples turn it on.
+
+The persistence store keeps the client's identity key. Keep it across restarts, since the client gets a new `client_id` whenever the key is lost.
+
 ## Architecture
 
 See [docs/rust-thoughts.md](docs/rust-thoughts.md) for detailed architecture and implementation notes.
